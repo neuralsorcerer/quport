@@ -1,0 +1,40 @@
+# Python bytecode and extension artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging/build artifacts
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Tool/test caches and reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter / notebook checkpoints
+.ipynb_checkpoints/
+
+# Pre-commit cache
+.pre-commit-cache/
+
+# Example-generated CSV outputs
+sweep.csv
+examples/sweep.csv
