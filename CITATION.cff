@@ -1,0 +1,22 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: >-
+  QuPort: Topology-, Port-, and Congestion-Aware Compilation for Modular Multi-QPU Quantum Systems
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Soumyadip
+    family-names: Sarkar
+    orcid: 'https://orcid.org/0000-0002-2377-9147'
+  - given-names: Subhasree
+    family-names: Bhattacharjee
+identifiers:
+  - type: doi
+    value: 10.48550/arXiv.2605.12583
+repository-code: 'https://github.com/neuralsorcerer/quport'
+repository: 'https://arxiv.org/abs/2605.12583'
+license: MIT
