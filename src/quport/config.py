@@ -13,6 +13,12 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal
 
+from quport._validation import (
+    validate_finite_result,
+    validate_nonnegative_finite_float,
+    validate_nonnegative_integral,
+)
+
 
 def optional_module_available(module_name: str) -> bool:
     try:
@@ -105,14 +111,29 @@ class LatencyModel:
     def estimate_latency(
         self, n_1q: int, n_2q: int, swaps: int, remote_2q: int, depth: int | None = None
     ) -> float:
-        base = self.oneq * n_1q + self.twoq * n_2q + self.swap * swaps
-        remote = remote_2q * (
-            self.epr_gen + self.classical_rtt + self.remote_gate_overhead
+        n_1q_value = validate_nonnegative_integral(n_1q, label="n_1q")
+        n_2q_value = validate_nonnegative_integral(n_2q, label="n_2q")
+        swaps_value = validate_nonnegative_integral(swaps, label="swaps")
+        remote_2q_value = validate_nonnegative_integral(remote_2q, label="remote_2q")
+
+        oneq = validate_nonnegative_finite_float(self.oneq, label="oneq")
+        twoq = validate_nonnegative_finite_float(self.twoq, label="twoq")
+        swap = validate_nonnegative_finite_float(self.swap, label="swap")
+        epr_gen = validate_nonnegative_finite_float(self.epr_gen, label="epr_gen")
+        classical_rtt = validate_nonnegative_finite_float(
+            self.classical_rtt, label="classical_rtt"
         )
+        remote_gate_overhead = validate_nonnegative_finite_float(
+            self.remote_gate_overhead, label="remote_gate_overhead"
+        )
+
+        base = oneq * n_1q_value + twoq * n_2q_value + swap * swaps_value
+        remote = remote_2q_value * (epr_gen + classical_rtt + remote_gate_overhead)
         # Optionally include depth as a soft penalty
         if depth is not None:
-            base += 0.1 * depth * self.twoq
-        return base + remote
+            depth_value = validate_nonnegative_integral(depth, label="depth")
+            base += 0.1 * depth_value * twoq
+        return validate_finite_result(base + remote, label="estimated latency")
 
 
 def _validate_config_data(data: Any, path: str) -> dict[str, Any]:
