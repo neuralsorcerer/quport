@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import pytest
 
@@ -31,7 +32,7 @@ _INVALID_FLOATS = (-1.0, math.nan, math.inf, -math.inf, True, object())
 
 
 def _metrics(**overrides: object) -> CircuitMetrics:
-    values = {
+    values: dict[str, Any] = {
         "swaps": 3,
         "depth": 5,
         "size": 11,
@@ -48,7 +49,7 @@ def _metrics(**overrides: object) -> CircuitMetrics:
 def test_latency_model_rejects_invalid_operation_counts(
     field: str, bad_value: object
 ) -> None:
-    kwargs = dict(_VALID_LATENCY_KWARGS)
+    kwargs: dict[str, Any] = dict(_VALID_LATENCY_KWARGS)
     kwargs[field] = bad_value
 
     with pytest.raises(ValueError):

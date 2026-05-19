@@ -10,11 +10,12 @@ import csv
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import TypeAlias, TypeVar
 
 from qiskit import QuantumCircuit, transpile
 from qiskit.circuit.random import random_circuit
 
+from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
@@ -32,6 +33,46 @@ from quport.partition import (
 
 BenchmarkRow: TypeAlias = dict[str, float | str]
 SweepSummaryRow: TypeAlias = dict[str, float | str]
+_StringT = TypeVar("_StringT", bound=str)
+
+
+def _validate_positive_int(value: object, *, label: str) -> int:
+    """Return a positive integer, rejecting bools and non-integral values."""
+    out = validate_nonnegative_integral(value, label=label)
+    if out <= 0:
+        raise ValueError(f"{label} must be positive")
+    return out
+
+
+def _validate_string_sequence(
+    values: Sequence[_StringT],
+    *,
+    label: str,
+) -> tuple[_StringT, ...]:
+    """Validate an API sequence of strings without treating a bare string as a sequence."""
+    if isinstance(values, str | bytes | bytearray):
+        raise ValueError(f"{label} must be a sequence of strings, not a string")
+    if not isinstance(values, Sequence):
+        raise ValueError(f"{label} must be a sequence of strings")
+    out = tuple(values)
+    for idx, value in enumerate(out):
+        if not isinstance(value, str):
+            raise ValueError(f"{label}[{idx}] must be a string")
+    return out
+
+
+def _validate_nonnegative_int_sequence(
+    values: Sequence[int],
+    *,
+    label: str,
+) -> tuple[int, ...]:
+    """Validate a non-string sequence of non-negative integers."""
+    if isinstance(values, str | bytes | bytearray) or not isinstance(values, Sequence):
+        raise ValueError(f"{label} must be a sequence of non-negative integers")
+    return tuple(
+        validate_nonnegative_integral(value, label=f"{label}[{idx}]")
+        for idx, value in enumerate(values)
+    )
 
 
 @dataclass(frozen=True)
@@ -93,6 +134,8 @@ def map_and_transpile(
     MapResult
     """
     latency = latency or LatencyModel()
+    if seed is not None:
+        seed = validate_nonnegative_integral(seed, label="seed")
 
     if qc.num_qubits > cfg.total_physical_qubits():
         raise ValueError(
@@ -219,6 +262,8 @@ def transpile_baseline(
 ) -> MapResult:
     """Baseline: translate to basis then let transpiler pick layout/routing (no partition hints)."""
     latency = latency or LatencyModel()
+    if seed is not None:
+        seed = validate_nonnegative_integral(seed, label="seed")
 
     if qc.num_qubits > cfg.total_physical_qubits():
         raise ValueError(
@@ -269,12 +314,15 @@ def random_benchmark_circuit(
     seed: int,
 ) -> QuantumCircuit:
     """Random circuit generator suitable for mapping benchmarks."""
+    n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
+    depth_value = validate_nonnegative_integral(depth, label="depth")
+    seed_value = validate_nonnegative_integral(seed, label="seed")
     return random_circuit(
-        num_qubits=n_logical,
-        depth=depth,
+        num_qubits=n_logical_value,
+        depth=depth_value,
         max_operands=2,
         measure=False,
-        seed=seed,
+        seed=seed_value,
     )
 
 
@@ -307,11 +355,13 @@ def benchmark_random_circuits(
     latency = latency or LatencyModel()
     rows: list[BenchmarkRow] = []
 
-    if trials < 0:
-        raise ValueError("trials must be non-negative")
+    n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
+    depth_value = validate_nonnegative_integral(depth, label="depth")
+    trials_value = validate_nonnegative_integral(trials, label="trials")
+    seed_value = validate_nonnegative_integral(seed, label="seed")
 
     method_id = {"baseline": 0.0, "balanced": 1.0, "tpccap": 2.0}
-    selected_strategies = tuple(strategies)
+    selected_strategies = _validate_string_sequence(strategies, label="strategies")
     unknown = sorted(set(selected_strategies) - set(method_id))
     if unknown:
         raise ValueError(
@@ -336,9 +386,9 @@ def benchmark_random_circuits(
         "transpile_time_s",
     ]
 
-    for t in range(trials):
-        s = seed + t
-        qc = random_benchmark_circuit(n_logical, depth, s)
+    for t in range(trials_value):
+        s = seed_value + t
+        qc = random_benchmark_circuit(n_logical_value, depth_value, s)
 
         results: dict[str, MapResult] = {}
         if "baseline" in selected_strategies:
@@ -394,29 +444,46 @@ def sweep_topologies(
     inter_degree: int = 2,
 ) -> None:
     """Sweep multiple topology settings; write summary CSV."""
+    n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
+    depth_value = validate_nonnegative_integral(depth, label="depth")
+    trials_value = validate_nonnegative_integral(trials, label="trials")
+    seed_value = validate_nonnegative_integral(seed, label="seed")
+    compute_per_qpu_value = validate_nonnegative_integral(
+        compute_per_qpu, label="compute_per_qpu"
+    )
+    n_qpus_value = _validate_positive_int(n_qpus, label="n_qpus")
+    inter_degree_value = validate_nonnegative_integral(
+        inter_degree, label="inter_degree"
+    )
+    intra_values = _validate_string_sequence(intra_topologies, label="intra_topologies")
+    inter_values = _validate_string_sequence(inter_topologies, label="inter_topologies")
+    comm_port_values = _validate_nonnegative_int_sequence(
+        comm_ports, label="comm_ports"
+    )
+
     latency = LatencyModel()
     summary: list[SweepSummaryRow] = []
 
-    for intra in intra_topologies:
-        for inter in inter_topologies:
-            for ports in comm_ports:
+    for intra in intra_values:
+        for inter in inter_values:
+            for ports in comm_port_values:
                 cfg = MultiQPUConfig(
-                    n_qpus=n_qpus,
-                    compute_qubits_per_qpu=compute_per_qpu,
+                    n_qpus=n_qpus_value,
+                    compute_qubits_per_qpu=compute_per_qpu_value,
                     comm_qubits_per_qpu=ports,
                     intra_topology=intra,
                     inter_topology=inter,
-                    inter_degree=inter_degree,
+                    inter_degree=inter_degree_value,
                 )
-                if n_logical > cfg.total_physical_qubits():
+                if n_logical_value > cfg.total_physical_qubits():
                     continue
 
                 rows = benchmark_random_circuits(
                     cfg=cfg,
-                    n_logical=n_logical,
-                    depth=depth,
-                    trials=trials,
-                    seed=seed,
+                    n_logical=n_logical_value,
+                    depth=depth_value,
+                    trials=trials_value,
+                    seed=seed_value,
                     latency=latency,
                     out_csv=None,
                 )

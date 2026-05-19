@@ -180,3 +180,119 @@ def test_optional_module_available_handles_missing_parent() -> None:
     from quport.config import optional_module_available
 
     assert optional_module_available("quport_missing_dependency.child") is False
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"n_logical": -1, "depth": 0, "seed": 1}, "n_logical must be non-negative"),
+        (
+            {"n_logical": True, "depth": 0, "seed": 1},
+            "n_logical must be a non-negative integer",
+        ),
+        ({"n_logical": 1, "depth": -1, "seed": 1}, "depth must be non-negative"),
+        ({"n_logical": 1, "depth": 0, "seed": -1}, "seed must be non-negative"),
+    ],
+)
+def test_random_benchmark_circuit_rejects_invalid_integer_inputs(
+    kwargs: dict[str, object], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        random_benchmark_circuit(**kwargs)  # type: ignore[arg-type]
+
+
+def test_benchmark_rejects_string_strategy_sequence() -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+
+    with pytest.raises(ValueError, match="strategies must be a sequence of strings"):
+        benchmark_random_circuits(
+            cfg,
+            n_logical=1,
+            depth=0,
+            trials=0,
+            strategies="baseline",
+        )
+
+
+def test_benchmark_rejects_non_sequence_strategies() -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+
+    with pytest.raises(ValueError, match="strategies must be a sequence of strings"):
+        benchmark_random_circuits(
+            cfg,
+            n_logical=1,
+            depth=0,
+            trials=0,
+            strategies=None,  # type: ignore[arg-type]
+        )
+
+
+def test_benchmark_rejects_non_string_strategy_entry() -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+
+    with pytest.raises(ValueError, match=r"strategies\[1\] must be a string"):
+        benchmark_random_circuits(
+            cfg,
+            n_logical=1,
+            depth=0,
+            trials=0,
+            strategies=("baseline", 1),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"n_qpus": 0}, "n_qpus must be positive"),
+        ({"compute_per_qpu": -1}, "compute_per_qpu must be non-negative"),
+        ({"inter_degree": -1}, "inter_degree must be non-negative"),
+        ({"comm_ports": (True,)}, r"comm_ports\[0\] must be a non-negative integer"),
+        ({"comm_ports": 1}, "comm_ports must be a sequence"),
+        ({"intra_topologies": "clique"}, "intra_topologies must be a sequence"),
+        (
+            {"inter_topologies": ("switch", 3)},
+            r"inter_topologies\[1\] must be a string",
+        ),
+    ],
+)
+def test_sweep_rejects_invalid_api_inputs(
+    tmp_path: Path, kwargs: dict[str, object], match: str
+) -> None:
+    from quport.pipeline import sweep_topologies
+
+    base: dict[str, object] = {
+        "n_logical": 1,
+        "depth": 0,
+        "trials": 0,
+        "seed": 1,
+        "out_csv": str(tmp_path / "out.csv"),
+        "intra_topologies": ("clique",),
+        "inter_topologies": ("switch",),
+        "comm_ports": (0,),
+        "compute_per_qpu": 1,
+        "n_qpus": 1,
+        "inter_degree": 0,
+    }
+    base.update(kwargs)
+
+    with pytest.raises(ValueError, match=match):
+        sweep_topologies(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("seed", [-1, True])
+def test_mapping_entrypoints_reject_invalid_optional_seeds(seed: object) -> None:
+    from quport.pipeline import transpile_baseline
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+    qc = random_benchmark_circuit(n_logical=1, depth=0, seed=0)
+
+    with pytest.raises(ValueError, match="seed"):
+        map_and_transpile(qc, cfg, seed=seed)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="seed"):
+        transpile_baseline(qc, cfg, seed=seed)  # type: ignore[arg-type]
