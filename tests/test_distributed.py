@@ -397,3 +397,38 @@ def test_compile_distributed_validates_strategy_before_temporal_decay() -> None:
 
     with pytest.raises(ValueError, match="Unknown strategy"):
         compile_distributed(qc, cfg, strategy="invalid", temporal_decay=1.1)
+
+
+def test_compile_distributed_ignores_temporal_decay_for_non_tpccap_strategies() -> None:
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(
+        n_qpus=1,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=0,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    qc = QuantumCircuit(2)
+    qc.cx(0, 1)
+
+    # Non-TPCCAP strategies always use uniform interaction weights and should not
+    # validate temporal_decay at all.
+    result = compile_distributed(qc, cfg, strategy="balanced", temporal_decay=1.1)
+    assert result.strategy == "balanced"
+
+
+def test_compile_distributed_rejects_circuit_larger_than_physical_capacity() -> None:
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(
+        n_qpus=1,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=0,
+        intra_topology="line",
+        inter_topology="switch",
+    )
+    qc = QuantumCircuit(2)
+
+    with pytest.raises(ValueError, match="exceed physical qubits"):
+        compile_distributed(qc, cfg, strategy="balanced")
