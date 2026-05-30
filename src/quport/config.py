@@ -39,6 +39,15 @@ IntraTopology = Literal["clique", "line", "ring", "grid2d"]
 InterTopology = Literal["switch", "mesh", "ring", "degree_d", "clos", "fat_tree"]
 
 
+def _validate_nonempty_string(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    out = value.strip()
+    if not out:
+        raise ValueError(f"{label} must be a non-empty string")
+    return out
+
+
 @dataclass(frozen=True)
 class MultiQPUConfig:
     """Configuration for the multi-QPU architecture and mapping pipeline."""
@@ -74,6 +83,29 @@ class MultiQPUConfig:
     optimization_level: int = 3
     layout_method: str = "sabre"
     routing_method: str = "sabre"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.async_classical, bool):
+            raise ValueError("async_classical must be a boolean")
+        async_overlap = validate_nonnegative_finite_float(
+            self.async_overlap, label="async_overlap"
+        )
+        if async_overlap > 1.0:
+            raise ValueError("async_overlap must be in [0, 1]")
+
+        if not isinstance(self.basis_gates, tuple):
+            raise ValueError("basis_gates must be a tuple of gate names")
+        for gate in self.basis_gates:
+            _validate_nonempty_string(gate, label="basis_gates entries")
+
+        optimization_level = validate_nonnegative_integral(
+            self.optimization_level, label="optimization_level"
+        )
+        if optimization_level > 3:
+            raise ValueError("optimization_level must be between 0 and 3")
+
+        _validate_nonempty_string(self.layout_method, label="layout_method")
+        _validate_nonempty_string(self.routing_method, label="routing_method")
 
     def total_physical_qubits(self) -> int:
         return self.n_qpus * (self.compute_qubits_per_qpu + self.comm_qubits_per_qpu)
