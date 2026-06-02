@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quport"
-version = "0.1.0"
+version = "0.1.1"
 description = "Research-grade multi-QPU mapping, routing, and benchmarking toolkit for NISQ circuit partitioning in Qiskit."
 readme = "README.md"
 requires-python = ">=3.10"
