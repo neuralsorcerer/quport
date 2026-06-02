@@ -262,9 +262,11 @@ def choose_comm_logicals_diverse(
                 break
             selected.append(best)
             # mark the strongest remote neighbor as covered, with deterministic ties
-            if ext_by_qpu[best]:
+            best_logical = best
+            if ext_by_qpu[best_logical]:
                 remote_best = max(
-                    ext_by_qpu[best], key=lambda r: (ext_by_qpu[best][r], -r)
+                    ext_by_qpu[best_logical],
+                    key=lambda r: (ext_by_qpu[best_logical][r], -r),
                 )
                 covered_remote.add(remote_best)
 

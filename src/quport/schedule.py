@@ -312,6 +312,38 @@ class TopologyScheduleSummary:
     peak_qpu_ports_used: int
 
 
+@dataclass(frozen=True)
+class RemoteRoundTrace:
+    """Resource usage for one packed remote-operation communication round."""
+
+    layer_index: int
+    round_index: int
+    qpu_pairs: tuple[tuple[int, int], ...]
+    duration: float
+    qpu_ports_used: tuple[int, ...]
+    link_utilization: tuple[tuple[tuple[int, int], int], ...]
+    unschedulable_ops: int = 0
+
+
+@dataclass(frozen=True)
+class LayerScheduleTrace:
+    """Detailed schedule trace for one circuit DAG layer."""
+
+    layer_index: int
+    local_duration: float
+    remote_ops: int
+    remote_rounds: tuple[RemoteRoundTrace, ...]
+    duration: float
+
+
+@dataclass(frozen=True)
+class TopologySchedulePlan:
+    """Topology schedule summary plus per-layer/per-round trace details."""
+
+    summary: TopologyScheduleSummary
+    layers: tuple[LayerScheduleTrace, ...]
+
+
 def _effective_classical_rtt(
     cfg: MultiQPUConfig, lat: _ValidatedLatencyValues
 ) -> float:
@@ -328,14 +360,15 @@ def _effective_classical_rtt(
     return lat.classical_rtt
 
 
-def estimate_parallel_makespan_topology(
+def _topology_schedule_plan(
     mapped: QuantumCircuit,
     arch: MultiQPUArchitecture,
     model: LatencyModel,
-) -> TopologyScheduleSummary:
-    """Estimate makespan with **comm-port + link-capacity** constraints.
+) -> TopologySchedulePlan:
+    """Build a topology-aware schedule summary and detailed trace.
 
     Compared to :func:`estimate_parallel_makespan_layered`, this estimator:
+
     - respects comm port capacity (comm qubits per QPU)
     - respects per-link capacity on the inter-QPU topology
     - charges remote ops proportional to QPU distance (hop count)
@@ -348,6 +381,9 @@ def estimate_parallel_makespan_topology(
     - We use Qiskit's DAG layers as a dependency-aware parallelization heuristic.
     - Within each layer, local ops are parallel across QPUs.
     - Remote ops are packed into rounds using a greedy algorithm.
+
+    The public summary function projects this plan down to the historical
+    :class:`TopologyScheduleSummary` return type.
     """
     from collections import defaultdict
 
@@ -393,6 +429,7 @@ def estimate_parallel_makespan_topology(
     total_rounds = 0
     peak_link = 0
     peak_ports = 0
+    layer_traces: list[LayerScheduleTrace] = []
 
     edge_cache: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
     hop_cache: dict[tuple[int, int], float] = {}
@@ -432,6 +469,40 @@ def estimate_parallel_makespan_topology(
                 )
         return cost_cache[key]
 
+    def unschedulable_round_trace(
+        a: int,
+        b: int,
+        round_traces: list[RemoteRoundTrace],
+        *,
+        qpu_ports_used: tuple[int, ...] | None = None,
+    ) -> RemoteRoundTrace:
+        return RemoteRoundTrace(
+            layer_index=layers - 1,
+            round_index=len(round_traces),
+            qpu_pairs=(pair_key(a, b),),
+            duration=UNSCHEDULABLE_PENALTY,
+            qpu_ports_used=qpu_ports_used or (0,) * n_qpus,
+            link_utilization=(),
+            unschedulable_ops=1,
+        )
+
+    def append_layer_trace(
+        *,
+        local_duration: float,
+        remote_ops: int,
+        remote_rounds: list[RemoteRoundTrace],
+        duration: float,
+    ) -> None:
+        layer_traces.append(
+            LayerScheduleTrace(
+                layer_index=layers - 1,
+                local_duration=local_duration,
+                remote_ops=remote_ops,
+                remote_rounds=tuple(remote_rounds),
+                duration=duration,
+            )
+        )
+
     for layer in dag.layers():
         layers += 1
         local_dur = [0.0] * n_qpus
@@ -464,15 +535,32 @@ def estimate_parallel_makespan_topology(
 
         if not remote_pairs:
             total += layer_local
+            append_layer_trace(
+                local_duration=layer_local,
+                remote_ops=0,
+                remote_rounds=[],
+                duration=layer_local,
+            )
             continue
 
         total_remote += len(remote_pairs)
+        round_traces: list[RemoteRoundTrace] = []
 
         if ports <= 0 or link_cap == 0:
             # Remote ops impossible: either no comm ports or zero link capacity.
             unschedulable_ops = len(remote_pairs)
-            total += max(layer_local, UNSCHEDULABLE_PENALTY * unschedulable_ops)
+            rounds_time = UNSCHEDULABLE_PENALTY * unschedulable_ops
+            layer_time = max(layer_local, rounds_time)
+            total += layer_time
             total_rounds += unschedulable_ops
+            for a, b in remote_pairs:
+                round_traces.append(unschedulable_round_trace(a, b, round_traces))
+            append_layer_trace(
+                local_duration=layer_local,
+                remote_ops=len(remote_pairs),
+                remote_rounds=round_traces,
+                duration=layer_time,
+            )
             continue
 
         reachable_pairs: list[tuple[int, int]] = []
@@ -485,6 +573,9 @@ def estimate_parallel_makespan_topology(
 
         rounds_time = UNSCHEDULABLE_PENALTY * unreachable_pairs
         rounds_here = unreachable_pairs
+        for a, b in remote_pairs:
+            if not is_reachable(a, b):
+                round_traces.append(unschedulable_round_trace(a, b, round_traces))
 
         # Greedy round packing with port + link constraints for reachable pairs.
         remaining = sorted(
@@ -495,6 +586,8 @@ def estimate_parallel_makespan_topology(
 
         # Fast path: zero switch pair budget makes every remaining reachable op unschedulable.
         if is_switch_like and sw_pairs_cap == 0 and remaining:
+            for a, b in remaining:
+                round_traces.append(unschedulable_round_trace(a, b, round_traces))
             rounds_time += UNSCHEDULABLE_PENALTY * len(remaining)
             rounds_here += len(remaining)
             remaining = []
@@ -505,6 +598,7 @@ def estimate_parallel_makespan_topology(
                 int
             )  # edge->count
             used_pairs: set[tuple[int, int]] = set()
+            placed_pairs: list[tuple[int, int]] = []
             placed_any = False
             round_max_cost = 0.0
 
@@ -535,6 +629,7 @@ def estimate_parallel_makespan_topology(
                     continue
 
                 # place op
+                placed_pairs.append(key)
                 used_ports[a] += 1
                 used_ports[b] += 1
                 peak_ports = max(peak_ports, used_ports[a], used_ports[b])
@@ -549,9 +644,18 @@ def estimate_parallel_makespan_topology(
             if not placed_any:
                 # Constraints can make a "reachable" pair unschedulable (e.g., switch_parallel_links=0).
                 # Charge one penalty round and defer the rest.
+                skipped = remaining[0]
                 next_remaining = remaining[1:]
                 rounds_time += UNSCHEDULABLE_PENALTY
                 rounds_here += 1
+                round_traces.append(
+                    unschedulable_round_trace(
+                        skipped[0],
+                        skipped[1],
+                        round_traces,
+                        qpu_ports_used=tuple(used_ports),
+                    )
+                )
                 remaining = next_remaining
                 continue
 
@@ -562,12 +666,28 @@ def estimate_parallel_makespan_topology(
                 round_max_cost += sw_reconf
             rounds_time += round_max_cost
             rounds_here += 1
+            round_traces.append(
+                RemoteRoundTrace(
+                    layer_index=layers - 1,
+                    round_index=len(round_traces),
+                    qpu_pairs=tuple(placed_pairs),
+                    duration=round_max_cost,
+                    qpu_ports_used=tuple(used_ports),
+                    link_utilization=tuple(sorted(used_link.items())),
+                )
+            )
 
         total_rounds += rounds_here
         layer_time = max(layer_local, rounds_time)
         total += layer_time
+        append_layer_trace(
+            local_duration=layer_local,
+            remote_ops=len(remote_pairs),
+            remote_rounds=round_traces,
+            duration=layer_time,
+        )
 
-    return TopologyScheduleSummary(
+    summary = TopologyScheduleSummary(
         makespan=total,
         layers=layers,
         remote_ops=total_remote,
@@ -575,3 +695,26 @@ def estimate_parallel_makespan_topology(
         peak_link_util=peak_link,
         peak_qpu_ports_used=peak_ports,
     )
+    return TopologySchedulePlan(summary=summary, layers=tuple(layer_traces))
+
+
+def estimate_parallel_makespan_topology(
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+) -> TopologyScheduleSummary:
+    """Estimate makespan with **comm-port + link-capacity** constraints."""
+    return _topology_schedule_plan(mapped, arch, model).summary
+
+
+def estimate_topology_schedule_plan(
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+) -> TopologySchedulePlan:
+    """Return a topology-aware schedule summary plus per-layer/per-round trace.
+
+    The trace exposes which QPU pairs were packed into each communication round,
+    per-QPU port usage, per-link utilization, and unschedulable penalty rounds.
+    """
+    return _topology_schedule_plan(mapped, arch, model)

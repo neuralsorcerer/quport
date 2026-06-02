@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -260,6 +261,7 @@ def compile_dist(
       - qpu_<id>_routed.qasm : routed per-QPU local programs
       - remote_ops.json     : ordered remote-op trace
       - schedule.json       : topology-aware schedule summary
+      - schedule_trace.json : detailed per-layer/per-round communication plan
     """
     cfg = load_config(config) if config else MultiQPUConfig()
     latency = LatencyModel()
@@ -285,7 +287,10 @@ def compile_dist(
         encoding="utf-8",
     )
     (outp / "schedule.json").write_text(
-        json.dumps(res.schedule.__dict__, indent=2), encoding="utf-8"
+        json.dumps(asdict(res.schedule), indent=2), encoding="utf-8"
+    )
+    (outp / "schedule_trace.json").write_text(
+        json.dumps(asdict(res.schedule_plan), indent=2), encoding="utf-8"
     )
 
     swaps_total = sum(m.get("swap", 0) for m in res.local_metrics.values())

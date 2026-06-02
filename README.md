@@ -10,6 +10,7 @@ QuPort is a production-ready Python and Qiskit toolkit for modeling, mapping, ro
 
 <div align="center">
 
+[![Qiskit Ecosystem](https://qisk.it/e-390ee704)](https://qisk.it/e)
 [![Current Release](https://img.shields.io/github/release/neuralsorcerer/quport.svg)](https://github.com/neuralsorcerer/quport/releases)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-fcbc2c.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Test Linux](https://github.com/neuralsorcerer/quport/actions/workflows/ubuntu.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/ubuntu.yml?query=branch%3Amain)
@@ -751,6 +752,7 @@ result = compile_distributed(
 )
 
 print(result.schedule.makespan)
+print(result.schedule_plan.layers[0].remote_rounds)
 print(len(result.program.remote_ops))
 print(result.local_metrics)
 ```
@@ -851,6 +853,7 @@ Produces:
 | `qpu_<id>_routed.qasm` | Locally routed OpenQASM 3 circuit for QPU `<id>`. |
 | `remote_ops.json` | Ordered remote-operation trace. |
 | `schedule.json` | Topology-aware schedule summary. |
+| `schedule_trace.json` | Detailed per-layer and per-round communication plan with QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
 
 Remote operation entries have the shape:
 

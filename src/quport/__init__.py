@@ -16,11 +16,15 @@ from quport.pipeline import (
     sweep_topologies,
 )
 from quport.schedule import (
+    LayerScheduleTrace,
+    RemoteRoundTrace,
     ScheduleSummary,
+    TopologySchedulePlan,
     TopologyScheduleSummary,
     estimate_parallel_makespan,
     estimate_parallel_makespan_layered,
     estimate_parallel_makespan_topology,
+    estimate_topology_schedule_plan,
 )
 
 __all__ = [
@@ -29,14 +33,18 @@ __all__ = [
     "LatencyModel",
     "MultiQPUArchitecture",
     "MultiQPUConfig",
+    "LayerScheduleTrace",
     "RemoteOp",
+    "RemoteRoundTrace",
     "ScheduleSummary",
+    "TopologySchedulePlan",
     "TopologyScheduleSummary",
     "benchmark_random_circuits",
     "compile_distributed",
     "estimate_parallel_makespan",
     "estimate_parallel_makespan_layered",
     "estimate_parallel_makespan_topology",
+    "estimate_topology_schedule_plan",
     "map_and_transpile",
     "split_into_qpus",
     "sweep_topologies",

@@ -1098,6 +1098,12 @@ def tpccap_sa_partition(
             temp = temp0 * ((temp_end / temp0) ** frac)
 
         proposal_swap = rng.random() < p_swap
+        v = -1
+        u = -1
+        q0 = -1
+        q1 = -1
+        old_q = -1
+        new_q = -1
         if proposal_swap and len(nonempty_qpus) < 2:
             # Preserve swap-only mode semantics (e.g., p_swap == 1.0): when a
             # swap is requested but infeasible, skip the step rather than
@@ -1125,7 +1131,7 @@ def tpccap_sa_partition(
             new_q_opt = pick_free_qpu_excluding(old_q)
             if new_q_opt is None:
                 continue
-            new_q: int = new_q_opt
+            new_q = new_q_opt
             part[v] = new_q
             loads[old_q] -= 1
             loads[new_q] += 1

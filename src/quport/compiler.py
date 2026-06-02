@@ -56,7 +56,11 @@ from quport.partition import (
     tpccap_partition,
     tpccap_sa_partition,
 )
-from quport.schedule import TopologyScheduleSummary, estimate_parallel_makespan_topology
+from quport.schedule import (
+    TopologySchedulePlan,
+    TopologyScheduleSummary,
+    estimate_topology_schedule_plan,
+)
 
 
 def _translate_to_basis(
@@ -93,6 +97,7 @@ class DistributedCompileResult:
     global_metrics: CircuitMetrics
     local_metrics: dict[int, dict[str, int]]  # op counts per QPU (including swaps)
     schedule: TopologyScheduleSummary
+    schedule_plan: TopologySchedulePlan
 
     # Times
     mapping_time_s: float
@@ -156,6 +161,8 @@ def compile_distributed(
         partition_weights = extract_twoq_weights(qc_basis)  # int weights
 
     capacity = cfg.capacity_per_qpu()
+    part: list[int]
+    cut: float
     part_diag: PartitionDiagnostics | None = None
     anneal_diag: AnnealDiagnostics | None = None
 
@@ -214,6 +221,9 @@ def compile_distributed(
         part_diag = diag
         anneal_diag = ad
 
+    else:
+        raise ValueError("Unknown strategy.")
+
     # 2) Compute layout hints (comm qubit selection is diversity-aware for tpccap*)
     comm_mode = "diverse" if is_tpccap else "topk"
     hints = compute_layout_hints(qc_basis, arch, part, comm_mode=comm_mode)
@@ -256,7 +266,7 @@ def compile_distributed(
 
     # 6) Global metrics + topology-aware schedule estimate (remote rounds)
     global_metrics = compute_metrics(physical, arch)
-    sched = estimate_parallel_makespan_topology(physical, arch, latency)
+    sched_plan = estimate_topology_schedule_plan(physical, arch, latency)
 
     return DistributedCompileResult(
         physical_circuit=physical,
@@ -270,7 +280,8 @@ def compile_distributed(
         local_routed=local_routed,
         global_metrics=global_metrics,
         local_metrics=local_counts,
-        schedule=sched,
+        schedule=sched_plan.summary,
+        schedule_plan=sched_plan,
         mapping_time_s=mapping_time,
         local_transpile_time_s=local_time,
     )

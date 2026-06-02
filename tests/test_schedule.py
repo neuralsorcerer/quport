@@ -18,6 +18,7 @@ from quport.schedule import (
     estimate_parallel_makespan,
     estimate_parallel_makespan_layered,
     estimate_parallel_makespan_topology,
+    estimate_topology_schedule_plan,
 )
 
 
@@ -721,3 +722,170 @@ def test_topology_estimator_treats_single_port_clos_as_ring_not_switch() -> None
     assert summary.remote_ops == 1
     assert summary.remote_rounds == 1
     assert summary.makespan < UNSCHEDULABLE_PENALTY
+
+
+def test_topology_schedule_plan_exposes_round_trace() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=2,
+        inter_topology="switch",
+        link_capacity=2,
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.cx(0, 4)
+    qc.cx(1, 5)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    assert plan.summary.remote_ops == 2
+    assert plan.summary.remote_rounds == 1
+    assert len(plan.layers) == plan.summary.layers
+    remote_layers = [layer for layer in plan.layers if layer.remote_ops]
+    assert len(remote_layers) == 1
+    round_trace = remote_layers[0].remote_rounds[0]
+    assert round_trace.qpu_pairs == ((0, 1), (0, 1))
+    assert round_trace.qpu_ports_used == (2, 2)
+    assert round_trace.unschedulable_ops == 0
+
+
+def test_topology_schedule_plan_records_unschedulable_rounds() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=0,
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.cx(0, 1)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    assert plan.summary.remote_ops == 1
+    assert plan.summary.remote_rounds == 1
+    remote_layers = [layer for layer in plan.layers if layer.remote_ops]
+    assert remote_layers[0].remote_rounds[0].unschedulable_ops == 1
+    assert remote_layers[0].remote_rounds[0].duration >= UNSCHEDULABLE_PENALTY
+
+
+def test_topology_schedule_plan_summary_matches_public_summary_api() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.h(0)
+    qc.cx(0, 3)
+    qc.cx(1, 6)
+
+    model = LatencyModel()
+    plan = estimate_topology_schedule_plan(qc, arch, model)
+    summary = estimate_parallel_makespan_topology(qc, arch, model)
+
+    assert plan.summary == summary
+    assert plan.summary.layers == len(plan.layers)
+    assert sum(layer.remote_ops for layer in plan.layers) == summary.remote_ops
+    assert (
+        sum(len(layer.remote_rounds) for layer in plan.layers) == summary.remote_rounds
+    )
+
+
+def test_topology_schedule_plan_handles_circuits_without_dag_layers() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=1,
+        compute_qubits_per_qpu=0,
+        comm_qubits_per_qpu=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    qc = QuantumCircuit(0)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    assert plan.summary.makespan == 0.0
+    assert plan.summary.layers == 0
+    assert plan.summary.remote_ops == 0
+    assert plan.summary.remote_rounds == 0
+    assert plan.layers == ()
+
+
+def test_topology_schedule_plan_records_multihop_link_utilization() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    # Physical qubits 0 and 4 are on QPUs 0 and 2, which are two hops apart on
+    # the ring.  The deterministic shortest path is 0 -> 1 -> 2.
+    qc.cx(0, 4)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    round_trace = next(
+        layer.remote_rounds[0] for layer in plan.layers if layer.remote_ops
+    )
+    assert round_trace.qpu_pairs == ((0, 2),)
+    assert round_trace.qpu_ports_used == (1, 0, 1, 0)
+    assert round_trace.link_utilization == (((0, 1), 1), ((1, 2), 1))
+
+
+def test_topology_schedule_plan_records_switch_reconfiguration_delay() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        switch_reconfig_delay=7.0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    lat = LatencyModel(epr_gen=10.0, classical_rtt=4.0, remote_gate_overhead=3.0)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.cx(0, 2)
+
+    plan = estimate_topology_schedule_plan(qc, arch, lat)
+
+    remote_round = next(
+        layer.remote_rounds[0] for layer in plan.layers if layer.remote_ops
+    )
+    # One hop: epr_gen + overlapped classical_rtt (50% by default) + overhead + reconfig.
+    assert remote_round.duration == 10.0 + 2.0 + 3.0 + 7.0
+    assert plan.summary.makespan == remote_round.duration
+
+
+def test_topology_schedule_plan_records_zero_switch_pair_budget_penalties() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=2,
+        inter_topology="switch",
+        switch_parallel_links=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.cx(0, 4)
+    qc.cx(1, 5)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    remote_layers = [layer for layer in plan.layers if layer.remote_ops]
+    assert len(remote_layers) == 1
+    assert remote_layers[0].remote_ops == 2
+    assert [round_.unschedulable_ops for round_ in remote_layers[0].remote_rounds] == [
+        1,
+        1,
+    ]
+    assert plan.summary.remote_rounds == 2
+    assert plan.summary.makespan >= 2 * UNSCHEDULABLE_PENALTY

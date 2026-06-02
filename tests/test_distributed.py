@@ -432,3 +432,23 @@ def test_compile_distributed_rejects_circuit_larger_than_physical_capacity() -> 
 
     with pytest.raises(ValueError, match="exceed physical qubits"):
         compile_distributed(qc, cfg, strategy="balanced")
+
+
+def test_compile_distributed_exposes_schedule_plan_matching_summary() -> None:
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    qc = QuantumCircuit(2)
+    qc.cx(0, 1)
+
+    result = compile_distributed(qc, cfg, strategy="balanced", seed=0)
+
+    assert result.schedule_plan.summary == result.schedule
+    assert result.schedule_plan.summary.remote_ops == len(result.program.remote_ops)
+    assert len(result.schedule_plan.layers) == result.schedule.layers
