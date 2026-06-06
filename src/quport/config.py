@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Literal
 
@@ -48,6 +48,22 @@ def _validate_nonempty_string(value: object, *, label: str) -> str:
     return out
 
 
+def _normalize_basis_gates(value: object) -> tuple[str, ...]:
+    """Validate and normalize transpiler basis gate names.
+
+    Config files deserialize tuples as lists, so the public configuration accepts
+    any non-string sequence but stores an immutable tuple internally.
+    """
+    if isinstance(value, str | bytes | bytearray) or not isinstance(value, Sequence):
+        raise ValueError("basis_gates must be a sequence of gate names")
+    normalized = tuple(
+        _validate_nonempty_string(gate, label="basis_gates entries") for gate in value
+    )
+    if not normalized:
+        raise ValueError("basis_gates must contain at least one gate name")
+    return normalized
+
+
 @dataclass(frozen=True)
 class MultiQPUConfig:
     """Configuration for the multi-QPU architecture and mapping pipeline."""
@@ -79,7 +95,7 @@ class MultiQPUConfig:
     grid_cols: int | None = None
 
     # Transpiler settings
-    basis_gates: tuple[str, ...] = ("rz", "sx", "x", "cx")
+    basis_gates: Sequence[str] = ("rz", "sx", "x", "cx")
     optimization_level: int = 3
     layout_method: str = "sabre"
     routing_method: str = "sabre"
@@ -93,10 +109,9 @@ class MultiQPUConfig:
         if async_overlap > 1.0:
             raise ValueError("async_overlap must be in [0, 1]")
 
-        if not isinstance(self.basis_gates, tuple):
-            raise ValueError("basis_gates must be a tuple of gate names")
-        for gate in self.basis_gates:
-            _validate_nonempty_string(gate, label="basis_gates entries")
+        object.__setattr__(
+            self, "basis_gates", _normalize_basis_gates(self.basis_gates)
+        )
 
         optimization_level = validate_nonnegative_integral(
             self.optimization_level, label="optimization_level"

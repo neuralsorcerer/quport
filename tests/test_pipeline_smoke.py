@@ -296,3 +296,128 @@ def test_mapping_entrypoints_reject_invalid_optional_seeds(seed: object) -> None
         map_and_transpile(qc, cfg, seed=seed)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="seed"):
         transpile_baseline(qc, cfg, seed=seed)  # type: ignore[arg-type]
+
+
+def test_benchmark_supports_tpccap_sa_strategy() -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+
+    rows = benchmark_random_circuits(
+        cfg,
+        n_logical=3,
+        depth=1,
+        trials=1,
+        seed=2,
+        strategies=("tpccap_sa",),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["strategy"] == "tpccap_sa"
+    assert rows[0]["method"] == 3.0
+
+
+def test_sweep_can_include_tpccap_sa_strategy(tmp_path: Path) -> None:
+    from quport.pipeline import sweep_topologies
+
+    out = tmp_path / "sweep_tpccap_sa.csv"
+
+    sweep_topologies(
+        n_logical=1,
+        depth=0,
+        trials=0,
+        seed=5,
+        out_csv=str(out),
+        intra_topologies=("clique",),
+        inter_topologies=("switch",),
+        comm_ports=(0,),
+        compute_per_qpu=1,
+        n_qpus=1,
+        strategies=("tpccap_sa",),
+    )
+
+    assert "3.0" in out.read_text(encoding="utf-8")
+
+
+def test_benchmark_preserves_requested_strategy_order() -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+
+    rows = benchmark_random_circuits(
+        cfg,
+        n_logical=3,
+        depth=0,
+        trials=1,
+        seed=4,
+        strategies=("tpccap_sa", "baseline"),
+    )
+
+    assert [row["strategy"] for row in rows] == ["tpccap_sa", "baseline"]
+    assert [row["method"] for row in rows] == [3.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    ("strategies", "match"),
+    [
+        ((), "at least one strategy"),
+        (("baseline", "baseline"), "duplicate strategies: baseline"),
+        (("not-a-strategy",), "Unknown benchmark strategies: not-a-strategy"),
+    ],
+)
+def test_benchmark_rejects_invalid_strategy_sequences(
+    strategies: tuple[str, ...], match: str
+) -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+
+    with pytest.raises(ValueError, match=match):
+        benchmark_random_circuits(
+            cfg,
+            n_logical=1,
+            depth=0,
+            trials=0,
+            strategies=strategies,
+        )
+
+
+@pytest.mark.parametrize(
+    ("strategies", "match"),
+    [
+        ((), "at least one strategy"),
+        (("tpccap", "tpccap"), "duplicate strategies: tpccap"),
+        (("bad",), "Unknown sweep strategies: bad"),
+    ],
+)
+def test_sweep_rejects_invalid_strategy_sequences(
+    tmp_path: Path, strategies: tuple[str, ...], match: str
+) -> None:
+    from quport.pipeline import sweep_topologies
+
+    with pytest.raises(ValueError, match=match):
+        sweep_topologies(
+            n_logical=1,
+            depth=0,
+            trials=0,
+            seed=5,
+            out_csv=str(tmp_path / "sweep.csv"),
+            intra_topologies=("clique",),
+            inter_topologies=("switch",),
+            comm_ports=(0,),
+            compute_per_qpu=1,
+            n_qpus=1,
+            strategies=strategies,
+        )

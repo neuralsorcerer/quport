@@ -113,7 +113,7 @@ def bench(
     seed: int = typer.Option(0, help="Base seed"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,tpccap",
+        help="Comma-separated strategies: baseline,balanced,tpccap,tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     out: str = typer.Option("results.csv", help="Output CSV path"),
@@ -144,6 +144,10 @@ def sweep(
     trials: int = typer.Option(5, help="Trials per setting"),
     seed: int = typer.Option(0, help="Base seed"),
     out: str = typer.Option("sweep.csv", help="Output CSV summary"),
+    strategies: str = typer.Option(
+        "baseline,balanced,tpccap",
+        help="Comma-separated strategies: baseline,balanced,tpccap,tpccap_sa",
+    ),
     plot: str | None = typer.Option(
         None, help="Optional PNG plot (requires quport[viz])"
     ),
@@ -155,6 +159,7 @@ def sweep(
         trials=trials,
         seed=seed,
         out_csv=out,
+        strategies=[s.strip() for s in strategies.split(",") if s.strip()],
     )
     console.print(f"Wrote sweep summary to {out}")
 
@@ -162,11 +167,20 @@ def sweep(
         plt, pd = _load_plot_modules()
 
         df = pd.read_csv(out)
-        # plot cost_mean vs ports for baseline and quport (method 0 vs 1)
         fig = plt.figure()
-        for method, label in [(0.0, "baseline"), (1.0, "balanced"), (2.0, "tpccap")]:
+        method_labels = {
+            0.0: "baseline",
+            1.0: "balanced",
+            2.0: "tpccap",
+            3.0: "tpccap_sa",
+        }
+        for method in sorted(df["method"].unique()):
             sub = df[df["method"] == method]
-            plt.scatter(sub["ports"], sub["cost_mean"], label=label)
+            plt.scatter(
+                sub["ports"],
+                sub["cost_mean"],
+                label=method_labels.get(float(method), str(method)),
+            )
         plt.xlabel("comm ports per QPU")
         plt.ylabel("mean estimated cost")
         plt.legend()

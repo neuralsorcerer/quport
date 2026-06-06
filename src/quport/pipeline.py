@@ -34,6 +34,12 @@ from quport.partition import (
 BenchmarkRow: TypeAlias = dict[str, float | str]
 SweepSummaryRow: TypeAlias = dict[str, float | str]
 _StringT = TypeVar("_StringT", bound=str)
+_BENCHMARK_METHOD_IDS = {
+    "baseline": 0.0,
+    "balanced": 1.0,
+    "tpccap": 2.0,
+    "tpccap_sa": 3.0,
+}
 
 
 def _validate_positive_int(value: object, *, label: str) -> int:
@@ -59,6 +65,35 @@ def _validate_string_sequence(
         if not isinstance(value, str):
             raise ValueError(f"{label}[{idx}] must be a string")
     return out
+
+
+def _validate_strategy_sequence(
+    values: Sequence[str],
+    *,
+    label: str,
+) -> tuple[str, ...]:
+    """Validate benchmark/sweep strategy names, preserving caller order."""
+    selected = _validate_string_sequence(values, label=label)
+    if not selected:
+        raise ValueError(f"{label} must contain at least one strategy")
+
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for strategy in selected:
+        if strategy in seen and strategy not in duplicates:
+            duplicates.append(strategy)
+        seen.add(strategy)
+    if duplicates:
+        duplicate_list = ", ".join(duplicates)
+        raise ValueError(f"{label} contains duplicate strategies: {duplicate_list}")
+
+    unknown = sorted(set(selected) - set(_BENCHMARK_METHOD_IDS))
+    if unknown:
+        allowed = ", ".join(_BENCHMARK_METHOD_IDS)
+        raise ValueError(
+            f"Unknown {label}: {', '.join(unknown)}. Use any of: {allowed}."
+        )
+    return selected
 
 
 def _validate_nonnegative_int_sequence(
@@ -345,11 +380,12 @@ def benchmark_random_circuits(
         - "baseline": identity-ish initial layout + SABRE routing
         - "balanced": QuPort baseline partitioner
         - "tpccap": QuPort novel partitioner (topology+port+congestion aware)
+        - "tpccap_sa": TPCCAP plus simulated-annealing refinement
 
     Notes
     -----
     The CSV is deliberately numeric-friendly. The column `method` encodes:
-        baseline=0, balanced=1, tpccap=2
+        baseline=0, balanced=1, tpccap=2, tpccap_sa=3
     and the column `strategy` stores the string name for readability.
     """
     latency = latency or LatencyModel()
@@ -360,15 +396,9 @@ def benchmark_random_circuits(
     trials_value = validate_nonnegative_integral(trials, label="trials")
     seed_value = validate_nonnegative_integral(seed, label="seed")
 
-    method_id = {"baseline": 0.0, "balanced": 1.0, "tpccap": 2.0}
-    selected_strategies = _validate_string_sequence(strategies, label="strategies")
-    unknown = sorted(set(selected_strategies) - set(method_id))
-    if unknown:
-        raise ValueError(
-            "Unknown benchmark strategies: "
-            + ", ".join(unknown)
-            + ". Use any of: baseline, balanced, tpccap."
-        )
+    selected_strategies = _validate_strategy_sequence(
+        strategies, label="benchmark strategies"
+    )
 
     fieldnames = [
         "trial",
@@ -390,24 +420,22 @@ def benchmark_random_circuits(
         s = seed_value + t
         qc = random_benchmark_circuit(n_logical_value, depth_value, s)
 
-        results: dict[str, MapResult] = {}
-        if "baseline" in selected_strategies:
-            results["baseline"] = transpile_baseline(qc, cfg, latency=latency, seed=s)
-        if "balanced" in selected_strategies:
-            results["balanced"] = map_and_transpile(
-                qc, cfg, latency=latency, seed=s, strategy="balanced"
-            )
-        if "tpccap" in selected_strategies:
-            results["tpccap"] = map_and_transpile(
-                qc, cfg, latency=latency, seed=s, strategy="tpccap"
-            )
+        results: list[tuple[str, MapResult]] = []
+        for strategy_name in selected_strategies:
+            if strategy_name == "baseline":
+                result = transpile_baseline(qc, cfg, latency=latency, seed=s)
+            else:
+                result = map_and_transpile(
+                    qc, cfg, latency=latency, seed=s, strategy=strategy_name
+                )
+            results.append((strategy_name, result))
 
-        for strat, r in results.items():
+        for strat, r in results:
             rows.append(
                 {
                     "trial": float(t),
                     "seed": float(s),
-                    "method": method_id[strat],
+                    "method": _BENCHMARK_METHOD_IDS[strat],
                     "strategy": strat,
                     "swaps": float(r.metrics.swaps),
                     "remote_2q": float(r.metrics.remote_2q),
@@ -442,6 +470,7 @@ def sweep_topologies(
     compute_per_qpu: int = 8,
     n_qpus: int = 10,
     inter_degree: int = 2,
+    strategies: Sequence[str] = ("baseline", "balanced", "tpccap"),
 ) -> None:
     """Sweep multiple topology settings; write summary CSV."""
     n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
@@ -459,6 +488,9 @@ def sweep_topologies(
     inter_values = _validate_string_sequence(inter_topologies, label="inter_topologies")
     comm_port_values = _validate_nonnegative_int_sequence(
         comm_ports, label="comm_ports"
+    )
+    selected_strategies = _validate_strategy_sequence(
+        strategies, label="sweep strategies"
     )
 
     latency = LatencyModel()
@@ -486,6 +518,7 @@ def sweep_topologies(
                     seed=seed_value,
                     latency=latency,
                     out_csv=None,
+                    strategies=selected_strategies,
                 )
 
                 rows_snapshot = list(rows)
@@ -493,16 +526,16 @@ def sweep_topologies(
                 inter_id = inter
                 ports_count = ports
 
-                # aggregate for baseline (0.0), balanced (1.0), and tpccap (2.0)
                 def agg(
-                    method: float,
+                    strategy_name: str,
                     *,
                     rows_snapshot: list[BenchmarkRow] = rows_snapshot,
                     intra_id: str = intra_id,
                     inter_id: str = inter_id,
                     ports_count: int = ports_count,
                 ) -> SweepSummaryRow:
-                    rs = [r for r in rows_snapshot if r["method"] == method]
+                    method = _BENCHMARK_METHOD_IDS[strategy_name]
+                    rs = [r for r in rows_snapshot if r["strategy"] == strategy_name]
 
                     def mean(k: str) -> float:
                         return sum(float(r[k]) for r in rs) / max(1, len(rs))
@@ -519,9 +552,8 @@ def sweep_topologies(
                         "transpile_time_mean": mean("transpile_time_s"),
                     }
 
-                summary.append(agg(0.0))
-                summary.append(agg(1.0))
-                summary.append(agg(2.0))
+                for strategy_name in selected_strategies:
+                    summary.append(agg(strategy_name))
 
     sweep_fieldnames = [
         "intra",
