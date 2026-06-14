@@ -4,6 +4,8 @@
 # This source code is licensed under the Apache-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("qiskit")
@@ -452,3 +454,218 @@ def test_compile_distributed_exposes_schedule_plan_matching_summary() -> None:
     assert result.schedule_plan.summary == result.schedule
     assert result.schedule_plan.summary.remote_ops == len(result.program.remote_ops)
     assert len(result.schedule_plan.layers) == result.schedule.layers
+
+
+def test_remote_op_to_dict_is_json_safe_for_symbolic_and_complex_params() -> None:
+    import json
+
+    from qiskit.circuit import Parameter
+
+    from quport.distributed import RemoteOp
+
+    theta = Parameter("θ")
+    remote = RemoteOp(
+        name="remote_parametric",
+        q0_phys=0,
+        q1_phys=2,
+        qpu0=0,
+        qpu1=1,
+        params=(theta, theta + 1, 1.25, 2 + 3j, ("nested", theta)),
+        clbits=(1, 3),
+        index=7,
+    )
+
+    payload = remote.to_dict()
+
+    json.dumps(payload)
+    assert payload["name"] == "remote_parametric"
+    assert payload["params"][0] == {"type": "Parameter", "repr": "θ"}
+    assert payload["params"][2] == 1.25
+    assert payload["params"][3] == {"type": "complex", "real": 2.0, "imag": 3.0}
+    assert payload["params"][4][0] == "nested"
+    assert payload["clbits"] == [1, 3]
+
+
+def test_distributed_program_remote_ops_payload_and_writer_are_json_safe(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from qiskit.circuit import Parameter
+
+    from quport.distributed import write_remote_ops_json
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=0,
+        intra_topology="line",
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    theta = Parameter("theta")
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.crx(theta, 0, 2)
+
+    program = split_into_qpus(mapped, arch)
+    payload = program.remote_ops_payload()
+    out = tmp_path / "remote_ops.json"
+    write_remote_ops_json(program.remote_ops, out)
+
+    assert json.loads(json.dumps(payload)) == json.loads(
+        out.read_text(encoding="utf-8")
+    )
+    assert payload[0]["name"] == "crx"
+    assert payload[0]["params"] == [{"type": "Parameter", "repr": "theta"}]
+
+
+def test_remote_op_to_dict_encodes_nonfinite_bytes_sets_and_mapping_collisions() -> (
+    None
+):
+    import json
+    import math
+
+    from quport.distributed import RemoteOp
+
+    remote = RemoteOp(
+        name="remote_edge_params",
+        q0_phys=0,
+        q1_phys=1,
+        qpu0=0,
+        qpu1=1,
+        params=(
+            float("nan"),
+            float("inf"),
+            complex(float("-inf"), math.nan),
+            b"abc",
+            {"1": "string-key", 1: "integer-key"},
+            {3, 1, 2},
+        ),
+        clbits=(),
+        index=0,
+    )
+
+    payload = remote.to_dict()
+    encoded = json.dumps(payload, allow_nan=False)
+
+    assert "NaN" not in encoded
+    assert payload["params"][0] == {"type": "float", "value": "nan"}
+    assert payload["params"][1] == {"type": "float", "value": "inf"}
+    assert payload["params"][2] == {
+        "type": "complex",
+        "real": {"type": "float", "value": "-inf"},
+        "imag": {"type": "float", "value": "nan"},
+    }
+    assert payload["params"][3] == {
+        "type": "bytes",
+        "encoding": "base64",
+        "data": "YWJj",
+    }
+    assert payload["params"][4] == {
+        "type": "mapping",
+        "entries": [["1", "string-key"], [1, "integer-key"]],
+    }
+    assert payload["params"][5] == {"type": "set", "items": [1, 2, 3]}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("name", "", "remote operation name must be a non-empty string"),
+        ("q0_phys", -1, "q0_phys must be non-negative"),
+        ("q1_phys", True, "q1_phys must be an integer"),
+        ("q1_phys", 0, "physical qubits must be distinct"),
+        ("qpu0", 1.5, "qpu0 must be an integer"),
+        ("qpu1", -1, "qpu1 must be non-negative"),
+        ("qpu1", 0, "QPUs must be distinct"),
+        ("params", None, "params must be a sequence"),
+        ("params", "not-a-sequence", "params must be a sequence"),
+        ("clbits", None, "clbits must be a sequence"),
+        ("clbits", (False,), "clbit index must be an integer"),
+        ("index", -1, "index must be non-negative"),
+    ],
+)
+def test_remote_op_to_dict_rejects_invalid_manifest_fields(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    from quport.distributed import RemoteOp
+
+    kwargs: dict[str, object] = {
+        "name": "remote",
+        "q0_phys": 0,
+        "q1_phys": 1,
+        "qpu0": 0,
+        "qpu1": 1,
+        "params": (),
+        "clbits": (),
+        "index": 0,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        RemoteOp(**kwargs).to_dict()  # type: ignore[arg-type]
+
+
+def test_remote_op_to_dict_rejects_cyclic_parameter_containers() -> None:
+    from quport.distributed import RemoteOp
+
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    remote = RemoteOp(
+        name="remote_cyclic",
+        q0_phys=0,
+        q1_phys=1,
+        qpu0=0,
+        qpu1=1,
+        params=(cyclic,),
+        clbits=(),
+        index=0,
+    )
+
+    with pytest.raises(ValueError, match="parameters cannot contain cycles"):
+        remote.to_dict()
+
+
+def test_write_remote_ops_json_creates_parent_directories(tmp_path: Path) -> None:
+    import json
+
+    from quport.distributed import RemoteOp, write_remote_ops_json
+
+    out = tmp_path / "nested" / "remote_ops.json"
+    remote = RemoteOp(
+        name="remote",
+        q0_phys=0,
+        q1_phys=1,
+        qpu0=0,
+        qpu1=1,
+        params=(),
+        clbits=(),
+        index=0,
+    )
+
+    write_remote_ops_json((remote,), out)
+
+    assert json.loads(out.read_text(encoding="utf-8")) == [remote.to_dict()]
+
+
+def test_write_remote_ops_json_accepts_generators_and_rejects_bad_entries(
+    tmp_path: Path,
+) -> None:
+    from quport.distributed import RemoteOp, write_remote_ops_json
+
+    remote = RemoteOp(
+        name="remote",
+        q0_phys=0,
+        q1_phys=1,
+        qpu0=0,
+        qpu1=1,
+        params=(),
+        clbits=(),
+        index=0,
+    )
+    write_remote_ops_json((op for op in (remote,)), tmp_path / "ops.json")
+
+    with pytest.raises(ValueError, match=r"remote_ops\[0\] must be a RemoteOp"):
+        write_remote_ops_json((object(),), tmp_path / "bad.json")  # type: ignore[arg-type]

@@ -9,7 +9,12 @@
 from quport.architecture import MultiQPUArchitecture
 from quport.compiler import DistributedCompileResult, compile_distributed
 from quport.config import LatencyModel, MultiQPUConfig
-from quport.distributed import DistributedProgram, RemoteOp, split_into_qpus
+from quport.distributed import (
+    DistributedProgram,
+    RemoteOp,
+    split_into_qpus,
+    write_remote_ops_json,
+)
 from quport.pipeline import (
     benchmark_random_circuits,
     map_and_transpile,
@@ -47,5 +52,6 @@ __all__ = [
     "estimate_topology_schedule_plan",
     "map_and_transpile",
     "split_into_qpus",
+    "write_remote_ops_json",
     "sweep_topologies",
 ]

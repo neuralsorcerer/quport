@@ -25,6 +25,7 @@ from quport.config import (
     load_config,
     optional_module_available,
 )
+from quport.distributed import write_remote_ops_json
 from quport.pipeline import (
     benchmark_random_circuits,
     map_and_transpile,
@@ -245,8 +246,7 @@ def split(
         (outp / f"qpu_{qpu}.qasm").write_text(qasm3.dumps(c), encoding="utf-8")
 
     # write remote ops
-    rops = [op.__dict__ for op in prog.remote_ops]
-    (outp / "remote_ops.json").write_text(json.dumps(rops, indent=2), encoding="utf-8")
+    write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
 
     console.print(
         f"Wrote {len(prog.local_circuits)} local circuits and {len(prog.remote_ops)} remote ops to {out_dir}"
@@ -296,10 +296,7 @@ def compile_dist(
     for qpu, c in res.local_routed.items():
         (outp / f"qpu_{qpu}_routed.qasm").write_text(qasm3.dumps(c), encoding="utf-8")
 
-    (outp / "remote_ops.json").write_text(
-        json.dumps([op.__dict__ for op in res.program.remote_ops], indent=2),
-        encoding="utf-8",
-    )
+    write_remote_ops_json(res.program.remote_ops, outp / "remote_ops.json")
     (outp / "schedule.json").write_text(
         json.dumps(asdict(res.schedule), indent=2), encoding="utf-8"
     )

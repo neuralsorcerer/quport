@@ -6,12 +6,146 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import math
+from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
+from numbers import Integral
+from pathlib import Path
 from typing import Any
 
 from qiskit import QuantumCircuit
 
 from quport.architecture import MultiQPUArchitecture
+
+
+def _validate_manifest_int(value: object, *, label: str) -> int:
+    """Return a non-negative integer manifest field, rejecting bools."""
+    if type(value) is bool or not isinstance(value, Integral):
+        raise ValueError(f"{label} must be an integer")
+    out = int(value)
+    if out < 0:
+        raise ValueError(f"{label} must be non-negative")
+    return out
+
+
+def _validate_manifest_sequence(value: object, *, label: str) -> Sequence[object]:
+    """Return a sequence manifest field, rejecting string-like containers."""
+    if isinstance(value, str | bytes | bytearray | memoryview) or not isinstance(
+        value, Sequence
+    ):
+        raise ValueError(f"{label} must be a sequence")
+    return value
+
+
+def _json_safe_float(value: float) -> Any:
+    """Represent finite floats directly and non-finite floats explicitly."""
+    if math.isfinite(value):
+        return value
+    if math.isnan(value):
+        label = "nan"
+    elif value > 0:
+        label = "inf"
+    else:
+        label = "-inf"
+    return {"type": "float", "value": label}
+
+
+def _enter_container(value: object, seen: set[int]) -> int:
+    """Track containers so self-referential parameter structures fail clearly."""
+    object_id = id(value)
+    if object_id in seen:
+        raise ValueError("remote operation parameters cannot contain cycles")
+    seen.add(object_id)
+    return object_id
+
+
+def _json_safe_mapping(value: Mapping[object, object], seen: set[int]) -> Any:
+    """Convert mappings while avoiding string-key collisions."""
+    object_id = _enter_container(value, seen)
+    try:
+        converted: dict[str, Any] = {}
+        entries: list[list[Any]] = []
+        use_entries = False
+        for key, item in value.items():
+            safe_key = _json_safe_value(key, seen)
+            safe_item = _json_safe_value(item, seen)
+            entries.append([safe_key, safe_item])
+
+            if isinstance(key, str) and key not in converted and not use_entries:
+                converted[key] = safe_item
+            else:
+                use_entries = True
+
+        if not use_entries:
+            return converted
+        return {"type": "mapping", "entries": entries}
+    finally:
+        seen.remove(object_id)
+
+
+def _json_safe_sequence(value: Sequence[object], seen: set[int]) -> list[Any]:
+    """Convert ordered containers to JSON arrays with cycle detection."""
+    object_id = _enter_container(value, seen)
+    try:
+        return [_json_safe_value(item, seen) for item in value]
+    finally:
+        seen.remove(object_id)
+
+
+def _json_safe_set(value: Set[object], seen: set[int]) -> Any:
+    """Convert unordered containers deterministically without losing their type."""
+    object_id = _enter_container(value, seen)
+    try:
+        items = [_json_safe_value(item, seen) for item in sorted(value, key=repr)]
+        return {"type": type(value).__name__, "items": items}
+    finally:
+        seen.remove(object_id)
+
+
+def _json_safe_value(value: object, seen: set[int] | None = None) -> Any:
+    """Convert instruction metadata to a deterministic JSON-compatible value.
+
+    Qiskit gate parameters are usually numbers or symbolic parameters, but custom
+    instructions may carry richer metadata. This helper preserves JSON-native
+    values, explicitly encodes non-finite/complex/bytes/container edge cases, and
+    falls back to a typed string representation for opaque objects.
+    """
+    active_seen = set() if seen is None else seen
+
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        return _json_safe_float(value)
+    if isinstance(value, complex):
+        return {
+            "type": "complex",
+            "real": _json_safe_float(value.real),
+            "imag": _json_safe_float(value.imag),
+        }
+    if isinstance(value, bytes | bytearray | memoryview):
+        raw = bytes(value)
+        return {
+            "type": type(value).__name__,
+            "encoding": "base64",
+            "data": base64.b64encode(raw).decode("ascii"),
+        }
+    if isinstance(value, Mapping):
+        return _json_safe_mapping(value, active_seen)
+    if isinstance(value, Set):
+        return _json_safe_set(value, active_seen)
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        return _json_safe_sequence(value, active_seen)
+
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_safe_value(item(), active_seen)
+        except (TypeError, ValueError):
+            pass
+
+    return {"type": type(value).__name__, "repr": str(value)}
 
 
 @dataclass(frozen=True)
@@ -27,6 +161,41 @@ class RemoteOp:
     clbits: tuple[int, ...]
     index: int  # global instruction index
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a stable, JSON-safe representation of this remote operation."""
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("remote operation name must be a non-empty string")
+
+        q0_phys = _validate_manifest_int(self.q0_phys, label="remote operation q0_phys")
+        q1_phys = _validate_manifest_int(self.q1_phys, label="remote operation q1_phys")
+        qpu0 = _validate_manifest_int(self.qpu0, label="remote operation qpu0")
+        qpu1 = _validate_manifest_int(self.qpu1, label="remote operation qpu1")
+        if q0_phys == q1_phys:
+            raise ValueError("remote operation physical qubits must be distinct")
+        if qpu0 == qpu1:
+            raise ValueError("remote operation QPUs must be distinct")
+
+        params = _json_safe_sequence(
+            _validate_manifest_sequence(self.params, label="remote operation params"),
+            set(),
+        )
+        clbits = [
+            _validate_manifest_int(clbit, label="remote operation clbit index")
+            for clbit in _validate_manifest_sequence(
+                self.clbits, label="remote operation clbits"
+            )
+        ]
+        return {
+            "name": self.name,
+            "q0_phys": q0_phys,
+            "q1_phys": q1_phys,
+            "qpu0": qpu0,
+            "qpu1": qpu1,
+            "params": params,
+            "clbits": clbits,
+            "index": _validate_manifest_int(self.index, label="remote operation index"),
+        }
+
 
 @dataclass
 class DistributedProgram:
@@ -34,6 +203,32 @@ class DistributedProgram:
 
     local_circuits: dict[int, QuantumCircuit]
     remote_ops: list[RemoteOp]
+
+    def remote_ops_payload(self) -> list[dict[str, Any]]:
+        """Return the ordered remote-operation manifest as JSON-safe dictionaries."""
+        return [op.to_dict() for op in self.remote_ops]
+
+
+def write_remote_ops_json(remote_ops: Iterable[RemoteOp], path: str | Path) -> None:
+    """Write remote operations as a stable JSON manifest.
+
+    The writer creates parent directories and uses ``allow_nan=False`` so the
+    emitted manifest is standards-compliant JSON rather than Python's extended
+    NaN/Infinity dialect.
+    """
+    payload: list[dict[str, Any]] = []
+    for idx, op in enumerate(remote_ops):
+        if not isinstance(op, RemoteOp):
+            raise ValueError(f"remote_ops[{idx}] must be a RemoteOp")
+        payload.append(op.to_dict())
+
+    out_path = Path(path)
+    if out_path.parent != Path(""):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _group_qubits_by_qpu_in_operand_order(
