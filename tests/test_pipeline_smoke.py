@@ -421,3 +421,77 @@ def test_sweep_rejects_invalid_strategy_sequences(
             n_qpus=1,
             strategies=strategies,
         )
+
+
+def test_benchmark_supports_cluster_strategy(tmp_path: Path) -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0)
+    out = tmp_path / "cluster.csv"
+
+    rows = benchmark_random_circuits(
+        cfg,
+        n_logical=1,
+        depth=0,
+        trials=1,
+        out_csv=str(out),
+        strategies=("cluster",),
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["strategy"] == "cluster"
+    assert rows[0]["method"] == 4.0
+    assert "cluster" in out.read_text(encoding="utf-8")
+
+
+def test_benchmark_method_labels_are_stable_copy() -> None:
+    from quport.pipeline import benchmark_method_labels
+
+    labels = benchmark_method_labels()
+    labels[4.0] = "mutated"
+
+    assert benchmark_method_labels()[4.0] == "cluster"
+
+
+def test_sweep_supports_cluster_strategy_with_zero_trials(tmp_path: Path) -> None:
+    from quport.pipeline import sweep_topologies
+
+    out = tmp_path / "sweep_cluster.csv"
+
+    sweep_topologies(
+        n_logical=1,
+        depth=0,
+        trials=0,
+        seed=5,
+        out_csv=str(out),
+        intra_topologies=("clique",),
+        inter_topologies=("switch",),
+        comm_ports=(0,),
+        compute_per_qpu=1,
+        n_qpus=1,
+        strategies=("cluster",),
+    )
+
+    assert out.read_text(encoding="utf-8") == (
+        "intra,inter,ports,method,swaps_mean,remote_2q_mean,depth_mean,"
+        "cost_mean,transpile_time_mean\n"
+        "clique,switch,0.0,4.0,0.0,0.0,0.0,0.0,0.0\n"
+    )
+
+
+def test_benchmark_preserves_cluster_strategy_order() -> None:
+    from quport.pipeline import benchmark_random_circuits
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0)
+
+    rows = benchmark_random_circuits(
+        cfg,
+        n_logical=1,
+        depth=0,
+        trials=1,
+        seed=4,
+        strategies=("cluster", "baseline"),
+    )
+
+    assert [row["strategy"] for row in rows] == ["cluster", "baseline"]
+    assert [row["method"] for row in rows] == [4.0, 0.0]

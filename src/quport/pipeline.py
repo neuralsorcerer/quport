@@ -39,7 +39,16 @@ _BENCHMARK_METHOD_IDS = {
     "balanced": 1.0,
     "tpccap": 2.0,
     "tpccap_sa": 3.0,
+    "cluster": 4.0,
 }
+_BENCHMARK_METHOD_LABELS = {
+    method_id: strategy for strategy, method_id in _BENCHMARK_METHOD_IDS.items()
+}
+
+
+def benchmark_method_labels() -> dict[float, str]:
+    """Return a copy of the stable numeric benchmark-method label map."""
+    return dict(_BENCHMARK_METHOD_LABELS)
 
 
 def _validate_positive_int(value: object, *, label: str) -> int:
@@ -379,13 +388,14 @@ def benchmark_random_circuits(
         Any subset of:
         - "baseline": identity-ish initial layout + SABRE routing
         - "balanced": QuPort baseline partitioner
+        - "cluster": heavy-edge clustering partitioner
         - "tpccap": QuPort novel partitioner (topology+port+congestion aware)
         - "tpccap_sa": TPCCAP plus simulated-annealing refinement
 
     Notes
     -----
     The CSV is deliberately numeric-friendly. The column `method` encodes:
-        baseline=0, balanced=1, tpccap=2, tpccap_sa=3
+        baseline=0, balanced=1, tpccap=2, tpccap_sa=3, cluster=4
     and the column `strategy` stores the string name for readability.
     """
     latency = latency or LatencyModel()

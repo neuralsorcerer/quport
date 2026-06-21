@@ -27,6 +27,7 @@ from quport.config import (
 )
 from quport.distributed import write_remote_ops_json
 from quport.pipeline import (
+    benchmark_method_labels,
     benchmark_random_circuits,
     map_and_transpile,
     random_benchmark_circuit,
@@ -114,7 +115,7 @@ def bench(
     seed: int = typer.Option(0, help="Base seed"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,tpccap,tpccap_sa",
+        help="Comma-separated strategies: baseline,balanced,cluster,tpccap,tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     out: str = typer.Option("results.csv", help="Output CSV path"),
@@ -147,7 +148,7 @@ def sweep(
     out: str = typer.Option("sweep.csv", help="Output CSV summary"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,tpccap,tpccap_sa",
+        help="Comma-separated strategies: baseline,balanced,cluster,tpccap,tpccap_sa",
     ),
     plot: str | None = typer.Option(
         None, help="Optional PNG plot (requires quport[viz])"
@@ -169,12 +170,7 @@ def sweep(
 
         df = pd.read_csv(out)
         fig = plt.figure()
-        method_labels = {
-            0.0: "baseline",
-            1.0: "balanced",
-            2.0: "tpccap",
-            3.0: "tpccap_sa",
-        }
+        method_labels = benchmark_method_labels()
         for method in sorted(df["method"].unique()):
             sub = df[df["method"] == method]
             plt.scatter(
