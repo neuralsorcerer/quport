@@ -9,15 +9,18 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeAlias
 
 from qiskit import QuantumCircuit
 
 from quport.architecture import MultiQPUArchitecture
+
+_PathLike: TypeAlias = str | os.PathLike[str]
 
 
 def _validate_manifest_int(value: object, *, label: str) -> int:
@@ -209,7 +212,14 @@ class DistributedProgram:
         return [op.to_dict() for op in self.remote_ops]
 
 
-def write_remote_ops_json(remote_ops: Iterable[RemoteOp], path: str | Path) -> None:
+def _coerce_output_path(path: object, *, label: str) -> Path:
+    """Return a filesystem path, rejecting ambiguous non-path objects."""
+    if not isinstance(path, str | os.PathLike):
+        raise ValueError(f"{label} must be a filesystem path")
+    return Path(path)
+
+
+def write_remote_ops_json(remote_ops: Iterable[RemoteOp], path: _PathLike) -> None:
     """Write remote operations as a stable JSON manifest.
 
     The writer creates parent directories and uses ``allow_nan=False`` so the
@@ -222,13 +232,59 @@ def write_remote_ops_json(remote_ops: Iterable[RemoteOp], path: str | Path) -> N
             raise ValueError(f"remote_ops[{idx}] must be a RemoteOp")
         payload.append(op.to_dict())
 
-    out_path = Path(path)
+    out_path = _coerce_output_path(path, label="path")
     if out_path.parent != Path(""):
         out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
+
+
+def write_distributed_program(
+    program: DistributedProgram,
+    path: _PathLike,
+    *,
+    include_empty_circuits: bool = True,
+) -> dict[str, Path]:
+    """Write a distributed program bundle to a directory.
+
+    The bundle contains one OpenQASM 3 file per local QPU circuit plus a
+    standards-compliant ``remote_ops.json`` manifest.  The returned mapping uses
+    stable artifact keys (``qpu_<id>`` and ``remote_ops``) so callers can report
+    or post-process generated files without re-deriving filenames.
+    """
+    if not isinstance(program, DistributedProgram):
+        raise ValueError("program must be a DistributedProgram")
+    if not isinstance(include_empty_circuits, bool):
+        raise ValueError("include_empty_circuits must be a boolean")
+
+    from qiskit import qasm3
+
+    out_dir = _coerce_output_path(path, label="path")
+    if out_dir.exists() and not out_dir.is_dir():
+        raise ValueError("path must be a directory or a path that does not exist")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    entries: list[tuple[int, QuantumCircuit]] = []
+    for qpu, circuit in program.local_circuits.items():
+        qpu_id = _validate_manifest_int(qpu, label="local circuit QPU id")
+        if not isinstance(circuit, QuantumCircuit):
+            raise ValueError(f"local_circuits[{qpu!r}] must be a QuantumCircuit")
+        entries.append((qpu_id, circuit))
+
+    written: dict[str, Path] = {}
+    for qpu_id, circuit in sorted(entries, key=lambda item: item[0]):
+        if not include_empty_circuits and len(circuit.data) == 0:
+            continue
+        qpu_path = out_dir / f"qpu_{qpu_id}.qasm"
+        qpu_path.write_text(qasm3.dumps(circuit), encoding="utf-8")
+        written[f"qpu_{qpu_id}"] = qpu_path
+
+    remote_path = out_dir / "remote_ops.json"
+    write_remote_ops_json(program.remote_ops, remote_path)
+    written["remote_ops"] = remote_path
+    return written
 
 
 def _group_qubits_by_qpu_in_operand_order(

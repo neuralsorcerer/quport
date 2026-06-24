@@ -14,7 +14,7 @@ from qiskit import QuantumCircuit
 
 from quport.architecture import MultiQPUArchitecture
 from quport.config import MultiQPUConfig
-from quport.distributed import split_into_qpus
+from quport.distributed import DistributedProgram, split_into_qpus
 
 
 def test_split_into_qpus_multiqubit_remote_op_is_deterministic() -> None:
@@ -669,3 +669,158 @@ def test_write_remote_ops_json_accepts_generators_and_rejects_bad_entries(
 
     with pytest.raises(ValueError, match=r"remote_ops\[0\] must be a RemoteOp"):
         write_remote_ops_json((object(),), tmp_path / "bad.json")  # type: ignore[arg-type]
+
+
+def test_write_distributed_program_exports_qasm_and_remote_manifest(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from quport.distributed import write_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=0,
+        intra_topology="line",
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 1)
+
+    program = split_into_qpus(mapped, arch)
+    written = write_distributed_program(program, tmp_path / "bundle")
+
+    assert set(written) == {"qpu_0", "qpu_1", "remote_ops"}
+    assert "OPENQASM" in written["qpu_0"].read_text(encoding="utf-8")
+    assert "h" in written["qpu_0"].read_text(encoding="utf-8")
+    assert "OPENQASM" in written["qpu_1"].read_text(encoding="utf-8")
+    payload = json.loads(written["remote_ops"].read_text(encoding="utf-8"))
+    assert payload == [program.remote_ops[0].to_dict()]
+
+
+def test_write_distributed_program_can_skip_empty_local_circuits(
+    tmp_path: Path,
+) -> None:
+    from quport.distributed import write_distributed_program
+
+    program = DistributedProgram(
+        local_circuits={0: QuantumCircuit(1), 1: QuantumCircuit(1)}, remote_ops=[]
+    )
+    program.local_circuits[0].x(0)
+
+    written = write_distributed_program(
+        program, tmp_path / "bundle", include_empty_circuits=False
+    )
+
+    assert set(written) == {"qpu_0", "remote_ops"}
+    assert not (tmp_path / "bundle" / "qpu_1.qasm").exists()
+
+
+@pytest.mark.parametrize(
+    ("program", "include_empty", "message"),
+    [
+        (object(), True, "program must be a DistributedProgram"),
+        (
+            DistributedProgram(local_circuits={}, remote_ops=[]),
+            1,
+            "include_empty_circuits must be a boolean",
+        ),
+        (
+            DistributedProgram(local_circuits={True: QuantumCircuit(1)}, remote_ops=[]),
+            True,
+            "local circuit QPU id must be an integer",
+        ),
+        (
+            DistributedProgram(local_circuits={0: object()}, remote_ops=[]),
+            True,
+            r"local_circuits\[0\] must be a QuantumCircuit",
+        ),
+    ],
+)
+def test_write_distributed_program_rejects_invalid_inputs(
+    tmp_path: Path, program: object, include_empty: object, message: str
+) -> None:
+    from quport.distributed import write_distributed_program
+
+    with pytest.raises(ValueError, match=message):
+        write_distributed_program(
+            program, tmp_path / "bundle", include_empty_circuits=include_empty
+        )  # type: ignore[arg-type]
+
+
+def test_write_distributed_program_accepts_existing_directory_and_pathlike(
+    tmp_path: Path,
+) -> None:
+    from quport.distributed import write_distributed_program
+
+    out_dir = tmp_path / "bundle"
+    out_dir.mkdir()
+    program = DistributedProgram(local_circuits={0: QuantumCircuit(1)}, remote_ops=[])
+
+    written = write_distributed_program(program, out_dir)
+
+    assert written["qpu_0"] == out_dir / "qpu_0.qasm"
+    assert written["remote_ops"] == out_dir / "remote_ops.json"
+
+
+def test_write_distributed_program_validates_entries_before_sorting_or_writing(
+    tmp_path: Path,
+) -> None:
+    from quport.distributed import write_distributed_program
+
+    program = DistributedProgram(
+        local_circuits={"bad": QuantumCircuit(1), 0: QuantumCircuit(1)},  # type: ignore[dict-item]
+        remote_ops=[],
+    )
+
+    with pytest.raises(ValueError, match="local circuit QPU id must be an integer"):
+        write_distributed_program(program, tmp_path / "bundle")
+
+    assert not (tmp_path / "bundle" / "qpu_0.qasm").exists()
+
+
+@pytest.mark.parametrize(
+    ("path", "message"),
+    [
+        (123, "path must be a filesystem path"),
+        (None, "path must be a filesystem path"),
+    ],
+)
+def test_write_distributed_program_rejects_non_path_outputs(
+    tmp_path: Path, path: object, message: str
+) -> None:
+    from quport.distributed import write_distributed_program
+
+    program = DistributedProgram(local_circuits={0: QuantumCircuit(1)}, remote_ops=[])
+
+    with pytest.raises(ValueError, match=message):
+        write_distributed_program(program, path)  # type: ignore[arg-type]
+
+
+def test_write_distributed_program_rejects_output_file_path(tmp_path: Path) -> None:
+    from quport.distributed import write_distributed_program
+
+    out_file = tmp_path / "not_a_directory"
+    out_file.write_text("already here", encoding="utf-8")
+    program = DistributedProgram(local_circuits={0: QuantumCircuit(1)}, remote_ops=[])
+
+    with pytest.raises(ValueError, match="path must be a directory"):
+        write_distributed_program(program, out_file)
+
+
+@pytest.mark.parametrize("path", [123, None])
+def test_write_remote_ops_json_rejects_non_path_outputs(path: object) -> None:
+    from quport.distributed import write_remote_ops_json
+
+    with pytest.raises(ValueError, match="path must be a filesystem path"):
+        write_remote_ops_json([], path)  # type: ignore[arg-type]
+
+
+def test_write_distributed_program_is_exported_from_package() -> None:
+    import quport
+    from quport.distributed import write_distributed_program
+
+    assert quport.write_distributed_program is write_distributed_program

@@ -13,6 +13,7 @@ from quport.distributed import (
     DistributedProgram,
     RemoteOp,
     split_into_qpus,
+    write_distributed_program,
     write_remote_ops_json,
 )
 from quport.pipeline import (
@@ -52,6 +53,7 @@ __all__ = [
     "estimate_topology_schedule_plan",
     "map_and_transpile",
     "split_into_qpus",
+    "write_distributed_program",
     "write_remote_ops_json",
     "sweep_topologies",
 ]
