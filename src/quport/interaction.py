@@ -8,10 +8,48 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from numbers import Integral
 from typing import SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit
+
+from quport._validation import validate_nonnegative_integral
+
+
+def _iter_validated_weights(
+    weights: Mapping[tuple[int, int], float], n: int
+) -> Iterator[tuple[int, int, float]]:
+    """Yield normalized positive weighted edges with clear public errors."""
+    if not isinstance(weights, Mapping):
+        raise ValueError("weights must be a mapping of 2-tuples to numeric values")
+    n_value = validate_nonnegative_integral(n, label="n")
+
+    for edge, raw_weight in weights.items():
+        if not isinstance(edge, tuple) or len(edge) != 2:
+            raise ValueError("weights keys must be 2-tuples of logical indices")
+        i_raw, j_raw = edge
+        if type(i_raw) is bool or not isinstance(i_raw, Integral):
+            raise ValueError("weights keys must contain integer logical indices")
+        if type(j_raw) is bool or not isinstance(j_raw, Integral):
+            raise ValueError("weights keys must contain integer logical indices")
+        i = int(i_raw)
+        j = int(j_raw)
+        if i < 0 or j < 0 or i >= n_value or j >= n_value:
+            raise ValueError("weights contain out-of-range logical indices")
+        if type(raw_weight) is bool:
+            raise ValueError("weights must be numeric values, not booleans")
+        try:
+            weight = float(cast(SupportsFloat | SupportsIndex | str, raw_weight))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("weights must be numeric") from None
+        if not math.isfinite(weight):
+            raise ValueError("weights must be finite")
+        if weight < 0.0:
+            raise ValueError("weights must be non-negative")
+        if i == j or weight == 0.0:
+            continue
+        yield i, j, weight
 
 
 def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
@@ -41,20 +79,34 @@ def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
 
 
 def degree(weights: Mapping[tuple[int, int], float], n: int) -> list[float]:
-    """Weighted degree of each node."""
-    deg = [0.0] * n
-    for (i, j), w in weights.items():
-        deg[i] += float(w)
-        deg[j] += float(w)
+    """Weighted degree of each node.
+
+    Public callers may pass weights assembled outside :func:`extract_twoq_weights`;
+    validate them here so malformed graphs fail with deterministic ``ValueError``
+    messages instead of accidental ``IndexError``/``TypeError`` exceptions.
+    """
+    n_value = validate_nonnegative_integral(n, label="n")
+    deg = [0.0] * n_value
+    for i, j, weight in _iter_validated_weights(weights, n_value):
+        deg[i] += weight
+        deg[j] += weight
     return deg
 
 
 def cut_weight(weights: Mapping[tuple[int, int], float], part: list[int]) -> float:
     """Total weight of edges crossing partitions."""
+    if not isinstance(part, list):
+        raise ValueError("part must be a list of integer QPU indices")
+    for idx, qpu in enumerate(part):
+        if type(qpu) is bool or not isinstance(qpu, Integral):
+            raise ValueError(f"part[{idx}] must be an integer QPU index")
+        if int(qpu) < 0:
+            raise ValueError(f"part[{idx}] must be non-negative")
+
     cut = 0.0
-    for (i, j), w in weights.items():
-        if part[i] != part[j]:
-            cut += float(w)
+    for i, j, weight in _iter_validated_weights(weights, len(part)):
+        if int(part[i]) != int(part[j]):
+            cut += weight
     return cut
 
 
@@ -64,7 +116,7 @@ def validate_temporal_decay(decay: object, *, label: str = "decay") -> float:
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         decay_value = float(cast(SupportsFloat | SupportsIndex | str, decay))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{label} must be numeric") from None
     if not math.isfinite(decay_value):
         raise ValueError(f"{label} must be finite")
