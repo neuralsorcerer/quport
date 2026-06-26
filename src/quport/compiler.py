@@ -37,6 +37,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from qiskit import QuantumCircuit, transpile
+from qiskit.transpiler import CouplingMap
 
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig
@@ -246,16 +247,34 @@ def compile_distributed(
     local_routed: dict[int, QuantumCircuit] = {}
     local_counts: dict[int, dict[str, int]] = {}
 
-    identity_layout = list(range(arch.n_phys))
     for qpu_id, local_qc in program.local_circuits.items():
         cm_intra = arch.build_intra_coupling_map(qpu_id)
+
+        # Each local_qc carries the full global physical register (n_phys
+        # qubits), but cm_intra only has edges for the B qubits of this QPU.
+        # Passing a 20-qubit circuit to a 5-node coupling map causes Qiskit's
+        # SABRE layout to panic (Rust: range start index 20 out of range for
+        # slice of length 5) because it indexes into the coupling-map slice
+        # using global qubit indices. Fix: extract only the active qubits from
+        # local_qc, re-index them to 0..B-1, and build a matching CouplingMap.
+        active_nodes = sorted(
+            set(n for edge in cm_intra.get_edges() for n in edge)
+        )
+        g2l = {g: l for l, g in enumerate(active_nodes)}  # global -> local index
+        qc_trimmed = QuantumCircuit(len(active_nodes))
+        for inst in local_qc.data:
+            qidxs = [local_qc.find_bit(q).index for q in inst.qubits]
+            if all(qi in g2l for qi in qidxs):
+                qc_trimmed.append(inst.operation, [g2l[qi] for qi in qidxs])
+        cm_reindexed = CouplingMap(
+            [(g2l[u], g2l[v]) for u, v in cm_intra.get_edges()]
+        )
+
         routed = transpile(
-            local_qc,
-            coupling_map=cm_intra,
-            initial_layout=identity_layout,
+            qc_trimmed,
+            coupling_map=cm_reindexed,
             basis_gates=list(cfg.basis_gates),
             optimization_level=cfg.optimization_level,
-            layout_method="trivial",
             routing_method=cfg.routing_method,
             seed_transpiler=seed,
         )

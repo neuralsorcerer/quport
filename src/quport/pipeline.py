@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import time
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TypeAlias, TypeVar
@@ -39,16 +40,7 @@ _BENCHMARK_METHOD_IDS = {
     "balanced": 1.0,
     "tpccap": 2.0,
     "tpccap_sa": 3.0,
-    "cluster": 4.0,
 }
-_BENCHMARK_METHOD_LABELS = {
-    method_id: strategy for strategy, method_id in _BENCHMARK_METHOD_IDS.items()
-}
-
-
-def benchmark_method_labels() -> dict[float, str]:
-    """Return a copy of the stable numeric benchmark-method label map."""
-    return dict(_BENCHMARK_METHOD_LABELS)
 
 
 def _validate_positive_int(value: object, *, label: str) -> int:
@@ -269,16 +261,22 @@ def map_and_transpile(
 
     # Step 2: transpile on the global coupling map using SABRE
     t1 = time.perf_counter()
-    mapped = transpile(
-        qc_basis,
-        coupling_map=coupling,
-        initial_layout=hints.initial_layout,
-        basis_gates=list(cfg.basis_gates),
-        optimization_level=cfg.optimization_level,
-        layout_method=cfg.layout_method,
-        routing_method=cfg.routing_method,
-        seed_transpiler=seed,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="initial_layout provided; layout_method is ignored",
+            category=UserWarning,
+        )
+        mapped = transpile(
+            qc_basis,
+            coupling_map=coupling,
+            initial_layout=hints.initial_layout,
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=cfg.optimization_level,
+            layout_method=cfg.layout_method,
+            routing_method=cfg.routing_method,
+            seed_transpiler=seed,
+        )
     transpile_time = time.perf_counter() - t1
 
     metrics = compute_metrics(mapped, arch)
@@ -323,16 +321,22 @@ def transpile_baseline(
     init_layout = naive_layout(qc_basis.num_qubits)
 
     t0 = time.perf_counter()
-    mapped = transpile(
-        qc_basis,
-        coupling_map=coupling,
-        initial_layout=init_layout,
-        basis_gates=list(cfg.basis_gates),
-        optimization_level=cfg.optimization_level,
-        layout_method=cfg.layout_method,
-        routing_method=cfg.routing_method,
-        seed_transpiler=seed,
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="initial_layout provided; layout_method is ignored",
+            category=UserWarning,
+        )
+        mapped = transpile(
+            qc_basis,
+            coupling_map=coupling,
+            initial_layout=init_layout,
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=cfg.optimization_level,
+            layout_method=cfg.layout_method,
+            routing_method=cfg.routing_method,
+            seed_transpiler=seed,
+        )
     t1 = time.perf_counter()
 
     metrics = compute_metrics(mapped, arch)
@@ -388,14 +392,13 @@ def benchmark_random_circuits(
         Any subset of:
         - "baseline": identity-ish initial layout + SABRE routing
         - "balanced": QuPort baseline partitioner
-        - "cluster": heavy-edge clustering partitioner
         - "tpccap": QuPort novel partitioner (topology+port+congestion aware)
         - "tpccap_sa": TPCCAP plus simulated-annealing refinement
 
     Notes
     -----
     The CSV is deliberately numeric-friendly. The column `method` encodes:
-        baseline=0, balanced=1, tpccap=2, tpccap_sa=3, cluster=4
+        baseline=0, balanced=1, tpccap=2, tpccap_sa=3
     and the column `strategy` stores the string name for readability.
     """
     latency = latency or LatencyModel()
