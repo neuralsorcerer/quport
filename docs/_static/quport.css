@@ -1,0 +1,21 @@
+:root {
+  --quport-accent: #3c60b1;
+}
+
+.sidebar-brand-text {
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.content table.docutils {
+  width: 100%;
+}
+
+.content table.docutils th,
+.content table.docutils td {
+  vertical-align: top;
+}
+
+a.headerlink {
+  color: var(--quport-accent);
+}

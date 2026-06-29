@@ -7,7 +7,7 @@ land without tests and documentation.
 ## Environment
 
 ```bash
-python -m pip install -e '.[yaml,viz,graph]'
+python -m pip install -e '.[yaml,viz,graph,docs]'
 python -m pip install pre-commit
 pre-commit install
 ```
@@ -23,6 +23,7 @@ pytest -q
 mypy src tests
 python -m compileall -q src tests
 pre-commit run --all-files
+sphinx-build -W --keep-going -b dirhtml docs docs/_build/dirhtml
 ```
 
 The pre-commit configuration currently runs merge-conflict checks, YAML checks,
@@ -72,9 +73,21 @@ Add tests at the level where behavior is guaranteed:
 Prefer small deterministic circuits in tests. Random-circuit tests should always use
 a fixed seed.
 
-## Docs validation tips
+## Docs site workflow
 
-The repository does not currently require a dedicated Markdown linter, but contributors
+The documentation is a Sphinx site built from Markdown with MyST. Source files live
+in `docs/`, `docs/conf.py` owns the production build configuration, and GitHub
+Actions publishes `docs/_build/dirhtml` to GitHub Pages from the `main` branch.
+
+Useful local commands:
+
+```bash
+make -C docs html      # standard local HTML build
+make -C docs strict    # production-equivalent build with warnings as errors
+make -C docs linkcheck # external and internal link validation
+```
+
+The repository does not require a dedicated Markdown linter, but contributors
 should at least check local links when editing docs. A simple check is:
 
 ```bash

@@ -17,27 +17,15 @@ QuPort is a production-ready Python and Qiskit toolkit for modeling, mapping, ro
 [![Test Windows](https://github.com/neuralsorcerer/quport/actions/workflows/windows.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/windows.yml?query=branch%3Amain)
 [![Test MacOS](https://github.com/neuralsorcerer/quport/actions/workflows/macos.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/macos.yml?query=branch%3Amain)
 [![Lints](https://github.com/neuralsorcerer/quport/actions/workflows/lint.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/lint.yml?query=branch%3Amain)
+[![Documentation](https://github.com/neuralsorcerer/quport/actions/workflows/docs.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/docs.yml?query=branch%3Amain)
 [![License](https://img.shields.io/badge/License-Apache%202.0-3c60b1.svg?logo=opensourceinitiative&logoColor=white)](./LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.12583-b31b1b.svg?logo=arxiv)](https://arxiv.org/abs/2605.12583)
 [![DOI:48550/arXiv.2605.12583](https://img.shields.io/badge/DOI-10.48550/arXiv.2605.12583-blue.svg)](https://doi.org/10.48550/arXiv.2605.12583)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/quport?period=total&units=INTERNATIONAL_SYSTEM&left_color=GRAY&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/quport)
 
 </div>
 
 ---
-
-## Documentation
-
-Full project documentation is maintained in [`docs/`](./docs/):
-
-- [Getting started](./docs/getting-started.md)
-- [Concepts](./docs/concepts.md)
-- [Configuration](./docs/configuration.md)
-- [CLI reference](./docs/cli.md)
-- [API reference](./docs/api-references.md)
-- [Examples](./docs/examples.md)
-- [Development](./docs/development.md)
-
-When public APIs, CLI commands, configuration fields, or output artifacts change, update the matching docs page in the same pull request.
 
 
 The central problem solved by QuPort is:

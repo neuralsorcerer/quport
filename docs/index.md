@@ -6,6 +6,29 @@ project models each QPU as a block of compute and communication qubits, exposes
 multiple interconnect abstractions, and provides both global-routing and explicit
 distributed-compilation workflows.
 
+```{toctree}
+:hidden:
+:maxdepth: 2
+:caption: User guide
+
+getting-started
+concepts
+configuration
+cli
+api-references
+examples
+development
+```
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+:caption: Project links
+
+GitHub repository <https://github.com/neuralsorcerer/quport>
+Package releases <https://github.com/neuralsorcerer/quport/releases>
+```
+
 ## Documentation map
 
 | Page | What it answers | Primary audience |
