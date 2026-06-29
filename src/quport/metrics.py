@@ -14,7 +14,7 @@ from qiskit import QuantumCircuit
 from qiskit.circuit import Qubit
 
 from quport.architecture import MultiQPUArchitecture
-from quport.interaction import cut_weight
+from quport.interaction import WeightValue, cut_weight
 
 
 @dataclass(frozen=True)
@@ -74,5 +74,7 @@ def compute_metrics(qc: QuantumCircuit, arch: MultiQPUArchitecture) -> CircuitMe
     )
 
 
-def compute_cut(weights: Mapping[tuple[int, int], float], part: list[int]) -> float:
+def compute_cut(
+    weights: Mapping[tuple[int, int], WeightValue], part: list[int]
+) -> float:
     return cut_weight(weights, part)

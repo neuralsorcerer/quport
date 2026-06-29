@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -747,8 +748,10 @@ def test_write_distributed_program_rejects_invalid_inputs(
 
     with pytest.raises(ValueError, match=message):
         write_distributed_program(
-            program, tmp_path / "bundle", include_empty_circuits=include_empty
-        )  # type: ignore[arg-type]
+            cast(Any, program),
+            tmp_path / "bundle",
+            include_empty_circuits=cast(Any, include_empty),
+        )
 
 
 def test_write_distributed_program_accepts_existing_directory_and_pathlike(
@@ -824,3 +827,21 @@ def test_write_distributed_program_is_exported_from_package() -> None:
     from quport.distributed import write_distributed_program
 
     assert quport.write_distributed_program is write_distributed_program
+
+
+@pytest.mark.parametrize(
+    ("seed", "message"),
+    [
+        (-1, "seed must be non-negative"),
+        (True, "seed must be a non-negative integer"),
+        (1.5, "seed must be a non-negative integer"),
+    ],
+)
+def test_compile_distributed_rejects_invalid_seed(seed: object, message: str) -> None:
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+    qc = QuantumCircuit(1)
+
+    with pytest.raises(ValueError, match=message):
+        compile_distributed(qc, cfg, seed=cast(Any, seed))

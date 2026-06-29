@@ -25,6 +25,21 @@ QuPort is a production-ready Python and Qiskit toolkit for modeling, mapping, ro
 
 ---
 
+## Documentation
+
+Full project documentation is maintained in [`docs/`](./docs/):
+
+- [Getting started](./docs/getting-started.md)
+- [Concepts](./docs/concepts.md)
+- [Configuration](./docs/configuration.md)
+- [CLI reference](./docs/cli.md)
+- [API reference](./docs/api-references.md)
+- [Examples](./docs/examples.md)
+- [Development](./docs/development.md)
+
+When public APIs, CLI commands, configuration fields, or output artifacts change, update the matching docs page in the same pull request.
+
+
 The central problem solved by QuPort is:
 
 Given a logical quantum circuit $C$ with $n$ logical qubits and two-qubit interactions $E$, choose

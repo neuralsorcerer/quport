@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 from qiskit import QuantumCircuit, transpile
 
+from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig
 from quport.distributed import DistributedProgram, split_into_qpus
@@ -127,6 +128,8 @@ def compile_distributed(
     *early* remote interactions.
     """
     latency = latency or LatencyModel()
+    if seed is not None:
+        seed = validate_nonnegative_integral(seed, label="seed")
 
     if qc.num_qubits > cfg.total_physical_qubits():
         raise ValueError(

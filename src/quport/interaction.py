@@ -10,15 +10,17 @@ import math
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
 from numbers import Integral
-from typing import SupportsFloat, SupportsIndex, cast
+from typing import SupportsFloat, SupportsIndex, TypeAlias, cast
 
 from qiskit import QuantumCircuit
 
 from quport._validation import validate_nonnegative_integral
 
+WeightValue: TypeAlias = SupportsFloat | SupportsIndex | str
+
 
 def _iter_validated_weights(
-    weights: Mapping[tuple[int, int], float], n: int
+    weights: Mapping[tuple[int, int], WeightValue], n: int
 ) -> Iterator[tuple[int, int, float]]:
     """Yield normalized positive weighted edges with clear public errors."""
     if not isinstance(weights, Mapping):
@@ -78,7 +80,7 @@ def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
     return dict(weights)
 
 
-def degree(weights: Mapping[tuple[int, int], float], n: int) -> list[float]:
+def degree(weights: Mapping[tuple[int, int], WeightValue], n: int) -> list[float]:
     """Weighted degree of each node.
 
     Public callers may pass weights assembled outside :func:`extract_twoq_weights`;
@@ -93,7 +95,9 @@ def degree(weights: Mapping[tuple[int, int], float], n: int) -> list[float]:
     return deg
 
 
-def cut_weight(weights: Mapping[tuple[int, int], float], part: list[int]) -> float:
+def cut_weight(
+    weights: Mapping[tuple[int, int], WeightValue], part: list[int]
+) -> float:
     """Total weight of edges crossing partitions."""
     if not isinstance(part, list):
         raise ValueError("part must be a list of integer QPU indices")
