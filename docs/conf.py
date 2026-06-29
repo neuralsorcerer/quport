@@ -24,7 +24,7 @@ author = "Soumyadip Sarkar"
 try:
     release = version("quport")
 except PackageNotFoundError:
-    release = "0.0.0+local"
+    release = "0.1.1"
 version = ".".join(release.split(".")[:2])
 
 try:
@@ -81,8 +81,6 @@ html_theme_options = {
     "source_repository": "https://github.com/neuralsorcerer/quport/",
     "source_branch": "main",
     "source_directory": "docs/",
-    "light_logo": "quport-wordmark.svg",
-    "dark_logo": "quport-wordmark.svg",
     "sidebar_hide_name": False,
 }
 html_context = {

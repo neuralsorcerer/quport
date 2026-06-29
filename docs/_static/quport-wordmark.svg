@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 48" role="img" aria-labelledby="title desc">
-  <title id="title">QuPort</title>
-  <desc id="desc">QuPort documentation wordmark</desc>
-  <rect width="180" height="48" rx="12" fill="#101828"/>
-  <circle cx="28" cy="24" r="10" fill="none" stroke="#7dd3fc" stroke-width="4"/>
-  <path d="M35 31 L44 40" stroke="#7dd3fc" stroke-width="4" stroke-linecap="round"/>
-  <path d="M54 14 h12 v20 h16" fill="none" stroke="#a78bfa" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
-  <text x="92" y="31" fill="#f8fafc" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">QuPort</text>
-</svg>
