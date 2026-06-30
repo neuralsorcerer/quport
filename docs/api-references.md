@@ -78,6 +78,22 @@ Important methods:
 `QPUBlock` has `compute` and `comm` lists. Those lists contain physical qubit indices,
 not logical qubit indices.
 
+### `topology_metrics`
+
+```python
+from quport import MultiQPUConfig, topology_metrics
+from quport.network import build_qpu_graph
+
+metrics = topology_metrics(build_qpu_graph(MultiQPUConfig(inter_topology="ring")))
+```
+
+Computes validated inter-QPU graph diagnostics as a `TopologyMetrics` dataclass.
+Fields include `n_qpus`, `edges`, `min_degree`, `max_degree`, `average_degree`,
+`connected`, `components`, `diameter`, `average_shortest_path`, and
+`unreachable_pairs`. Distances are calculated over reachable unordered QPU pairs;
+`unreachable_pairs` makes disconnected or zero-port topologies explicit instead of
+folding them into the average.
+
 ## Mapping pipeline
 
 ### `map_and_transpile`

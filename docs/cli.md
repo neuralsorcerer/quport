@@ -26,6 +26,19 @@ Writes an example JSON/YAML config and prints the resolved `MultiQPUConfig`.
 Use this as the safest starting point for editing architecture fields because it
 contains all current config keys.
 
+## `quport topology-info`
+
+```bash
+quport topology-info --config quport_config.yaml
+```
+
+Builds the configured inter-QPU graph and prints structural metrics before any
+circuit compilation work is performed. Reported values include edge count, degree
+range, connectivity, component count, reachable-pair diameter, average shortest
+path over reachable QPU pairs, and unreachable unordered QPU pairs. Use this as a
+quick sanity check when comparing switch, ring, degree-bounded, Clos, and fat-tree
+models.
+
 ## `quport map`
 
 ```bash
@@ -126,6 +139,7 @@ python -m json.tool compile_out/schedule_trace.json >/dev/null
 
 | If you need... | Use... |
 |---|---|
+| inter-QPU graph sanity metrics | `quport topology-info` |
 | one globally routed Qiskit circuit | `quport map` |
 | repeated global-routing comparisons | `quport bench` |
 | topology/port aggregate summaries | `quport sweep` |

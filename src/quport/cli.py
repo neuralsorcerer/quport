@@ -28,6 +28,7 @@ from quport.config import (
     optional_module_available,
 )
 from quport.distributed import write_remote_ops_json
+from quport.network import build_qpu_graph, topology_metrics
 from quport.pipeline import (
     benchmark_method_labels,
     benchmark_random_circuits,
@@ -175,6 +176,25 @@ def gen_config(
     dump_config(cfg, out)
     console.print(f"Wrote config to {out}")
     _pretty_config(cfg)
+
+
+@app.command("topology-info")
+def topology_info(
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+) -> None:
+    """Print structural metrics for the configured inter-QPU topology."""
+    cfg = load_config(config) if config else MultiQPUConfig()
+    metrics = topology_metrics(build_qpu_graph(cfg))
+
+    t = Table(title="Inter-QPU Topology Metrics")
+    t.add_column("metric")
+    t.add_column("value")
+    for key, value in asdict(metrics).items():
+        if isinstance(value, float):
+            t.add_row(key, f"{value:.6g}")
+        else:
+            t.add_row(key, str(value))
+    console.print(t)
 
 
 @app.command()

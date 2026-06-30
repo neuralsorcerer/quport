@@ -21,6 +21,7 @@ from quport.network import (
     compute_traffic_matrix,
     congestion_metrics,
     route_link_loads,
+    topology_metrics,
 )
 
 ALL_INTER_TOPOLOGIES: tuple[InterTopology, ...] = get_args(InterTopology)
@@ -972,3 +973,110 @@ def test_congestion_metrics_rejects_invalid_edge_keys(
 ) -> None:
     with pytest.raises(ValueError, match=error):
         congestion_metrics({bad_edge: 1.0})  # type: ignore[dict-item]
+
+
+def test_topology_metrics_for_ring_reports_expected_structure() -> None:
+    cfg = MultiQPUConfig(n_qpus=6, comm_qubits_per_qpu=1, inter_topology="ring")
+
+    metrics = topology_metrics(build_qpu_graph(cfg))
+
+    assert metrics.n_qpus == 6
+    assert metrics.edges == 6
+    assert metrics.min_degree == 2
+    assert metrics.max_degree == 2
+    assert metrics.average_degree == 2.0
+    assert metrics.connected is True
+    assert metrics.components == 1
+    assert metrics.diameter == 3
+    assert metrics.average_shortest_path == pytest.approx(1.8)
+    assert metrics.unreachable_pairs == 0
+
+
+def test_topology_metrics_reports_disconnected_zero_degree_topology() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        comm_qubits_per_qpu=1,
+        inter_topology="degree_d",
+        inter_degree=0,
+    )
+
+    metrics = topology_metrics(build_qpu_graph(cfg))
+
+    assert metrics.connected is False
+    assert metrics.components == 4
+    assert metrics.edges == 0
+    assert metrics.diameter == 0
+    assert metrics.average_shortest_path == 0.0
+    assert metrics.unreachable_pairs == 6
+
+
+def test_topology_metrics_empty_graph_uses_zero_metrics() -> None:
+    metrics = topology_metrics([])
+
+    assert metrics.n_qpus == 0
+    assert metrics.edges == 0
+    assert metrics.min_degree == 0
+    assert metrics.max_degree == 0
+    assert metrics.average_degree == 0.0
+    assert metrics.connected is True
+    assert metrics.components == 0
+    assert metrics.diameter == 0
+    assert metrics.average_shortest_path == 0.0
+    assert metrics.unreachable_pairs == 0
+
+
+def test_topology_metrics_single_qpu_graph_is_connected_without_pairs() -> None:
+    metrics = topology_metrics([[]])
+
+    assert metrics.n_qpus == 1
+    assert metrics.edges == 0
+    assert metrics.min_degree == 0
+    assert metrics.max_degree == 0
+    assert metrics.average_degree == 0.0
+    assert metrics.connected is True
+    assert metrics.components == 1
+    assert metrics.diameter == 0
+    assert metrics.average_shortest_path == 0.0
+    assert metrics.unreachable_pairs == 0
+
+
+def test_topology_metrics_complete_graph_reports_unit_distances() -> None:
+    cfg = MultiQPUConfig(n_qpus=5, comm_qubits_per_qpu=1, inter_topology="switch")
+
+    metrics = topology_metrics(build_qpu_graph(cfg))
+
+    assert metrics.edges == 10
+    assert metrics.min_degree == 4
+    assert metrics.max_degree == 4
+    assert metrics.average_degree == 4.0
+    assert metrics.connected is True
+    assert metrics.components == 1
+    assert metrics.diameter == 1
+    assert metrics.average_shortest_path == 1.0
+    assert metrics.unreachable_pairs == 0
+
+
+def test_topology_metrics_normalizes_duplicate_edges_and_self_loops() -> None:
+    metrics = topology_metrics([[0, 1, 1], [0, 1]])
+
+    assert metrics.n_qpus == 2
+    assert metrics.edges == 1
+    assert metrics.min_degree == 1
+    assert metrics.max_degree == 1
+    assert metrics.diameter == 1
+    assert metrics.average_shortest_path == 1.0
+
+
+@pytest.mark.parametrize(
+    ("adj", "error"),
+    [
+        ("01", "adjacency must be a sequence of rows"),
+        ([[1], []], "adjacency must be symmetric"),
+        ([[2], []], "adjacency contains invalid indices"),
+        ([[True], []], "adjacency must contain integer indices"),
+        ([1, []], "adjacency rows must be sequences"),
+    ],
+)
+def test_topology_metrics_rejects_malformed_adjacency(adj: object, error: str) -> None:
+    with pytest.raises(ValueError, match=error):
+        topology_metrics(adj)  # type: ignore[arg-type]

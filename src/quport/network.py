@@ -24,6 +24,7 @@ All routines here are dependency-free and designed for n_qpus ~ O(10..100).
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
@@ -759,3 +760,98 @@ def path_edges(sp: QpuShortestPaths, src: int, dst: int) -> list[QpuEdge]:
         u, v = path[i], path[i + 1]
         out.append((u, v) if u < v else (v, u))
     return out
+
+
+@dataclass(frozen=True)
+class TopologyMetrics:
+    """Structural metrics for an inter-QPU topology.
+
+    ``diameter`` and ``average_shortest_path`` ignore unreachable QPU pairs;
+    ``unreachable_pairs`` records how many unordered pairs have no path.
+    This keeps disconnected or zero-port designs analyzable without silently
+    treating the finite reachable subgraph as globally connected.
+    """
+
+    n_qpus: int
+    edges: int
+    min_degree: int
+    max_degree: int
+    average_degree: float
+    connected: bool
+    components: int
+    diameter: int
+    average_shortest_path: float
+    unreachable_pairs: int
+
+
+def topology_metrics(adj: Sequence[Sequence[int]]) -> TopologyMetrics:
+    """Compute validated structural metrics for an undirected QPU graph.
+
+    The helper is useful for comparing candidate interconnects before running an
+    expensive compile/sweep. It validates the same undirected adjacency contract
+    used by routing helpers, so malformed custom graphs fail early with clear
+    errors.
+    """
+    norm_adj = _normalize_undirected_adjacency(adj)
+    n = len(norm_adj)
+    if n == 0:
+        return TopologyMetrics(
+            n_qpus=0,
+            edges=0,
+            min_degree=0,
+            max_degree=0,
+            average_degree=0.0,
+            connected=True,
+            components=0,
+            diameter=0,
+            average_shortest_path=0.0,
+            unreachable_pairs=0,
+        )
+
+    degrees = [len(row) for row in norm_adj]
+    edges = sum(degrees) // 2
+    components = 0
+    assigned_component = [False] * n
+    finite_pairs = 0
+    distance_sum = 0
+    diameter = 0
+    unreachable_pairs = 0
+
+    for src in range(n):
+        dist = [-1] * n
+        dist[src] = 0
+        queue: deque[int] = deque([src])
+        if not assigned_component[src]:
+            components += 1
+            assigned_component[src] = True
+
+        while queue:
+            u = queue.popleft()
+            for v in norm_adj[u]:
+                if dist[v] >= 0:
+                    continue
+                dist[v] = dist[u] + 1
+                assigned_component[v] = True
+                queue.append(v)
+
+        for dst in range(src + 1, n):
+            d = dist[dst]
+            if d < 0:
+                unreachable_pairs += 1
+            else:
+                finite_pairs += 1
+                distance_sum += d
+                diameter = max(diameter, d)
+
+    return TopologyMetrics(
+        n_qpus=n,
+        edges=edges,
+        min_degree=min(degrees),
+        max_degree=max(degrees),
+        average_degree=(sum(degrees) / n),
+        connected=components <= 1,
+        components=components,
+        diameter=diameter,
+        average_shortest_path=(distance_sum / finite_pairs if finite_pairs else 0.0),
+        unreachable_pairs=unreachable_pairs,
+    )

@@ -170,3 +170,13 @@ def test_circuit_commands_require_n_logical_without_input_qasm() -> None:
 
     assert result.exit_code != 0
     assert "--n-logical is required" in result.output
+
+
+def test_topology_info_command_outputs_metrics() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["topology-info"])
+
+    assert result.exit_code == 0
+    assert "Inter-QPU Topology Metrics" in result.stdout
+    assert "average_shortest_path" in result.stdout

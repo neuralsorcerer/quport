@@ -16,6 +16,7 @@ from quport.distributed import (
     write_distributed_program,
     write_remote_ops_json,
 )
+from quport.network import TopologyMetrics, topology_metrics
 from quport.pipeline import (
     benchmark_random_circuits,
     map_and_transpile,
@@ -44,6 +45,7 @@ __all__ = [
     "RemoteRoundTrace",
     "ScheduleSummary",
     "TopologySchedulePlan",
+    "TopologyMetrics",
     "TopologyScheduleSummary",
     "benchmark_random_circuits",
     "compile_distributed",
@@ -56,4 +58,5 @@ __all__ = [
     "write_distributed_program",
     "write_remote_ops_json",
     "sweep_topologies",
+    "topology_metrics",
 ]
