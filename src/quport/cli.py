@@ -131,6 +131,13 @@ def _load_or_random_circuit(
     if input_qasm:
         return _load_qasm_circuit(input_qasm)
     if n_logical is None:
+        # Typer/Rich may syntax-highlight option-looking text inside validation
+        # errors (for example under FORCE_COLOR), which can split the literal
+        # "--n-logical" with ANSI escape codes.  Emit a plain copy first so CLI
+        # users and tests can reliably match the actionable requirement.
+        typer.echo(
+            "--n-logical is required when --input-qasm is not provided", color=False
+        )
         raise typer.BadParameter(
             "--n-logical is required when --input-qasm is not provided"
         )
