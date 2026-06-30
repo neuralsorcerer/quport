@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import typer
-from qiskit import qasm3
+from qiskit import QuantumCircuit, qasm2, qasm3
+from qiskit.exceptions import MissingOptionalLibraryError
 from rich.console import Console
 from rich.table import Table
 
@@ -38,6 +40,101 @@ app = typer.Typer(
     add_completion=False, help="QuPort: multi-QPU circuit mapping + benchmarks"
 )
 console = Console()
+
+_QASM_VERSION_RE = re.compile(r"\AOPENQASM\s+([23])(?:\.0)?\s*;", re.ASCII)
+
+
+def _qasm_version(source: str) -> int | None:
+    """Return the declared OpenQASM major version, ignoring leading comments."""
+    remaining = source.lstrip("\ufeff \t\r\n")
+    while True:
+        if remaining.startswith("//"):
+            _comment, separator, rest = remaining.partition("\n")
+            if not separator:
+                return None
+            remaining = rest.lstrip(" \t\r\n")
+            continue
+        if remaining.startswith("/*"):
+            end = remaining.find("*/", 2)
+            if end < 0:
+                return None
+            remaining = remaining[end + 2 :].lstrip(" \t\r\n")
+            continue
+        break
+
+    match = _QASM_VERSION_RE.match(remaining)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
+    """Load an OpenQASM 2/3 circuit with clear errors for optional dependencies."""
+    input_path = Path(input_qasm)
+    try:
+        source = input_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Unable to read --input-qasm file {input_qasm!r}: {exc}"
+        ) from exc
+
+    version = _qasm_version(source)
+    if version == 2:
+        try:
+            return qasm2.load(str(input_path))
+        except Exception as exc:
+            raise typer.BadParameter(
+                f"Unable to parse OpenQASM 2 input {input_qasm!r}: {exc}"
+            ) from exc
+
+    if version == 3:
+        try:
+            return qasm3.load(str(input_path))
+        except MissingOptionalLibraryError as exc:
+            raise typer.BadParameter(
+                "OpenQASM 3 input requires Qiskit's optional importer. "
+                "Install it with: pip install qiskit_qasm3_import"
+            ) from exc
+        except Exception as exc:
+            raise typer.BadParameter(
+                f"Unable to parse OpenQASM 3 input {input_qasm!r}: {exc}"
+            ) from exc
+
+    try:
+        return qasm3.load(str(input_path))
+    except MissingOptionalLibraryError:
+        try:
+            return qasm2.load(str(input_path))
+        except Exception as exc:
+            raise typer.BadParameter(
+                "Unable to detect an OpenQASM version header and the input could "
+                f"not be parsed as OpenQASM 2: {exc}"
+            ) from exc
+    except Exception as qasm3_exc:
+        try:
+            return qasm2.load(str(input_path))
+        except Exception as qasm2_exc:
+            raise typer.BadParameter(
+                "Unable to detect an OpenQASM version header. Parsing failed as "
+                f"OpenQASM 3 ({qasm3_exc}) and OpenQASM 2 ({qasm2_exc})."
+            ) from qasm2_exc
+
+
+def _load_or_random_circuit(
+    *,
+    input_qasm: str | None,
+    n_logical: int | None,
+    depth: int,
+    seed: int,
+) -> QuantumCircuit:
+    """Load an OpenQASM 2/3 circuit or generate the configured random benchmark."""
+    if input_qasm:
+        return _load_qasm_circuit(input_qasm)
+    if n_logical is None:
+        raise typer.BadParameter(
+            "--n-logical is required when --input-qasm is not provided"
+        )
+    return random_benchmark_circuit(n_logical, depth, seed)
 
 
 def _load_plot_modules() -> tuple[Any, Any]:
@@ -75,19 +172,28 @@ def gen_config(
 
 @app.command()
 def map(
-    n_logical: int = typer.Option(..., help="Number of logical qubits"),
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
     out: str | None = typer.Option(None, help="Write mapped circuit as OpenQASM 3.0"),
 ) -> None:
     """Map+transpile a single random circuit and print key metrics."""
     cfg = load_config(config) if config else MultiQPUConfig()
     latency = LatencyModel()
-    qc = random_benchmark_circuit(n_logical, depth, seed)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
 
     res = map_and_transpile(qc, cfg, latency=latency, seed=seed, strategy=strategy)
     m = res.metrics
@@ -187,13 +293,20 @@ def sweep(
 
 @app.command()
 def schedule(
-    n_logical: int = typer.Option(..., help="Number of logical qubits"),
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
         "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
 ) -> None:
     """Estimate parallel multi-QPU makespan for a mapped random circuit."""
     from .architecture import MultiQPUArchitecture
@@ -201,7 +314,9 @@ def schedule(
 
     cfg = load_config(config) if config else MultiQPUConfig()
     latency = LatencyModel()
-    qc = random_benchmark_circuit(n_logical, depth, seed)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
     res = map_and_transpile(qc, cfg, latency=latency, seed=seed, strategy=strategy)
     arch = MultiQPUArchitecture(cfg)
     summ = estimate_parallel_makespan_layered(res.mapped_circuit, arch, latency)
@@ -212,13 +327,20 @@ def schedule(
 
 @app.command()
 def split(
-    n_logical: int = typer.Option(..., help="Number of logical qubits"),
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
         "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
     out_dir: str = typer.Option(
         "distributed_out", help="Output directory for per-QPU QASM files"
     ),
@@ -229,7 +351,9 @@ def split(
 
     cfg = load_config(config) if config else MultiQPUConfig()
     latency = LatencyModel()
-    qc = random_benchmark_circuit(n_logical, depth, seed)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
     res = map_and_transpile(qc, cfg, latency=latency, seed=seed, strategy=strategy)
     arch = MultiQPUArchitecture(cfg)
     prog = split_into_qpus(res.mapped_circuit, arch)
@@ -251,7 +375,9 @@ def split(
 
 @app.command()
 def compile_dist(
-    n_logical: int = typer.Option(..., help="Number of logical qubits"),
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
@@ -261,6 +387,11 @@ def compile_dist(
         0.98, help="Time-decay factor for 2Q weights (<=1). Use 1 for uniform."
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
     out_dir: str = typer.Option(
         "compile_out", help="Output directory (per-QPU QASM3 + remote/schedule JSON)"
     ),
@@ -275,7 +406,9 @@ def compile_dist(
     """
     cfg = load_config(config) if config else MultiQPUConfig()
     latency = LatencyModel()
-    qc = random_benchmark_circuit(n_logical, depth, seed)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
 
     res = compile_distributed(
         qc,

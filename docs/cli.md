@@ -10,6 +10,11 @@ custom workflows, use the Python API documented in [API reference](api-reference
 - Strategy values use the Python strategy names, for example `tpccap_sa`.
 - Config paths may be JSON or YAML; YAML requires the `yaml` extra.
 - Output directories are created when possible by artifact-writing commands.
+- Commands that operate on one circuit (`map`, `schedule`, `split`, and
+  `compile-dist`) can either generate a random benchmark with `--n-logical` or
+  load a user OpenQASM 2/3 circuit with `--input-qasm path/to/circuit.qasm`.
+  OpenQASM 2 loads with Qiskit's built-in parser; OpenQASM 3 requires Qiskit's
+  optional `qiskit_qasm3_import` package.
 
 ## `quport gen-config`
 
@@ -37,6 +42,7 @@ Options:
 - `--seed`: random circuit and transpiler seed;
 - `--strategy`: `balanced`, `cluster`, `tpccap`, or `tpccap_sa`;
 - `--config`: optional JSON/YAML config path;
+- `--input-qasm`: optional OpenQASM 2/3 file to map instead of generating a random circuit;
 - `--out`: optional mapped OpenQASM 3 output.
 
 Use this command when you want to see the globally routed circuit that Qiskit
@@ -75,9 +81,9 @@ when you need raw per-trial rows.
 quport schedule --n-logical 6 --depth 5 --seed 1 --strategy tpccap
 ```
 
-Maps a random circuit and prints a layered makespan estimate. This is a fast way to
-compare whether a mapped circuit's remote operations are likely to serialize under
-communication-port limits.
+Maps a random or `--input-qasm` circuit and prints a layered makespan estimate.
+This is a fast way to compare whether a mapped circuit's remote operations are
+likely to serialize under communication-port limits.
 
 ## `quport split`
 
@@ -85,8 +91,8 @@ communication-port limits.
 quport split --n-logical 6 --depth 5 --seed 1 --strategy tpccap --out-dir distributed_out
 ```
 
-Maps a random circuit globally, splits the mapped circuit into per-QPU local QASM
-files, and writes `remote_ops.json`.
+Maps a random or `--input-qasm` circuit globally, splits the mapped circuit into
+per-QPU local QASM files, and writes `remote_ops.json`.
 
 This command is useful for inspecting how a globally routed circuit is decomposed,
 but it is not the preferred distributed-compilation workflow. Prefer `compile-dist`
@@ -99,7 +105,9 @@ from the compilation flow.
 quport compile-dist --n-logical 6 --depth 5 --seed 1 --strategy tpccap_sa --temporal-decay 0.98 --out-dir compile_out
 ```
 
-Runs distributed compilation without cross-QPU SWAP routing. Output artifacts:
+Runs distributed compilation without cross-QPU SWAP routing. Use `--input-qasm`
+to compile an application circuit from OpenQASM 2/3 instead of generating a random
+benchmark. Output artifacts:
 
 - `qpu_<id>_routed.qasm`: locally routed per-QPU programs;
 - `remote_ops.json`: ordered remote operation manifest;
