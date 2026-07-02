@@ -58,7 +58,7 @@ Package releases <https://github.com/neuralsorcerer/quport/releases>
 | Produce per-QPU local programs and explicit remote operations | `compile_distributed` or `quport compile-dist` | Keeps cross-QPU gates as remote events instead of hiding them inside global routing |
 | Run repeated random-circuit comparisons | `benchmark_random_circuits` or `quport bench` | Writes row-oriented benchmark metrics suitable for CSV analysis |
 | Sweep topology/port settings | `sweep_topologies` or `quport sweep` | Aggregates repeated benchmark rows by architecture setting |
-| Inspect communication bottlenecks | `estimate_topology_schedule_plan` | Returns layer/round traces with port and link utilization |
+| Inspect communication bottlenecks | `estimate_topology_schedule_plan` | Returns layer/round traces with absolute timing, port usage, and link utilization |
 
 ## Documentation accuracy policy
 

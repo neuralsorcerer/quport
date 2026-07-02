@@ -136,6 +136,8 @@ QuPort exposes three schedule estimators:
   switch pair budgets, reconfiguration delay, and unreachable-pair penalties.
 
 Use `estimate_topology_schedule_plan` when you need the detailed layer and round trace.
+Its trace includes absolute `start_time` / `end_time` offsets for both layers and
+remote rounds, making it suitable for timeline visualizations and simulator input.
 The topology-aware estimator is the most informative one for network bottleneck
 analysis because it reports remote rounds, peak link utilization, and peak QPU port
 usage.

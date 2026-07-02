@@ -125,7 +125,7 @@ benchmark. Output artifacts:
 - `qpu_<id>_routed.qasm`: locally routed per-QPU programs;
 - `remote_ops.json`: ordered remote operation manifest;
 - `schedule.json`: topology-aware schedule summary;
-- `schedule_trace.json`: detailed per-layer/per-round communication plan.
+- `schedule_trace.json`: detailed per-layer/per-round communication plan with absolute `start_time` / `end_time` offsets for layers and remote rounds.
 
 Recommended checks after running:
 

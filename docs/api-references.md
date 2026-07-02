@@ -308,15 +308,25 @@ estimate_topology_schedule_plan(mapped, arch, model) -> TopologySchedulePlan
 ```
 
 Returns the topology-aware summary plus a detailed trace of layers and remote rounds.
-This is the most useful API when diagnosing why a makespan increased.
+Each layer and each remote round carries absolute `start_time` and `end_time` offsets,
+so callers can render timelines or feed simulators without recomputing cumulative
+durations. This is the most useful API when diagnosing why a makespan increased.
 
 ### Schedule dataclasses
 
 - `ScheduleSummary(makespan, steps, remote_ops)`
 - `TopologyScheduleSummary(makespan, layers, remote_ops, remote_rounds, peak_link_util, peak_qpu_ports_used)`
-- `RemoteRoundTrace(layer_index, round_index, qpu_pairs, duration, qpu_ports_used, link_utilization, unschedulable_ops=0)`
-- `LayerScheduleTrace(layer_index, local_duration, remote_ops, remote_rounds, duration)`
+- `RemoteRoundTrace(layer_index, round_index, qpu_pairs, duration, qpu_ports_used, link_utilization, unschedulable_ops=0, start_time=0.0, end_time=0.0)`
+- `LayerScheduleTrace(layer_index, local_duration, remote_ops, remote_rounds, duration, start_time=0.0, end_time=0.0)`
 - `TopologySchedulePlan(summary, layers)`
+
+`LayerScheduleTrace.start_time` is the absolute offset at which the DAG layer begins,
+and `LayerScheduleTrace.end_time` is `start_time + duration`. Remote rounds are
+serialized from the containing layer's `start_time`; each `RemoteRoundTrace.start_time`
+is the previous round's `end_time` (or the layer start for the first round), and
+`RemoteRoundTrace.end_time` is `start_time + duration`. If local work is longer than
+the cumulative remote rounds, the layer end can be later than the final remote-round
+end because local work occupies the full layer interval.
 
 ## Interaction and metrics helpers
 

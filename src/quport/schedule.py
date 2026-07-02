@@ -314,7 +314,12 @@ class TopologyScheduleSummary:
 
 @dataclass(frozen=True)
 class RemoteRoundTrace:
-    """Resource usage for one packed remote-operation communication round."""
+    """Resource usage for one packed remote-operation communication round.
+
+    ``start_time`` and ``end_time`` are absolute offsets in the schedule plan.
+    They make the trace directly consumable by simulators and visualization tools
+    without re-integrating layer and round durations from the summary.
+    """
 
     layer_index: int
     round_index: int
@@ -323,17 +328,26 @@ class RemoteRoundTrace:
     qpu_ports_used: tuple[int, ...]
     link_utilization: tuple[tuple[tuple[int, int], int], ...]
     unschedulable_ops: int = 0
+    start_time: float = 0.0
+    end_time: float = 0.0
 
 
 @dataclass(frozen=True)
 class LayerScheduleTrace:
-    """Detailed schedule trace for one circuit DAG layer."""
+    """Detailed schedule trace for one circuit DAG layer.
+
+    ``start_time`` and ``end_time`` are absolute offsets in the schedule plan.
+    Local work is assumed to occupy the layer interval while remote rounds are
+    serialized from ``start_time`` until their cumulative duration is complete.
+    """
 
     layer_index: int
     local_duration: float
     remote_ops: int
     remote_rounds: tuple[RemoteRoundTrace, ...]
     duration: float
+    start_time: float = 0.0
+    end_time: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -469,22 +483,31 @@ def _topology_schedule_plan(
                 )
         return cost_cache[key]
 
-    def unschedulable_round_trace(
+    def append_unschedulable_round_trace(
         a: int,
         b: int,
         round_traces: list[RemoteRoundTrace],
         *,
+        layer_start: float,
+        elapsed_rounds_time: float,
         qpu_ports_used: tuple[int, ...] | None = None,
-    ) -> RemoteRoundTrace:
-        return RemoteRoundTrace(
-            layer_index=layers - 1,
-            round_index=len(round_traces),
-            qpu_pairs=(pair_key(a, b),),
-            duration=UNSCHEDULABLE_PENALTY,
-            qpu_ports_used=qpu_ports_used or (0,) * n_qpus,
-            link_utilization=(),
-            unschedulable_ops=1,
+    ) -> float:
+        """Append one penalty round and return updated remote-round elapsed time."""
+        round_start = layer_start + elapsed_rounds_time
+        round_traces.append(
+            RemoteRoundTrace(
+                layer_index=layers - 1,
+                round_index=len(round_traces),
+                qpu_pairs=(pair_key(a, b),),
+                duration=UNSCHEDULABLE_PENALTY,
+                qpu_ports_used=qpu_ports_used or (0,) * n_qpus,
+                link_utilization=(),
+                unschedulable_ops=1,
+                start_time=round_start,
+                end_time=round_start + UNSCHEDULABLE_PENALTY,
+            )
         )
+        return elapsed_rounds_time + UNSCHEDULABLE_PENALTY
 
     def append_layer_trace(
         *,
@@ -492,6 +515,7 @@ def _topology_schedule_plan(
         remote_ops: int,
         remote_rounds: list[RemoteRoundTrace],
         duration: float,
+        layer_start: float,
     ) -> None:
         layer_traces.append(
             LayerScheduleTrace(
@@ -500,10 +524,13 @@ def _topology_schedule_plan(
                 remote_ops=remote_ops,
                 remote_rounds=tuple(remote_rounds),
                 duration=duration,
+                start_time=layer_start,
+                end_time=layer_start + duration,
             )
         )
 
     for layer in dag.layers():
+        layer_start = total
         layers += 1
         local_dur = [0.0] * n_qpus
         remote_pairs: list[tuple[int, int]] = []
@@ -540,6 +567,7 @@ def _topology_schedule_plan(
                 remote_ops=0,
                 remote_rounds=[],
                 duration=layer_local,
+                layer_start=layer_start,
             )
             continue
 
@@ -549,17 +577,24 @@ def _topology_schedule_plan(
         if ports <= 0 or link_cap == 0:
             # Remote ops impossible: either no comm ports or zero link capacity.
             unschedulable_ops = len(remote_pairs)
-            rounds_time = UNSCHEDULABLE_PENALTY * unschedulable_ops
+            rounds_time = 0.0
+            for a, b in remote_pairs:
+                rounds_time = append_unschedulable_round_trace(
+                    a,
+                    b,
+                    round_traces,
+                    layer_start=layer_start,
+                    elapsed_rounds_time=rounds_time,
+                )
             layer_time = max(layer_local, rounds_time)
             total += layer_time
             total_rounds += unschedulable_ops
-            for a, b in remote_pairs:
-                round_traces.append(unschedulable_round_trace(a, b, round_traces))
             append_layer_trace(
                 local_duration=layer_local,
                 remote_ops=len(remote_pairs),
                 remote_rounds=round_traces,
                 duration=layer_time,
+                layer_start=layer_start,
             )
             continue
 
@@ -571,11 +606,17 @@ def _topology_schedule_plan(
             else:
                 unreachable_pairs += 1
 
-        rounds_time = UNSCHEDULABLE_PENALTY * unreachable_pairs
+        rounds_time = 0.0
         rounds_here = unreachable_pairs
         for a, b in remote_pairs:
             if not is_reachable(a, b):
-                round_traces.append(unschedulable_round_trace(a, b, round_traces))
+                rounds_time = append_unschedulable_round_trace(
+                    a,
+                    b,
+                    round_traces,
+                    layer_start=layer_start,
+                    elapsed_rounds_time=rounds_time,
+                )
 
         # Greedy round packing with port + link constraints for reachable pairs.
         remaining = sorted(
@@ -587,8 +628,13 @@ def _topology_schedule_plan(
         # Fast path: zero switch pair budget makes every remaining reachable op unschedulable.
         if is_switch_like and sw_pairs_cap == 0 and remaining:
             for a, b in remaining:
-                round_traces.append(unschedulable_round_trace(a, b, round_traces))
-            rounds_time += UNSCHEDULABLE_PENALTY * len(remaining)
+                rounds_time = append_unschedulable_round_trace(
+                    a,
+                    b,
+                    round_traces,
+                    layer_start=layer_start,
+                    elapsed_rounds_time=rounds_time,
+                )
             rounds_here += len(remaining)
             remaining = []
 
@@ -646,16 +692,15 @@ def _topology_schedule_plan(
                 # Charge one penalty round and defer the rest.
                 skipped = remaining[0]
                 next_remaining = remaining[1:]
-                rounds_time += UNSCHEDULABLE_PENALTY
-                rounds_here += 1
-                round_traces.append(
-                    unschedulable_round_trace(
-                        skipped[0],
-                        skipped[1],
-                        round_traces,
-                        qpu_ports_used=tuple(used_ports),
-                    )
+                rounds_time = append_unschedulable_round_trace(
+                    skipped[0],
+                    skipped[1],
+                    round_traces,
+                    layer_start=layer_start,
+                    elapsed_rounds_time=rounds_time,
+                    qpu_ports_used=tuple(used_ports),
                 )
+                rounds_here += 1
                 remaining = next_remaining
                 continue
 
@@ -664,6 +709,7 @@ def _topology_schedule_plan(
             # Round duration is the max remote cost in this round + optional reconfig
             if is_switch_like and sw_reconf > 0.0:
                 round_max_cost += sw_reconf
+            round_start = layer_start + rounds_time
             rounds_time += round_max_cost
             rounds_here += 1
             round_traces.append(
@@ -674,6 +720,8 @@ def _topology_schedule_plan(
                     duration=round_max_cost,
                     qpu_ports_used=tuple(used_ports),
                     link_utilization=tuple(sorted(used_link.items())),
+                    start_time=round_start,
+                    end_time=round_start + round_max_cost,
                 )
             )
 
@@ -685,6 +733,7 @@ def _topology_schedule_plan(
             remote_ops=len(remote_pairs),
             remote_rounds=round_traces,
             duration=layer_time,
+            layer_start=layer_start,
         )
 
     summary = TopologyScheduleSummary(

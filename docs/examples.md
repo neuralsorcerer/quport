@@ -87,11 +87,14 @@ plan = estimate_topology_schedule_plan(mapped.mapped_circuit, MultiQPUArchitectu
 
 print(plan.summary)
 for layer in plan.layers:
-    print(layer.layer_index, layer.remote_ops, layer.duration)
+    print(layer.layer_index, layer.start_time, layer.end_time, layer.remote_ops)
+    for round_trace in layer.remote_rounds:
+        print("  round", round_trace.round_index, round_trace.start_time, round_trace.end_time)
 ```
 
 Use the trace when a summary value such as `remote_rounds` or `makespan` changes and
-you need to understand which layer/round caused it.
+you need to understand which layer/round caused it. The absolute timing fields let
+you plot a timeline directly without reconstructing cumulative offsets.
 
 ## Benchmark CSV
 

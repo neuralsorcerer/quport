@@ -429,7 +429,7 @@ def compile_dist(
       - qpu_<id>_routed.qasm : routed per-QPU local programs
       - remote_ops.json     : ordered remote-op trace
       - schedule.json       : topology-aware schedule summary
-      - schedule_trace.json : detailed per-layer/per-round communication plan
+      - schedule_trace.json : detailed per-layer/per-round communication plan with absolute timing
     """
     cfg = load_config(config) if config else MultiQPUConfig()
     latency = LatencyModel()

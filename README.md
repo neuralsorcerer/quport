@@ -503,6 +503,8 @@ The estimator returns:
 - number of DAG `layers`;
 - total `remote_ops`;
 - `remote_rounds`;
+- absolute per-layer `start_time` / `end_time` offsets;
+- absolute per-round `start_time` / `end_time` offsets for timeline visualization and simulator ingestion;
 - `peak_link_util`;
 - `peak_qpu_ports_used`.
 
@@ -856,7 +858,7 @@ Produces:
 | `qpu_<id>_routed.qasm` | Locally routed OpenQASM 3 circuit for QPU `<id>`. |
 | `remote_ops.json` | Ordered remote-operation trace. |
 | `schedule.json` | Topology-aware schedule summary. |
-| `schedule_trace.json` | Detailed per-layer and per-round communication plan with QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
+| `schedule_trace.json` | Detailed per-layer and per-round communication plan with absolute timing, QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
 
 Remote operation entries have the shape:
 

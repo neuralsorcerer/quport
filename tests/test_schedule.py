@@ -22,6 +22,27 @@ from quport.schedule import (
 )
 
 
+def _assert_schedule_plan_timeline_is_consistent(plan: object) -> None:
+    layers = plan.layers
+    if not layers:
+        assert plan.summary.makespan == 0.0
+        return
+
+    assert layers[0].start_time == 0.0
+    for previous, current in zip(layers[:-1], layers[1:], strict=True):
+        assert current.start_time == previous.end_time
+    assert layers[-1].end_time == plan.summary.makespan
+
+    for layer in layers:
+        assert layer.end_time == layer.start_time + layer.duration
+        previous_round_end = layer.start_time
+        for round_trace in layer.remote_rounds:
+            assert round_trace.start_time == previous_round_end
+            assert round_trace.end_time == round_trace.start_time + round_trace.duration
+            assert round_trace.end_time <= layer.end_time
+            previous_round_end = round_trace.end_time
+
+
 def test_unschedulable_penalty_matches_unreachable_distance() -> None:
     assert UNSCHEDULABLE_PENALTY == float(UNREACHABLE_DISTANCE)
 
@@ -889,3 +910,80 @@ def test_topology_schedule_plan_records_zero_switch_pair_budget_penalties() -> N
     ]
     assert plan.summary.remote_rounds == 2
     assert plan.summary.makespan >= 2 * UNSCHEDULABLE_PENALTY
+
+
+def test_topology_schedule_plan_records_absolute_layer_and_round_times() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    latency = LatencyModel(
+        oneq=1.0,
+        twoq=10.0,
+        epr_gen=100.0,
+        classical_rtt=20.0,
+        remote_gate_overhead=5.0,
+    )
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.x(0)
+    qc.cx(0, 3)
+    qc.x(1)
+
+    plan = estimate_topology_schedule_plan(qc, arch, latency)
+
+    _assert_schedule_plan_timeline_is_consistent(plan)
+
+    remote_layer = next(layer for layer in plan.layers if layer.remote_rounds)
+    remote_round = remote_layer.remote_rounds[0]
+    assert remote_round.start_time == remote_layer.start_time
+
+
+def test_topology_schedule_plan_times_unschedulable_no_port_rounds() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=0,
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.cx(0, 2)
+    qc.cx(1, 3)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    _assert_schedule_plan_timeline_is_consistent(plan)
+    remote_layer = next(layer for layer in plan.layers if layer.remote_rounds)
+    assert [round_.start_time for round_ in remote_layer.remote_rounds] == [
+        remote_layer.start_time,
+        remote_layer.start_time + UNSCHEDULABLE_PENALTY,
+    ]
+    assert all(round_.unschedulable_ops == 1 for round_ in remote_layer.remote_rounds)
+
+
+def test_topology_schedule_plan_times_unreachable_rounds() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="degree_d",
+        inter_degree=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.cx(0, 2)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+
+    _assert_schedule_plan_timeline_is_consistent(plan)
+    remote_layer = next(layer for layer in plan.layers if layer.remote_rounds)
+    assert len(remote_layer.remote_rounds) == 1
+    assert remote_layer.remote_rounds[0].start_time == remote_layer.start_time
+    assert remote_layer.remote_rounds[0].duration == UNSCHEDULABLE_PENALTY
+    assert remote_layer.remote_rounds[0].unschedulable_ops == 1
