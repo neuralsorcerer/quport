@@ -4,6 +4,8 @@
 # This source code is licensed under the Apache-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+
 import pytest
 
 pytest.importorskip("qiskit")
@@ -15,6 +17,9 @@ from quport.config import LatencyModel, MultiQPUConfig
 from quport.network import UNREACHABLE_DISTANCE
 from quport.schedule import (
     UNSCHEDULABLE_PENALTY,
+    LayerScheduleTrace,
+    RemoteRoundTrace,
+    TopologyScheduleSummary,
     estimate_parallel_makespan,
     estimate_parallel_makespan_layered,
     estimate_parallel_makespan_topology,
@@ -940,6 +945,137 @@ def test_topology_schedule_plan_records_absolute_layer_and_round_times() -> None
     remote_layer = next(layer for layer in plan.layers if layer.remote_rounds)
     remote_round = remote_layer.remote_rounds[0]
     assert remote_round.start_time == remote_layer.start_time
+
+
+def test_topology_schedule_plan_to_dict_is_json_ready_and_stable() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.x(0)
+    qc.cx(0, 4)
+
+    plan = estimate_topology_schedule_plan(qc, arch, LatencyModel())
+    payload = plan.to_dict()
+
+    assert json.loads(json.dumps(payload, allow_nan=False)) == payload
+    assert payload["summary"] == plan.summary.to_dict()
+    remote_layer_payload = next(
+        layer for layer in payload["layers"] if layer["remote_rounds"]
+    )
+    round_payload = remote_layer_payload["remote_rounds"][0]
+    assert round_payload["qpu_pairs"] == [[0, 2]]
+    assert round_payload["link_utilization"] == [
+        {"edge": [0, 1], "count": 1},
+        {"edge": [1, 2], "count": 1},
+    ]
+    assert round_payload["start_time"] == remote_layer_payload["start_time"]
+
+
+@pytest.mark.parametrize(
+    "summary,match",
+    [
+        (
+            TopologyScheduleSummary(
+                makespan=float("nan"),
+                layers=0,
+                remote_ops=0,
+                remote_rounds=0,
+                peak_link_util=0,
+                peak_qpu_ports_used=0,
+            ),
+            "summary.makespan must be finite",
+        ),
+        (
+            TopologyScheduleSummary(
+                makespan=0.0,
+                layers=True,
+                remote_ops=0,
+                remote_rounds=0,
+                peak_link_util=0,
+                peak_qpu_ports_used=0,
+            ),
+            "summary.layers must be an integer, not boolean",
+        ),
+    ],
+)
+def test_topology_schedule_summary_to_dict_rejects_invalid_fields(
+    summary: TopologyScheduleSummary, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        summary.to_dict()
+
+
+@pytest.mark.parametrize(
+    "round_trace,match",
+    [
+        (
+            RemoteRoundTrace(
+                layer_index=0,
+                round_index=0,
+                qpu_pairs=((0, 0),),
+                duration=0.0,
+                qpu_ports_used=(0, 0),
+                link_utilization=(),
+            ),
+            r"round.qpu_pairs\[0\] entries must be distinct",
+        ),
+        (
+            RemoteRoundTrace(
+                layer_index=0,
+                round_index=0,
+                qpu_pairs=((0, 1),),
+                duration=0.0,
+                qpu_ports_used=(0, -1),
+                link_utilization=(),
+            ),
+            r"round.qpu_ports_used\[1\] must be non-negative",
+        ),
+        (
+            RemoteRoundTrace(
+                layer_index=0,
+                round_index=0,
+                qpu_pairs=((0, 1),),
+                duration=0.0,
+                qpu_ports_used=(0, 0),
+                link_utilization=(((0, 1), True),),
+            ),
+            r"round.link_utilization\[0\].count must be an integer, not boolean",
+        ),
+    ],
+)
+def test_remote_round_trace_to_dict_rejects_invalid_fields(
+    round_trace: RemoteRoundTrace, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        round_trace.to_dict()
+
+
+def test_layer_schedule_trace_to_dict_rejects_invalid_round_payload() -> None:
+    layer = LayerScheduleTrace(
+        layer_index=0,
+        local_duration=0.0,
+        remote_ops=1,
+        remote_rounds=(
+            RemoteRoundTrace(
+                layer_index=0,
+                round_index=0,
+                qpu_pairs=((0, 1),),
+                duration=float("inf"),
+                qpu_ports_used=(1, 1),
+                link_utilization=(((0, 1), 1),),
+            ),
+        ),
+        duration=0.0,
+    )
+
+    with pytest.raises(ValueError, match="round.duration must be finite"):
+        layer.to_dict()
 
 
 def test_topology_schedule_plan_times_unschedulable_no_port_rounds() -> None:

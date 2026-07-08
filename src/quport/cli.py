@@ -454,10 +454,12 @@ def compile_dist(
 
     write_remote_ops_json(res.program.remote_ops, outp / "remote_ops.json")
     (outp / "schedule.json").write_text(
-        json.dumps(asdict(res.schedule), indent=2), encoding="utf-8"
+        json.dumps(res.schedule.to_dict(), indent=2, allow_nan=False),
+        encoding="utf-8",
     )
     (outp / "schedule_trace.json").write_text(
-        json.dumps(asdict(res.schedule_plan), indent=2), encoding="utf-8"
+        json.dumps(res.schedule_plan.to_dict(), indent=2, allow_nan=False),
+        encoding="utf-8",
     )
 
     swaps_total = sum(m.get("swap", 0) for m in res.local_metrics.values())

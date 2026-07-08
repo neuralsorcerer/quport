@@ -142,6 +142,11 @@ The topology-aware estimator is the most informative one for network bottleneck
 analysis because it reports remote rounds, peak link utilization, and peak QPU port
 usage.
 
+For artifact export, call `plan.to_dict()` rather than serializing the dataclass
+directly. The serializer converts QPU pairs and link-utilization pairs into
+JSON-native arrays/objects and validates finite non-negative timings, non-negative
+counts, and non-self QPU/link pairs before returning the manifest.
+
 ## Interpreting metrics
 
 | Metric | Interpretation | Caveat |

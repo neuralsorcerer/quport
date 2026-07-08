@@ -300,6 +300,27 @@ def estimate_parallel_makespan_layered(
     return ScheduleSummary(makespan=total_time, steps=steps, remote_ops=total_remote)
 
 
+def _json_ready_nonnegative_int(value: object, *, label: str) -> int:
+    """Validate an integer schedule-manifest field before JSON export."""
+    return _validated_nonnegative_int(value, label=label)
+
+
+def _json_ready_nonnegative_float(value: object, *, label: str) -> float:
+    """Validate a finite non-negative timing field before JSON export."""
+    return _validated_nonnegative_finite(value, label=label)
+
+
+def _json_ready_pair(value: object, *, label: str) -> list[int]:
+    """Validate an unordered non-self QPU/link pair and return a JSON list."""
+    if not isinstance(value, tuple) or len(value) != 2:
+        raise ValueError(f"{label} must be a 2-tuple")
+    a = _json_ready_nonnegative_int(value[0], label=f"{label}[0]")
+    b = _json_ready_nonnegative_int(value[1], label=f"{label}[1]")
+    if a == b:
+        raise ValueError(f"{label} entries must be distinct")
+    return [a, b]
+
+
 @dataclass(frozen=True)
 class TopologyScheduleSummary:
     """Topology- and resource-aware schedule summary (paper-friendly)."""
@@ -310,6 +331,27 @@ class TopologyScheduleSummary:
     remote_rounds: int
     peak_link_util: int
     peak_qpu_ports_used: int
+
+    def to_dict(self) -> dict[str, float | int]:
+        """Return a stable JSON-ready representation of the summary."""
+        return {
+            "makespan": _json_ready_nonnegative_float(
+                self.makespan, label="summary.makespan"
+            ),
+            "layers": _json_ready_nonnegative_int(self.layers, label="summary.layers"),
+            "remote_ops": _json_ready_nonnegative_int(
+                self.remote_ops, label="summary.remote_ops"
+            ),
+            "remote_rounds": _json_ready_nonnegative_int(
+                self.remote_rounds, label="summary.remote_rounds"
+            ),
+            "peak_link_util": _json_ready_nonnegative_int(
+                self.peak_link_util, label="summary.peak_link_util"
+            ),
+            "peak_qpu_ports_used": _json_ready_nonnegative_int(
+                self.peak_qpu_ports_used, label="summary.peak_qpu_ports_used"
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -331,6 +373,50 @@ class RemoteRoundTrace:
     start_time: float = 0.0
     end_time: float = 0.0
 
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable JSON-ready representation of this communication round."""
+        return {
+            "layer_index": _json_ready_nonnegative_int(
+                self.layer_index, label="round.layer_index"
+            ),
+            "round_index": _json_ready_nonnegative_int(
+                self.round_index, label="round.round_index"
+            ),
+            "qpu_pairs": [
+                _json_ready_pair(pair, label=f"round.qpu_pairs[{idx}]")
+                for idx, pair in enumerate(self.qpu_pairs)
+            ],
+            "duration": _json_ready_nonnegative_float(
+                self.duration, label="round.duration"
+            ),
+            "qpu_ports_used": [
+                _json_ready_nonnegative_int(
+                    port_count, label=f"round.qpu_ports_used[{idx}]"
+                )
+                for idx, port_count in enumerate(self.qpu_ports_used)
+            ],
+            "link_utilization": [
+                {
+                    "edge": _json_ready_pair(
+                        edge, label=f"round.link_utilization[{idx}].edge"
+                    ),
+                    "count": _json_ready_nonnegative_int(
+                        count, label=f"round.link_utilization[{idx}].count"
+                    ),
+                }
+                for idx, (edge, count) in enumerate(self.link_utilization)
+            ],
+            "unschedulable_ops": _json_ready_nonnegative_int(
+                self.unschedulable_ops, label="round.unschedulable_ops"
+            ),
+            "start_time": _json_ready_nonnegative_float(
+                self.start_time, label="round.start_time"
+            ),
+            "end_time": _json_ready_nonnegative_float(
+                self.end_time, label="round.end_time"
+            ),
+        }
+
 
 @dataclass(frozen=True)
 class LayerScheduleTrace:
@@ -349,6 +435,32 @@ class LayerScheduleTrace:
     start_time: float = 0.0
     end_time: float = 0.0
 
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable JSON-ready representation of this DAG-layer schedule."""
+        return {
+            "layer_index": _json_ready_nonnegative_int(
+                self.layer_index, label="layer.layer_index"
+            ),
+            "local_duration": _json_ready_nonnegative_float(
+                self.local_duration, label="layer.local_duration"
+            ),
+            "remote_ops": _json_ready_nonnegative_int(
+                self.remote_ops, label="layer.remote_ops"
+            ),
+            "remote_rounds": [
+                round_trace.to_dict() for round_trace in self.remote_rounds
+            ],
+            "duration": _json_ready_nonnegative_float(
+                self.duration, label="layer.duration"
+            ),
+            "start_time": _json_ready_nonnegative_float(
+                self.start_time, label="layer.start_time"
+            ),
+            "end_time": _json_ready_nonnegative_float(
+                self.end_time, label="layer.end_time"
+            ),
+        }
+
 
 @dataclass(frozen=True)
 class TopologySchedulePlan:
@@ -356,6 +468,18 @@ class TopologySchedulePlan:
 
     summary: TopologyScheduleSummary
     layers: tuple[LayerScheduleTrace, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable JSON-ready schedule manifest.
+
+        The manifest preserves absolute layer and round timing, resource usage,
+        and unschedulable penalty rounds, making compiled schedules easier to
+        feed into visualization, simulation, or artifact-export workflows.
+        """
+        return {
+            "summary": self.summary.to_dict(),
+            "layers": [layer.to_dict() for layer in self.layers],
+        }
 
 
 def _effective_classical_rtt(

@@ -80,8 +80,12 @@ Inspect `compile_out/`:
 
 - `qpu_<id>_routed.qasm` files are locally routed QPU programs.
 - `remote_ops.json` is the ordered list of remote operations.
-- `schedule.json` is a topology-aware summary.
-- `schedule_trace.json` is the detailed layer/round trace, including absolute `start_time` and `end_time` offsets for timeline inspection.
+- `schedule.json` is a strict JSON topology-aware summary produced by `TopologyScheduleSummary.to_dict()`.
+- `schedule_trace.json` is the strict JSON layer/round trace produced by `TopologySchedulePlan.to_dict()`, including absolute `start_time` and `end_time` offsets for timeline inspection.
+
+Both schedule exports reject non-finite timings and malformed resource fields before
+writing JSON, which keeps generated artifacts compatible with `python -m json.tool`
+and other standards-compliant JSON consumers.
 
 ## Choosing a compilation mode
 

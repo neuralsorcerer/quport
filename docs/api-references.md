@@ -320,6 +320,15 @@ durations. This is the most useful API when diagnosing why a makespan increased.
 - `LayerScheduleTrace(layer_index, local_duration, remote_ops, remote_rounds, duration, start_time=0.0, end_time=0.0)`
 - `TopologySchedulePlan(summary, layers)`
 
+`TopologyScheduleSummary`, `RemoteRoundTrace`, `LayerScheduleTrace`, and
+`TopologySchedulePlan` provide `to_dict()` methods that return stable JSON-ready
+payloads. The conversion normalizes tuple-heavy fields such as QPU pairs and link
+utilization into ordinary JSON arrays/objects, so command-line schedule exports and
+downstream simulators can consume traces without depending on Python dataclass
+serialization details. The serializers also revalidate manifest fields and reject
+non-finite timings, negative counts, booleans in integer fields, malformed QPU/link
+pairs, and self-loop pairs before emitting payloads.
+
 `LayerScheduleTrace.start_time` is the absolute offset at which the DAG layer begins,
 and `LayerScheduleTrace.end_time` is `start_time + duration`. Remote rounds are
 serialized from the containing layer's `start_time`; each `RemoteRoundTrace.start_time`

@@ -86,6 +86,7 @@ mapped = map_and_transpile(qc, cfg, LatencyModel(), seed=2, strategy="balanced")
 plan = estimate_topology_schedule_plan(mapped.mapped_circuit, MultiQPUArchitecture(cfg), LatencyModel())
 
 print(plan.summary)
+print(plan.to_dict()["summary"])
 for layer in plan.layers:
     print(layer.layer_index, layer.start_time, layer.end_time, layer.remote_ops)
     for round_trace in layer.remote_rounds:
@@ -94,7 +95,9 @@ for layer in plan.layers:
 
 Use the trace when a summary value such as `remote_rounds` or `makespan` changes and
 you need to understand which layer/round caused it. The absolute timing fields let
-you plot a timeline directly without reconstructing cumulative offsets.
+you plot a timeline directly without reconstructing cumulative offsets. Use
+`plan.to_dict()` for JSON export; it converts tuple-heavy resource fields into
+JSON-native values and validates malformed timing/count/pair data before returning.
 
 ## Benchmark CSV
 

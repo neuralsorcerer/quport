@@ -508,6 +508,11 @@ The estimator returns:
 - `peak_link_util`;
 - `peak_qpu_ports_used`.
 
+Use `schedule.to_dict()` or `schedule_plan.to_dict()` when exporting these values.
+Those serializers normalize tuple-valued QPU pairs and link-utilization entries to
+JSON-native arrays/objects and validate finite non-negative timings, non-negative
+counts, and non-self QPU/link pairs before emitting a payload.
+
 ---
 
 ## Metrics and cost model
@@ -757,6 +762,8 @@ result = compile_distributed(
 )
 
 print(result.schedule.makespan)
+print(result.schedule.to_dict())
+print(result.schedule_plan.to_dict()["summary"])
 print(result.schedule_plan.layers[0].remote_rounds)
 print(len(result.program.remote_ops))
 print(result.local_metrics)
@@ -857,8 +864,8 @@ Produces:
 |---|---|
 | `qpu_<id>_routed.qasm` | Locally routed OpenQASM 3 circuit for QPU `<id>`. |
 | `remote_ops.json` | Ordered remote-operation trace. |
-| `schedule.json` | Topology-aware schedule summary. |
-| `schedule_trace.json` | Detailed per-layer and per-round communication plan with absolute timing, QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
+| `schedule.json` | Strict JSON topology-aware schedule summary produced from `TopologyScheduleSummary.to_dict()`. |
+| `schedule_trace.json` | Strict JSON per-layer/per-round communication plan produced from `TopologySchedulePlan.to_dict()`, with absolute timing, QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
 
 Remote operation entries have the shape:
 
@@ -866,12 +873,17 @@ Remote operation entries have the shape:
 {
   "index": 12,
   "name": "cx",
-  "qubits": [7, 84],
-  "qpus": [0, 9]
+  "q0_phys": 7,
+  "q1_phys": 84,
+  "qpu0": 0,
+  "qpu1": 9,
+  "params": [],
+  "clbits": []
 }
 ```
 
-Exact fields follow the `RemoteOp` dataclass used by the current implementation.
+Schedule artifacts are written with `allow_nan=False`, so non-finite values are
+rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
 
 ---
 
@@ -885,7 +897,7 @@ Exact fields follow the `RemoteOp` dataclass used by the current implementation.
 |---|---|
 | `trial` | Trial index. |
 | `seed` | Random seed used for the trial. |
-| `method` | Numeric method id: baseline `0`, balanced `1`, tpccap `2`. |
+| `method` | Numeric method id: baseline `0`, balanced `1`, tpccap `2`, tpccap_sa `3`, cluster `4`. |
 | `strategy` | Strategy name. |
 | `swaps` | SWAP count. |
 | `remote_2q` | Remote two-qubit operation count. |

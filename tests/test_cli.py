@@ -159,10 +159,21 @@ def test_compile_dist_accepts_input_qasm_without_n_logical(tmp_path: Path) -> No
 
     assert result.exit_code == 0, result.output
     assert (out_dir / "remote_ops.json").exists()
-    assert (out_dir / "schedule.json").exists()
+    schedule_path = out_dir / "schedule.json"
+    assert schedule_path.exists()
+    schedule = json.loads(schedule_path.read_text(encoding="utf-8"))
+    assert set(schedule) == {
+        "makespan",
+        "layers",
+        "remote_ops",
+        "remote_rounds",
+        "peak_link_util",
+        "peak_qpu_ports_used",
+    }
     trace_path = out_dir / "schedule_trace.json"
     assert trace_path.exists()
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["summary"] == schedule
     assert all(
         "start_time" in layer and "end_time" in layer for layer in trace["layers"]
     )
