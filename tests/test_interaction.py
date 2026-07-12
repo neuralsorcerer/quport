@@ -61,6 +61,28 @@ def test_extract_temporal_twoq_weights_applies_decay_only_to_2q_sequence() -> No
     assert weights == {(0, 1): 1.0, (1, 2): 0.5, (0, 2): 0.25}
 
 
+def test_extract_twoq_weights_ignores_two_qubit_barrier_directives() -> None:
+    qc = QuantumCircuit(3)
+    qc.cx(0, 1)
+    qc.barrier(0, 2)
+    qc.barrier(1, 2)
+
+    assert extract_twoq_weights(qc) == {(0, 1): 1}
+
+
+def test_extract_temporal_twoq_weights_ignores_two_qubit_barrier_directives() -> None:
+    qc = QuantumCircuit(3)
+    qc.cx(0, 1)
+    qc.barrier(0, 2)
+    qc.cz(1, 2)
+
+    # The barrier neither contributes weight nor advances the decay clock.
+    assert extract_temporal_twoq_weights(qc, decay=0.5) == {
+        (0, 1): 1.0,
+        (1, 2): 0.5,
+    }
+
+
 def test_degree_and_cut_weight_accept_integral_and_float_like_valid_values() -> None:
     weights = {
         (0, 1): Decimal("1.25"),

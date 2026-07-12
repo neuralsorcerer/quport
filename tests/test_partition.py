@@ -248,6 +248,16 @@ def test_heavy_edge_partition_rejects_non_numeric_weight() -> None:
         )
 
 
+def test_heavy_edge_partition_rejects_overflowing_integer_weight() -> None:
+    with pytest.raises(ValueError, match="weights must be numeric"):
+        heavy_edge_clustering_partition(
+            n=2,
+            weights={(0, 1): 10**400},
+            n_qpus=1,
+            capacity=2,
+        )
+
+
 def test_heavy_edge_partition_rejects_bool_weight() -> None:
     with pytest.raises(ValueError, match="not booleans"):
         heavy_edge_clustering_partition(

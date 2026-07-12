@@ -70,6 +70,9 @@ def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
     for inst in qc.data:
         if len(inst.qubits) != 2:
             continue
+        # Compiler directives (e.g. a 2-qubit barrier) are not interactions.
+        if getattr(inst.operation, "_directive", False):
+            continue
         i = qindex[inst.qubits[0]]
         j = qindex[inst.qubits[1]]
         if i == j:
@@ -166,6 +169,9 @@ def extract_temporal_twoq_weights(
     t = 0
     for inst in qc.data:
         if len(inst.qubits) != 2:
+            continue
+        # Compiler directives (e.g. a 2-qubit barrier) are not interactions.
+        if getattr(inst.operation, "_directive", False):
             continue
         i = qindex[inst.qubits[0]]
         j = qindex[inst.qubits[1]]

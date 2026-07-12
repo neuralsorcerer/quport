@@ -73,7 +73,7 @@ def _validate_and_normalize_partition_inputs(
             raise ValueError("weights must be numeric values, not booleans")
         try:
             w = float(w_raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError("weights must be numeric") from None
         if not math.isfinite(w):
             raise ValueError("weights must be finite")
@@ -105,7 +105,7 @@ def _coerce_finite_float(value: object, *, label: str) -> float:
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{label} must be numeric") from None
     if not math.isfinite(out):
         raise ValueError(f"{label} must be finite")
@@ -628,7 +628,7 @@ def _validate_sp_dimensions(sp: QpuShortestPaths, n_qpus: int) -> None:
                 raise ValueError("shortest-path distances must be numeric")
             try:
                 d_float = float(d)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise ValueError("shortest-path distances must be numeric") from None
             if not math.isfinite(d_float):
                 raise ValueError("shortest-path distances must be finite")

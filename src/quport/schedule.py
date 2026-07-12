@@ -52,7 +52,7 @@ def _validated_nonnegative_finite(value: object, *, label: str) -> float:
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{label} must be numeric") from None
     if not math.isfinite(out):
         raise ValueError(f"{label} must be finite")
@@ -166,6 +166,10 @@ def estimate_parallel_makespan(
     steps = 0
 
     for idx, inst in enumerate(mapped.data):
+        # Compiler directives (barriers) synchronize but consume no time; they
+        # are never RemoteOps (split_into_qpus handles them separately).
+        if getattr(inst.operation, "_directive", False):
+            continue
         qpus = _instruction_qpus(inst.qubits, qindex, phys_to_qpu)
         name = inst.operation.name
         if idx in remote_by_index:
@@ -255,6 +259,10 @@ def estimate_parallel_makespan_layered(
         remote_pairs: list[tuple[int, int]] = []
 
         for node in layer["graph"].op_nodes():
+            # Compiler directives (barriers) act as layer separators in the DAG
+            # but consume no time and are never remote operations.
+            if getattr(node.op, "_directive", False):
+                continue
             name = node.op.name
             qpus = _instruction_qpus(node.qargs, qindex, phys_to_qpu)
             if len(qpus) == 0:
@@ -660,6 +668,10 @@ def _topology_schedule_plan(
         remote_pairs: list[tuple[int, int]] = []
 
         for node in layer["graph"].op_nodes():
+            # Compiler directives (barriers) act as layer separators in the DAG
+            # but consume no time and are never remote operations.
+            if getattr(node.op, "_directive", False):
+                continue
             name = node.op.name
             qs = [qindex[q] for q in node.qargs]
             if len(qs) == 0:

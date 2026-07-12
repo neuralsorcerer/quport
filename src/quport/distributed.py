@@ -145,7 +145,7 @@ def _json_safe_value(value: object, seen: set[int] | None = None) -> Any:
     if callable(item):
         try:
             return _json_safe_value(item(), active_seen)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             pass
 
     return {"type": type(value).__name__, "repr": str(value)}

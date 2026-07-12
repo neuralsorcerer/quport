@@ -47,6 +47,10 @@ def compute_metrics(qc: QuantumCircuit, arch: MultiQPUArchitecture) -> CircuitMe
 
     # physical qubit indices in the transpiled circuit are qc.qubits indices
     for inst in qc.data:
+        # Compiler directives (barriers) consume no runtime resources; qiskit's
+        # own depth()/size() exclude them with the same check.
+        if getattr(inst.operation, "_directive", False):
+            continue
         if inst.operation.name == "swap":
             swaps += 1
         qubits = inst.qubits

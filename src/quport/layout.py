@@ -41,7 +41,7 @@ def _validate_nonnegative_float(value: object, *, label: str) -> float:
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ValueError(f"{label} must be numeric") from None
     if not math.isfinite(out):
         raise ValueError(f"{label} must be finite")
@@ -105,7 +105,7 @@ def _iter_validated_layout_weights(
             raise ValueError("weights must be numeric values, not booleans")
         try:
             weight = float(cast(SupportsFloat | SupportsIndex | str, weight_raw))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError("weights must be numeric") from None
         if not math.isfinite(weight):
             raise ValueError("weights must be finite")

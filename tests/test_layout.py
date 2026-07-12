@@ -201,6 +201,7 @@ def test_diverse_comm_selection_rejects_invalid_diversity_penalty(
         ({(0, 2): 1.0}, "out-of-range logical indices"),
         ({(0, 1): True}, "not booleans"),
         ({(0, 1): object()}, "weights must be numeric"),
+        ({(0, 1): 10**400}, "weights must be numeric"),
         ({(0, 1): nan}, "weights must be finite"),
         ({(0, 1): inf}, "weights must be finite"),
         ({(0, 1): -1.0}, "weights must be non-negative"),

@@ -63,6 +63,7 @@ def test_unschedulable_penalty_matches_unreachable_distance() -> None:
         ("remote_gate_overhead", float("inf")),
         ("oneq", True),
         ("oneq", object()),
+        ("oneq", 10**400),
     ],
 )
 def test_schedule_estimators_reject_invalid_latency_model_values(
@@ -338,6 +339,33 @@ def test_schedule_estimators_handle_zero_and_multi_qubit_ops_consistently() -> N
     assert summary_layered.remote_ops == 0
     assert summary_linear.makespan > 0.0
     assert summary_linear.makespan == pytest.approx(summary_layered.makespan)
+
+
+def test_schedule_estimators_ignore_qubit_scoped_barrier_directives() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    qc = QuantumCircuit(cfg.total_physical_qubits())
+    qc.barrier(0)  # single-qubit directive: no local gate time
+    qc.barrier(0, 4)  # spans both QPUs but is a directive, not a remote op
+
+    model = LatencyModel()
+    summary_linear = estimate_parallel_makespan(qc, arch, model)
+    summary_layered = estimate_parallel_makespan_layered(qc, arch, model)
+    summary_topology = estimate_parallel_makespan_topology(qc, arch, model)
+
+    assert summary_linear.remote_ops == 0
+    assert summary_layered.remote_ops == 0
+    assert summary_topology.remote_ops == 0
+    assert summary_linear.makespan == 0.0
+    assert summary_layered.makespan == 0.0
+    assert summary_topology.makespan == 0.0
+    assert summary_topology.remote_rounds == 0
 
 
 def test_topology_estimator_rejects_boolean_comm_ports() -> None:
