@@ -17,6 +17,7 @@ QuPort is a production-ready Python and Qiskit toolkit for modeling, mapping, ro
 [![Test Windows](https://github.com/neuralsorcerer/quport/actions/workflows/windows.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/windows.yml?query=branch%3Amain)
 [![Test MacOS](https://github.com/neuralsorcerer/quport/actions/workflows/macos.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/macos.yml?query=branch%3Amain)
 [![Lints](https://github.com/neuralsorcerer/quport/actions/workflows/lint.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/lint.yml?query=branch%3Amain)
+[![CodeQL](https://github.com/neuralsorcerer/quport/actions/workflows/codeql.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/codeql.yml?query=branch%3Amain)
 [![Documentation](https://github.com/neuralsorcerer/quport/actions/workflows/docs.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/docs.yml?query=branch%3Amain)
 [![License](https://img.shields.io/badge/License-Apache%202.0-3c60b1.svg?logo=opensourceinitiative&logoColor=white)](./LICENSE)
 [![arXiv](https://img.shields.io/badge/arXiv-2605.12583-b31b1b.svg?logo=arxiv)](https://arxiv.org/abs/2605.12583)
