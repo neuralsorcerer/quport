@@ -4,7 +4,7 @@ QuPort
 
 <div align="center">
 
-QuPort is a production-ready Python and Qiskit toolkit for modeling, mapping, routing, splitting, scheduling, and benchmarking quantum circuits on modular multi-QPU machines. It treats the machine as a collection of QPUs with local compute qubits, communication-port qubits, an inter-QPU network, finite link capacity, finite port count, and a configurable latency model.
+QuPort is a research software framework developed in Python using the Qiskit toolkit for modeling, mapping, routing, splitting, scheduling, and benchmarking quantum circuits on modular multi-QPU machines. It treats the machine as a collection of QPUs with local compute qubits, communication-port qubits, an inter-QPU network, finite link capacity, finite port count, and a configurable latency model.
 
 </div>
 
