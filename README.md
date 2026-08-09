@@ -397,7 +397,7 @@ The `map_and_transpile` pipeline performs:
 5. **Layout hinting**: choose communication-port logical qubits and create an initial Qiskit layout.
 6. **Global coupling map construction**: create a directed coupling map for all local and inter-QPU physical links.
 7. **Qiskit transpilation**: run Qiskit with the configured optimization, layout, and routing settings.
-8. **Metric computation**: count SWAPs, depth, size, one-qubit gates, two-qubit gates, and remote two-qubit operations.
+8. **Metric computation**: count SWAPs, , size, one-qubit gates, two-qubit gates, and remote two-qubit operations.
 9. **Cost estimation**: evaluate the configured latency/cost model.
 
 This mode is useful when you want one routed Qiskit circuit for the entire modular device graph.
@@ -514,7 +514,7 @@ For a transpiled or physical circuit, QuPort computes:
 | Metric | Meaning |
 |---|---|
 | `swaps` | Number of `swap` instructions. |
-| `depth` | Qiskit circuit depth. |
+| `` | Qiskit circuit . |
 | `size` | Qiskit circuit size. |
 | `n_1q` | Number of one-qubit instructions. |
 | `n_2q` | Number of two-qubit instructions. |
@@ -553,7 +553,7 @@ $$
 The depth penalty is:
 
 $$
-C_{\mathrm{depth}}=0.1\,d_{\mathrm{circuit}}\,c_{2q}.
+C_{\mathrm{depth}}=0.1\*d_{\mathrm{circuit}}\*c_{2q}.
 $$
 
 The total reported cost is:
