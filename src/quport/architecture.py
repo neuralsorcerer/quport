@@ -77,6 +77,26 @@ def _all_pairs(nodes: list[int]) -> Iterable[tuple[int, int]]:
             yield nodes[i], nodes[j]
 
 
+def _ring_qpu_pairs(n_qpus: int) -> Iterable[tuple[int, int]]:
+    """Yield each undirected ring adjacency ``(q, (q+1) % N)`` exactly once.
+
+    Iterating ``(a, (a + 1) % n_qpus)`` for every ``a`` degenerates at small
+    ring sizes: with one QPU it produces the self pair ``(0, 0)``, and with two
+    QPUs it produces the same undirected link twice.  Both cases must be avoided
+    here because comm ports are wired per QPU pair, so a self pair would invent
+    an intra-QPU link between two distinct comm ports and a repeated pair would
+    emit duplicate physical edges.  This matches the ring adjacency built by
+    :func:`quport.network.build_qpu_graph`, which deduplicates through sets.
+    """
+    if n_qpus <= 1:
+        return
+    if n_qpus == 2:
+        yield 0, 1
+        return
+    for a in range(n_qpus):
+        yield a, (a + 1) % n_qpus
+
+
 def _grid_dimensions(
     n: int, rows: object | None, cols: object | None
 ) -> tuple[int, int]:
@@ -203,8 +223,7 @@ class MultiQPUArchitecture:
                             _add_bidir(edges, qa, qb)
 
         elif topo == "ring":
-            for a in range(self.cfg.n_qpus):
-                b = (a + 1) % self.cfg.n_qpus
+            for a, b in _ring_qpu_pairs(self.cfg.n_qpus):
                 for qa in comms[a]:
                     for qb in comms[b]:
                         _add_bidir(edges, qa, qb)
@@ -231,11 +250,8 @@ class MultiQPUArchitecture:
             # - port1: full mesh across pods (spine)
             if self.cfg.comm_qubits_per_qpu < 2:
                 # fallback to degree-2 ring if not enough ports
-                for a in range(self.cfg.n_qpus):
-                    b = (a + 1) % self.cfg.n_qpus
-                    qa = comms[a][0]
-                    qb = comms[b][0]
-                    _add_bidir(edges, qa, qb)
+                for a, b in _ring_qpu_pairs(self.cfg.n_qpus):
+                    _add_bidir(edges, comms[a][0], comms[b][0])
             else:
                 pod_size = max(2, math.ceil(math.sqrt(self.cfg.n_qpus)))
                 pods: list[list[int]] = []

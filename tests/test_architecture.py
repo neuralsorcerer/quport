@@ -425,3 +425,98 @@ def test_architecture_accepts_integral_subclasses_for_structural_config() -> Non
     assert arch.n_phys == 4
     assert arch.block_of_qpu(FancyInt(1)).compute == [2]
     assert arch.qpu_of_phys(FancyInt(3)) == 1
+
+
+def _inter_coupling_edge_list(arch: MultiQPUArchitecture) -> list[tuple[int, int]]:
+    """Return inter-QPU coupling edges as a list so duplicates stay visible."""
+    return [
+        (int(u), int(v)) for u, v in arch.build_interconnect_coupling_map().get_edges()
+    ]
+
+
+@pytest.mark.parametrize("comm_qubits_per_qpu", [1, 2, 3])
+def test_ring_interconnect_never_links_a_single_qpu_to_itself(
+    comm_qubits_per_qpu: int,
+) -> None:
+    """A one-QPU ring has no inter-QPU link, so comm ports must stay unwired.
+
+    Wiring ``(a, (a + 1) % n_qpus)`` blindly would pair QPU 0 with itself and
+    invent an intra-QPU link between two distinct comm ports.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=1,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=comm_qubits_per_qpu,
+        intra_topology="line",
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    assert _inter_coupling_edge_list(arch) == []
+    assert arch.qpu_graph() == [[]]
+
+    # The global map must expose only the declared line topology: comm ports that
+    # sit more than one hop apart on the line must never be joined to each other.
+    n_local = 1 + comm_qubits_per_qpu
+    expected_line_edges = {
+        edge for i in range(n_local - 1) for edge in ((i, i + 1), (i + 1, i))
+    }
+    assert set(arch.build_coupling_map().get_edges()) == expected_line_edges
+
+
+@pytest.mark.parametrize("inter_topology", ["ring", "clos"])
+def test_two_qpu_ring_emits_each_inter_link_exactly_once(inter_topology: str) -> None:
+    """A two-QPU ring has a single undirected link, not one per direction.
+
+    ``clos`` falls back to the same ring wiring when there are fewer than two
+    comm ports per QPU, so both paths must avoid emitting duplicate edges.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology=inter_topology,
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    edges = _inter_coupling_edge_list(arch)
+    assert sorted(edges) == [(1, 3), (3, 1)]
+    assert len(edges) == len(set(edges))
+    assert _qpu_comm_edge_pairs(arch) == {(0, 1)} == _expected_qpu_pairs(arch)
+
+
+@pytest.mark.parametrize(
+    "inter_topology",
+    ["switch", "mesh", "ring", "degree_d", "clos", "fat_tree"],
+)
+@pytest.mark.parametrize("n_qpus", [1, 2, 3, 5])
+@pytest.mark.parametrize("comm_qubits_per_qpu", [0, 1, 2])
+def test_interconnect_edges_are_unique_and_match_the_qpu_graph(
+    inter_topology: str, n_qpus: int, comm_qubits_per_qpu: int
+) -> None:
+    """Physical inter-QPU wiring must agree with the QPU-level network model.
+
+    Every emitted edge has to join two *different* QPUs, appear exactly once per
+    direction, and induce precisely the adjacency reported by ``qpu_graph()``.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=n_qpus,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=comm_qubits_per_qpu,
+        intra_topology="line",
+        inter_topology=inter_topology,
+        inter_degree=2,
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    edges = _inter_coupling_edge_list(arch)
+    assert len(edges) == len(set(edges))
+    assert {(v, u) for u, v in edges} == set(edges)
+    for u, v in edges:
+        assert arch.qpu_of_phys(u) != arch.qpu_of_phys(v)
+
+    assert _qpu_comm_edge_pairs(arch) == _expected_qpu_pairs(arch)
+
+    global_edges = list(arch.build_coupling_map().get_edges())
+    assert len(global_edges) == len(set(global_edges))
