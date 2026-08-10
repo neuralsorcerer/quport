@@ -306,23 +306,32 @@ def build_initial_layout(
         comm_phys = blk.comm
         comp_phys = blk.compute
 
-        comm_l = [logical for logical in logicals if logical in comm_logicals]
-        comp_l = [logical for logical in logicals if logical not in comm_logicals]
-
         # truncate if needed
-        comm_l = comm_l[: len(comm_phys)]
+        comm_l = [logical for logical in logicals if logical in comm_logicals][
+            : len(comm_phys)
+        ]
         # ensure the rest are compute logicals
         used_comm = set(comm_l)
         comp_l = [logical for logical in logicals if logical not in used_comm]
 
-        if len(comp_l) > len(comp_phys):
+        # Communication ports count toward MultiQPUConfig.capacity_per_qpu(), so a
+        # port left over by the comm selection is still a valid home for a compute
+        # logical.  Spilling into those ports keeps this function total for every
+        # partition the partitioners can produce: without it, a caller supplying
+        # fewer comm logicals than there are ports would see a feasible QPU
+        # rejected while its ports sat empty.
+        spare_comm_phys = comm_phys[len(comm_l) :]
+        available_phys = comp_phys + spare_comm_phys
+
+        if len(comp_l) > len(available_phys):
             raise RuntimeError(
-                f"QPU {qpu_id} overflow: {len(comp_l)} logicals > {len(comp_phys)} compute qubits"
+                f"QPU {qpu_id} overflow: {len(logicals)} logicals > "
+                f"{len(comp_phys) + len(comm_phys)} qubits"
             )
 
         for logical, physical in zip(comm_l, comm_phys, strict=False):
             layout[logical] = physical
-        for logical, physical in zip(comp_l, comp_phys, strict=False):
+        for logical, physical in zip(comp_l, available_phys, strict=False):
             layout[logical] = physical
 
     if any(x < 0 for x in layout):

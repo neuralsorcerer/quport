@@ -227,9 +227,45 @@ def test_comm_selection_ignores_zero_weight_and_self_loop_edges(
     assert comm == {0, 1}
 
 
-def test_build_initial_layout_reports_compute_overflow_after_valid_input() -> None:
-    with pytest.raises(RuntimeError, match="QPU 0 overflow"):
-        build_initial_layout(_arch(n_qpus=1, compute=1, comm=1), 2, [0, 0], set())
+def test_build_initial_layout_reports_overflow_after_valid_input() -> None:
+    # Capacity is compute + comm = 2, so three logicals genuinely overflow QPU 0.
+    with pytest.raises(RuntimeError, match="QPU 0 overflow: 3 logicals > 2 qubits"):
+        build_initial_layout(_arch(n_qpus=1, compute=1, comm=1), 3, [0, 0, 0], set())
+
+
+@pytest.mark.parametrize("comm_logicals", [set(), {0}, {0, 1}])
+def test_build_initial_layout_spills_into_unused_comm_ports(
+    comm_logicals: set[int],
+) -> None:
+    """A QPU filled to ``capacity_per_qpu()`` must map regardless of comm selection.
+
+    Communication ports count toward per-QPU capacity, so ports the caller did
+    not claim for boundary qubits still have to accept ordinary compute
+    logicals instead of being reported as an overflow.
+    """
+    arch = _arch(n_qpus=1, compute=2, comm=2)
+    assert arch.cfg.capacity_per_qpu() == 4
+
+    layout = build_initial_layout(arch, 4, [0, 0, 0, 0], comm_logicals)
+
+    assert sorted(layout) == [0, 1, 2, 3]
+    comm_phys = set(arch.block_of_qpu(0).comm)
+    # Selected comm logicals keep priority on the ports.
+    for logical in comm_logicals:
+        assert layout[logical] in comm_phys
+
+
+def test_build_initial_layout_overflow_message_is_independent_of_comm_selection() -> (
+    None
+):
+    arch = _arch(n_qpus=1, compute=1, comm=1)
+    messages = set()
+    for comm_logicals in (set(), {0}, {0, 1, 2}):
+        with pytest.raises(RuntimeError) as excinfo:
+            build_initial_layout(arch, 3, [0, 0, 0], comm_logicals)
+        messages.add(str(excinfo.value))
+
+    assert messages == {"QPU 0 overflow: 3 logicals > 2 qubits"}
 
 
 def test_build_initial_layout_accepts_empty_circuit() -> None:
