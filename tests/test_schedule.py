@@ -19,6 +19,7 @@ from quport.schedule import (
     UNSCHEDULABLE_PENALTY,
     LayerScheduleTrace,
     RemoteRoundTrace,
+    TopologySchedulePlan,
     TopologyScheduleSummary,
     estimate_parallel_makespan,
     estimate_parallel_makespan_layered,
@@ -1151,3 +1152,67 @@ def test_topology_schedule_plan_times_unreachable_rounds() -> None:
     assert remote_layer.remote_rounds[0].start_time == remote_layer.start_time
     assert remote_layer.remote_rounds[0].duration == UNSCHEDULABLE_PENALTY
     assert remote_layer.remote_rounds[0].unschedulable_ops == 1
+
+
+def _single_layer_remote_plan(
+    cfg: MultiQPUConfig, pairs: list[tuple[int, int]]
+) -> TopologySchedulePlan:
+    """Build a physical circuit whose cross-QPU gates all fall in one DAG layer."""
+    arch = MultiQPUArchitecture(cfg)
+    circuit = QuantumCircuit(arch.n_phys)
+    for control, target in pairs:
+        circuit.cx(control, target)
+    return estimate_topology_schedule_plan(circuit, arch, LatencyModel())
+
+
+@pytest.mark.parametrize(
+    ("link_capacity", "expected_rounds"),
+    [(1, 2), (2, 1)],
+)
+def test_link_capacity_limits_remote_ops_sharing_one_link(
+    link_capacity: int, expected_rounds: int
+) -> None:
+    """Two remote ops crossing the same QPU link contend for that link's capacity."""
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=0,
+        comm_qubits_per_qpu=2,
+        inter_topology="switch",
+        link_capacity=link_capacity,
+        switch_parallel_links=1000,
+    )
+
+    # Disjoint qubit pairs, so both gates share a DAG layer; both cross QPU0<->QPU1.
+    layer = _single_layer_remote_plan(cfg, [(0, 2), (1, 3)]).layers[0]
+
+    assert layer.remote_ops == 2
+    assert len(layer.remote_rounds) == expected_rounds
+    for remote_round in layer.remote_rounds:
+        for _edge, count in remote_round.link_utilization:
+            assert count <= link_capacity
+
+
+@pytest.mark.parametrize(
+    ("switch_parallel_links", "expected_rounds"),
+    [(1, 2), (2, 1)],
+)
+def test_switch_parallel_links_limits_distinct_pairs_per_round(
+    switch_parallel_links: int, expected_rounds: int
+) -> None:
+    """A switch fabric can serve only `switch_parallel_links` QPU pairs per round."""
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=0,
+        comm_qubits_per_qpu=2,
+        inter_topology="switch",
+        link_capacity=4,
+        switch_parallel_links=switch_parallel_links,
+    )
+
+    # QPU0<->QPU1 and QPU2<->QPU3: two distinct pairs, no shared link, ports to spare.
+    layer = _single_layer_remote_plan(cfg, [(0, 2), (4, 6)]).layers[0]
+
+    assert layer.remote_ops == 2
+    assert len(layer.remote_rounds) == expected_rounds
+    for remote_round in layer.remote_rounds:
+        assert len(set(remote_round.qpu_pairs)) <= switch_parallel_links

@@ -1144,3 +1144,54 @@ def test_tpccap_partition_sums_unroutable_l2_per_qpu_pair() -> None:
         == (2.0 * float(UNREACHABLE_DISTANCE)) ** 2
         + (3.0 * float(UNREACHABLE_DISTANCE)) ** 2
     )
+
+
+def test_heavy_edge_clustering_splits_a_cluster_that_cannot_be_placed_whole() -> None:
+    """First-fit leaves fragments; the last cluster must then be placed per vertex.
+
+    Three tight pairs on two QPUs of capacity three fill each QPU to two, so the
+    final pair fits nowhere as a unit and has to be split across both QPUs.
+    """
+    weights = {(0, 1): 5.0, (2, 3): 4.0, (4, 5): 3.0}
+
+    part = heavy_edge_clustering_partition(6, weights, n_qpus=2, capacity=3)
+
+    loads = [part.count(qpu) for qpu in range(2)]
+    assert loads == [3, 3]
+    # The two heaviest pairs stay together, and the lightest is the one split.
+    assert part[0] == part[1]
+    assert part[2] == part[3]
+    assert part[4] != part[5]
+
+
+def test_tpccap_sa_records_an_improvement_over_its_starting_partition() -> None:
+    """Annealing must be able to improve on the TPCCAP seed and report it."""
+    import random
+
+    n = 12
+    rng = random.Random(1)
+    weights = {
+        (i, j): float(rng.randint(1, 6))
+        for i in range(n)
+        for j in range(i + 1, n)
+        if rng.random() < 0.45
+    }
+    # Four-QPU ring: each QPU neighbours the next one modulo four.
+    sp = all_pairs_shortest_paths([[1, 3], [0, 2], [1, 3], [0, 2]])
+
+    result, _diagnostics, anneal = tpccap_sa_partition(
+        n, weights, n_qpus=4, capacity=4, comm_ports_per_qpu=1, sp=sp, seed=1, steps=400
+    )
+
+    assert anneal.steps == 400
+    assert anneal.improved > 0
+    assert anneal.accepted >= anneal.improved
+    assert max(result.loads) <= 4
+    assert result.loads == [result.part.count(qpu) for qpu in range(4)]
+
+    # The same seed must reproduce the run exactly.
+    repeat, _repeat_diagnostics, repeat_anneal = tpccap_sa_partition(
+        n, weights, n_qpus=4, capacity=4, comm_ports_per_qpu=1, sp=sp, seed=1, steps=400
+    )
+    assert repeat.part == result.part
+    assert repeat_anneal == anneal
