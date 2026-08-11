@@ -1307,3 +1307,37 @@ def test_annealing_temperature_schedule_cools_rather_than_heats() -> None:
     heating = sum(accepted(s, cold, hot) for s in seeds)
 
     assert cooling > heating * 1.05
+
+
+def test_greedy_tie_break_prefers_the_emptier_qpu() -> None:
+    """With no interaction weight every QPU ties, so load must break the tie.
+
+    Preferring the fuller QPU would fill QPU 0 before touching QPU 1, giving
+    [0, 0, 1, 1] instead of the balanced alternation.
+    """
+    result = balanced_greedy_partition(
+        4, {}, n_qpus=2, capacity=2, seed=0, alpha_balance=0.0
+    )
+
+    assert result.part == [0, 1, 0, 1]
+    assert result.loads == [2, 2]
+
+
+def test_tpccap_congestion_weight_changes_the_partition() -> None:
+    """`w_cong` must actually scale the congestion term of the objective."""
+    import random
+
+    rng = random.Random(5)
+    n = 12
+    weights = {
+        (i, j): float(rng.randint(1, 6))
+        for i in range(n)
+        for j in range(i + 1, n)
+        if rng.random() < 0.5
+    }
+    sp = all_pairs_shortest_paths([[1, 3], [0, 2], [1, 3], [0, 2]])
+
+    ignored, _ = tpccap_partition(n, weights, 4, 4, 1, sp, seed=5, w_cong=0.0)
+    dominant, _ = tpccap_partition(n, weights, 4, 4, 1, sp, seed=5, w_cong=500.0)
+
+    assert ignored.part != dominant.part

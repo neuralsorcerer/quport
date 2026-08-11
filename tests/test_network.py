@@ -20,6 +20,7 @@ from quport.network import (
     compute_boundary_counts,
     compute_traffic_matrix,
     congestion_metrics,
+    path_edges,
     route_link_loads,
     topology_metrics,
 )
@@ -1168,3 +1169,38 @@ def test_topology_metrics_average_path_ignores_unreachable_pairs() -> None:
     assert metrics.unreachable_pairs == 4
     assert metrics.diameter == 1
     assert metrics.average_shortest_path == pytest.approx(1.0)
+
+
+def test_fat_tree_is_pod_structured_rather_than_all_to_all() -> None:
+    """The pod size is ~sqrt(n); collapsing it to n would make one big clique."""
+    n_qpus = 16
+    cfg = MultiQPUConfig(
+        n_qpus=n_qpus, comm_qubits_per_qpu=1, inter_topology="fat_tree"
+    )
+
+    metrics = topology_metrics(build_qpu_graph(cfg))
+
+    complete_edges = n_qpus * (n_qpus - 1) // 2
+    assert metrics.edges < complete_edges // 2
+    assert metrics.max_degree < n_qpus - 1
+    assert metrics.connected is True
+    # Pods plus representative links keep it shallow but not fully connected.
+    assert metrics.diameter > 1
+
+
+def test_path_edges_returns_canonically_oriented_undirected_links() -> None:
+    """Edges are undirected, so traversal direction must not change the key.
+
+    Callers aggregate per-link utilisation from these tuples; leaving them in
+    traversal order would file one physical link under two different keys.
+    """
+    paths = all_pairs_shortest_paths([[1], [0, 2], [1]])
+
+    assert path_edges(paths, 0, 2) == [(0, 1), (1, 2)]
+    assert path_edges(paths, 2, 0) == [(1, 2), (0, 1)]
+    assert path_edges(paths, 1, 0) == [(0, 1)]
+    assert path_edges(paths, 0, 0) == []
+    for src in range(3):
+        for dst in range(3):
+            for u, v in path_edges(paths, src, dst):
+                assert u < v

@@ -65,3 +65,18 @@ def test_compute_metrics_counts_gates_but_not_barriers_in_mixed_circuit() -> Non
 
     assert metrics.n_2q == 1
     assert metrics.remote_2q == 0
+
+
+def test_count_ops_tallies_each_instruction_once() -> None:
+    from qiskit import QuantumCircuit
+
+    from quport.metrics import count_ops
+
+    circuit = QuantumCircuit(3)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    circuit.cx(1, 2)
+    circuit.barrier()
+    circuit.h(0)
+
+    assert dict(count_ops(circuit)) == {"h": 2, "cx": 2, "barrier": 1}

@@ -1456,3 +1456,67 @@ def test_simple_estimator_synchronizes_both_qpus_at_a_remote_op() -> None:
     assert summary.makespan == pytest.approx(
         5 * latency.oneq + remote_cost + latency.oneq
     )
+
+
+def test_link_capacity_counts_both_traversal_directions_as_one_link() -> None:
+    """An undirected link is one resource however it is traversed.
+
+    The two remote ops cross QPU0<->QPU1 in opposite operand orders. Keying link
+    usage by traversal direction instead of canonically would file them under
+    separate links and let both through in a single round.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=0,
+        comm_qubits_per_qpu=2,
+        inter_topology="switch",
+        link_capacity=1,
+        switch_parallel_links=1000,
+    )
+
+    layer = _one_layer_plan(cfg, [(0, 2), (3, 1)]).layers[0]
+
+    assert layer.remote_ops == 2
+    assert len(layer.remote_rounds) == 2
+    for remote_round in layer.remote_rounds:
+        assert remote_round.link_utilization == (((0, 1), 1),)
+
+    # A lone op whose operands run high-QPU-first must still report the link
+    # canonically, otherwise consumers see (0, 1) and (1, 0) as separate links.
+    reversed_only = _one_layer_plan(cfg, [(2, 0)]).layers[0]
+    assert reversed_only.remote_rounds[0].link_utilization == (((0, 1), 1),)
+    assert reversed_only.remote_rounds[0].qpu_pairs == ((0, 1),)
+
+
+def test_round_packing_schedules_the_most_distant_pair_first() -> None:
+    """Greedy packing is longest-first, so the costliest op leads the layer."""
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+
+    # Both ops need QPU0's single port: one is 1 hop, the other 2 hops.
+    layer = _one_layer_plan(cfg, [(0, 2), (1, 4)]).layers[0]
+
+    assert len(layer.remote_rounds) == 2
+    assert layer.remote_rounds[0].qpu_pairs == ((0, 2),)  # the two-hop pair
+    assert layer.remote_rounds[1].qpu_pairs == ((0, 1),)
+    assert layer.remote_rounds[0].duration > layer.remote_rounds[1].duration
+
+
+def test_peak_link_utilisation_counts_the_link_in_use() -> None:
+    """`peak_link_util` reports usage after placement, so one op means one link."""
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+    )
+
+    summary = _one_layer_plan(cfg, [(0, 2)]).summary
+
+    assert summary.remote_ops == 1
+    assert summary.peak_link_util == 1
+    assert summary.peak_qpu_ports_used == 1
