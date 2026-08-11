@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("qiskit")
 
-from qiskit import QuantumCircuit
+from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister
 
 from quport.architecture import MultiQPUArchitecture
 from quport.config import MultiQPUConfig
@@ -929,3 +929,126 @@ def test_compile_distributed_keeps_local_programs_inside_their_qpu_block(
                 continue
             for qubit in instruction.qubits:
                 assert index[qubit] in allowed
+
+
+def test_split_preserves_source_classical_registers() -> None:
+    """Local circuits must carry the source circuit's clbits and registers.
+
+    Building them with a fresh anonymous register leaves register-valued
+    conditions pointing at a register the local circuit does not contain.
+    """
+    from qiskit.circuit import Clbit
+
+    from quport.distributed import split_into_qpus
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=2,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+    first = ClassicalRegister(2, "alpha")
+    second = ClassicalRegister(3, "beta")
+    circuit = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), first, second)
+    circuit.add_bits([Clbit(), Clbit()])  # loose clbits outside any register
+    circuit.h(0)
+    circuit.measure(0, first[0])
+
+    program = split_into_qpus(circuit, arch)
+
+    for local in program.local_circuits.values():
+        assert list(local.clbits) == list(circuit.clbits)
+        assert [reg.name for reg in local.cregs] == ["alpha", "beta"]
+        assert local.num_qubits == arch.n_phys
+
+
+def test_split_handles_conditional_blocks_without_dangling_registers() -> None:
+    """An `if_else` inside one QPU must survive splitting, DAG conversion and export."""
+    from qiskit import qasm3
+    from qiskit.converters import circuit_to_dag
+
+    from quport.distributed import split_into_qpus
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=2,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+    creg = ClassicalRegister(1, "c0")
+    circuit = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), creg)
+    circuit.h(0)
+    circuit.measure(0, 0)
+    with circuit.if_test((creg, 1)):
+        circuit.cx(0, 1)  # both operands live in QPU 0
+
+    program = split_into_qpus(circuit, arch)
+
+    assert program.remote_ops == []
+    assert program.local_circuits[0].count_ops()["if_else"] == 1
+    for local in program.local_circuits.values():
+        circuit_to_dag(local)  # panics on a dangling register reference
+        qasm3.dumps(local)
+
+
+def test_compile_distributed_accepts_circuits_with_control_flow() -> None:
+    from qiskit import qasm3
+
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+        optimization_level=0,
+    )
+    creg = ClassicalRegister(1, "c0")
+    circuit = QuantumCircuit(QuantumRegister(4, "q"), creg)
+    circuit.h(0)
+    circuit.measure(0, 0)
+    with circuit.if_test((creg, 1)):
+        circuit.cx(0, 1)
+
+    result = compile_distributed(circuit, cfg, strategy="balanced", seed=0)
+
+    assert set(result.local_routed) == {0, 1}
+    for local in result.local_routed.values():
+        qasm3.dumps(local)
+
+
+def test_split_preserves_measurements_on_their_own_qpu() -> None:
+    from quport.distributed import split_into_qpus
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=3,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+    qreg = QuantumRegister(arch.n_phys, "q")
+    creg = ClassicalRegister(arch.n_phys, "c")
+    circuit = QuantumCircuit(qreg, creg)
+    circuit.measure(qreg, creg)
+
+    program = split_into_qpus(circuit, arch)
+
+    total = 0
+    for qpu_id, local in program.local_circuits.items():
+        block = set(arch.block_of_qpu(qpu_id).compute + arch.block_of_qpu(qpu_id).comm)
+        index = {qubit: position for position, qubit in enumerate(local.qubits)}
+        for instruction in local.data:
+            if instruction.operation.name == "measure":
+                total += 1
+                assert index[instruction.qubits[0]] in block
+    assert total == arch.n_phys

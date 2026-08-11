@@ -16,7 +16,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, QuantumRegister
 
 from quport.architecture import MultiQPUArchitecture
 
@@ -310,6 +310,27 @@ def _local_cargs_for_qpu(
     return [qpu_clbits[i] for i in cargs_idx]
 
 
+def _new_local_circuit(mapped: QuantumCircuit, n_phys: int) -> QuantumCircuit:
+    """Create an empty per-QPU circuit mirroring the source's classical layout.
+
+    The circuit spans every physical qubit so physical indices stay usable
+    directly as qubit positions.
+
+    Its classical side reuses the *source* circuit's clbits and registers rather
+    than allocating a fresh anonymous one.  Operations that carry a
+    register-valued condition (``if_else``, ``while_loop``, ``switch_case``, and
+    legacy ``c_if``) reference the registers of the circuit they came from, so a
+    local circuit built with its own register leaves those references dangling
+    and Qiskit cannot convert the result to a DAG.
+    """
+    circuit = QuantumCircuit(QuantumRegister(n_phys, "q"))
+    if mapped.clbits:
+        circuit.add_bits(mapped.clbits)
+    for creg in mapped.cregs:
+        circuit.add_register(creg)
+    return circuit
+
+
 def split_into_qpus(
     mapped: QuantumCircuit, arch: MultiQPUArchitecture
 ) -> DistributedProgram:
@@ -328,7 +349,7 @@ def split_into_qpus(
     # Create per-QPU circuits with the full physical register for clarity.
     # (You may later shrink them to only used qubits.)
     for q in range(n_qpus):
-        local[q] = QuantumCircuit(arch.n_phys, mapped.num_clbits)
+        local[q] = _new_local_circuit(mapped, arch.n_phys)
 
     remote_ops: list[RemoteOp] = []
 
