@@ -1216,3 +1216,86 @@ def test_switch_parallel_links_limits_distinct_pairs_per_round(
     assert len(layer.remote_rounds) == expected_rounds
     for remote_round in layer.remote_rounds:
         assert len(set(remote_round.qpu_pairs)) <= switch_parallel_links
+
+
+def _three_qpu_arch() -> MultiQPUArchitecture:
+    # Blocks of two: QPU0 = {0,1}, QPU1 = {2,3}, QPU2 = {4,5}.
+    return MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=3,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+
+
+def test_estimators_agree_on_remote_count_for_multi_qubit_cross_qpu_gates() -> None:
+    """A 3-qubit gate spanning QPUs is one remote event in every view.
+
+    ``split_into_qpus`` emits a single ``RemoteOp`` for such a gate, so the
+    layered and topology estimators must not silently bill it as local work.
+    """
+    from quport.distributed import split_into_qpus
+
+    arch = _three_qpu_arch()
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.ccx(0, 2, 4)  # spans QPU0, QPU1, QPU2
+    circuit.ccx(0, 1, 2)  # spans QPU0 (twice) and QPU1
+    latency = LatencyModel()
+
+    expected = len(split_into_qpus(circuit, arch).remote_ops)
+    assert expected == 2
+
+    assert estimate_parallel_makespan(circuit, arch, latency).remote_ops == expected
+    assert (
+        estimate_parallel_makespan_layered(circuit, arch, latency).remote_ops
+        == expected
+    )
+    summary = estimate_topology_schedule_plan(circuit, arch, latency).summary
+    assert summary.remote_ops == expected
+    assert summary.remote_rounds >= 1
+
+
+def test_multi_qubit_gate_inside_one_qpu_is_still_billed_as_local() -> None:
+    """Operands sharing a QPU stay local and cost one local two-qubit slot."""
+    from quport.distributed import split_into_qpus
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=3,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.ccx(0, 1, 2)  # entirely inside QPU0
+    latency = LatencyModel()
+
+    assert split_into_qpus(circuit, arch).remote_ops == []
+    assert estimate_parallel_makespan_layered(circuit, arch, latency).remote_ops == 0
+
+    summary = estimate_topology_schedule_plan(circuit, arch, latency).summary
+    assert summary.remote_ops == 0
+    assert summary.remote_rounds == 0
+    assert summary.makespan == latency.twoq
+
+
+def test_multi_qubit_barrier_across_qpus_is_never_a_remote_event() -> None:
+    """Barriers are directives: they separate layers but cost nothing."""
+    from quport.distributed import split_into_qpus
+
+    arch = _three_qpu_arch()
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.barrier(0, 2, 4)
+    latency = LatencyModel()
+
+    assert split_into_qpus(circuit, arch).remote_ops == []
+    assert estimate_parallel_makespan_layered(circuit, arch, latency).remote_ops == 0
+
+    summary = estimate_topology_schedule_plan(circuit, arch, latency).summary
+    assert summary.remote_ops == 0
+    assert summary.makespan == 0.0

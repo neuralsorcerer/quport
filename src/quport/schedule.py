@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import SupportsFloat, SupportsIndex, cast
@@ -133,6 +134,23 @@ def _instruction_qpus(
     if argc == 2:
         return (phys_to_qpu[qindex[qargs[0]]], phys_to_qpu[qindex[qargs[1]]])
     return tuple(phys_to_qpu[qindex[q]] for q in qargs)
+
+
+def _first_remote_partner(qpus: Sequence[int]) -> int | None:
+    """Return the first QPU differing from the operation's leading QPU.
+
+    :func:`quport.distributed.split_into_qpus` turns an operation on three or
+    more qubits that spans several QPUs into one remote event, between the QPU
+    of its first operand and the first operand sitting on a different QPU. The
+    layered and topology estimators mirror that choice so that every view of a
+    circuit — the split program, the remote-op manifest and all three schedule
+    estimators — agrees on how many remote events the circuit contains.
+
+    Returns ``None`` when every operand shares one QPU, i.e. the operation is
+    local and costs local two-qubit time.
+    """
+    first = qpus[0]
+    return next((qpu for qpu in qpus[1:] if qpu != first), None)
 
 
 def estimate_parallel_makespan(
@@ -280,8 +298,11 @@ def estimate_parallel_makespan_layered(
                 else:
                     remote_pairs.append((q0, q1))
             else:
-                # conservative: treat as local 2q time on the first qpu
-                local_dur[qpus[0]] = max(local_dur[qpus[0]], lat.twoq)
+                partner = _first_remote_partner(qpus)
+                if partner is None:
+                    local_dur[qpus[0]] = max(local_dur[qpus[0]], lat.twoq)
+                else:
+                    remote_pairs.append((qpus[0], partner))
 
         layer_local = max(local_dur)
 
@@ -690,9 +711,12 @@ def _topology_schedule_plan(
                 else:
                     remote_pairs.append((q0, q1))
             else:
-                # conservative
-                qpu = phys_to_qpu[qs[0]]
-                local_dur[qpu] = max(local_dur[qpu], lat.twoq)
+                op_qpus = [phys_to_qpu[q] for q in qs]
+                partner = _first_remote_partner(op_qpus)
+                if partner is None:
+                    local_dur[op_qpus[0]] = max(local_dur[op_qpus[0]], lat.twoq)
+                else:
+                    remote_pairs.append((op_qpus[0], partner))
 
         layer_local = max(local_dur) if local_dur else 0.0
 
