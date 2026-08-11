@@ -139,3 +139,38 @@ def test_estimate_cost_matches_latency_model_formula() -> None:
         metrics.remote_2q,
         depth=metrics.depth,
     )
+
+
+@pytest.mark.parametrize("field", _LATENCY_FIELDS)
+@pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+def test_estimate_cost_rejects_non_finite_latency_fields(
+    field: str, value: float
+) -> None:
+    """Non-finite latencies must fail loudly rather than poison the totals.
+
+    The message must name the offending field: a downstream "local cost must be
+    finite" would mean the field validator let a non-finite value through.
+    """
+    model = LatencyModel()
+    object.__setattr__(model, field, value)
+
+    with pytest.raises(ValueError, match=field):
+        estimate_cost(_metrics(), model)
+
+
+@pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+def test_nonnegative_finite_float_validator_rejects_non_finite_values(
+    value: float,
+) -> None:
+    """The shared validator is the first line of defence for every cost path."""
+    from quport._validation import validate_nonnegative_finite_float
+
+    with pytest.raises(ValueError, match="latency"):
+        validate_nonnegative_finite_float(value, label="latency")
+
+
+def test_nonnegative_finite_float_validator_accepts_finite_values() -> None:
+    from quport._validation import validate_nonnegative_finite_float
+
+    assert validate_nonnegative_finite_float(0.0, label="x") == 0.0
+    assert validate_nonnegative_finite_float(2, label="x") == 2.0

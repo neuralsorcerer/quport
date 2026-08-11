@@ -354,3 +354,39 @@ def test_sweep_writes_summary_csv(tmp_path: Path) -> None:
     assert {row["intra"] for row in rows} <= {"clique", "line", "ring"}
     assert {row["inter"] for row in rows} <= {"switch", "ring", "degree_d", "clos"}
     assert all(float(row["ports"]) in (1.0, 2.0) for row in rows)
+
+
+@pytest.mark.parametrize("source", ["OPENQASM 1.0;", "OPENQASM 4.0;", "OPENQASM 23;"])
+def test_qasm_version_returns_none_for_unsupported_versions(source: str) -> None:
+    """Only OpenQASM 2 and 3 are recognised; anything else falls back to sniffing."""
+    assert _qasm_version(source) is None
+
+
+def test_bench_accepts_strategies_with_surrounding_whitespace(tmp_path: Path) -> None:
+    """`--strategies` is a human-typed list, so spaces after commas must work."""
+    import csv
+
+    config = tmp_path / "cfg.json"
+    _write_small_config(config)
+    out = tmp_path / "results.csv"
+
+    _run(
+        [
+            "bench",
+            "--n-logical",
+            "4",
+            "--depth",
+            "2",
+            "--trials",
+            "1",
+            "--strategies",
+            " balanced , cluster ",
+            "--config",
+            str(config),
+            "--out",
+            str(out),
+        ]
+    )
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert {row["strategy"] for row in rows} == {"balanced", "cluster"}

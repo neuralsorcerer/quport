@@ -561,3 +561,64 @@ def test_transpile_baseline_reports_partition_cut_as_not_applicable() -> None:
     assert result.partition_cut == -1.0
     assert result.strategy == "baseline"
     assert result.partition_diagnostics is None
+
+
+def test_sweep_means_are_averaged_over_that_strategy_only(tmp_path: Path) -> None:
+    """Each summary row averages its own strategy's trials, not every row.
+
+    Dividing by the whole snapshot would scale every mean down by the number of
+    strategies in the sweep.
+    """
+    import csv
+    import statistics
+
+    from quport.config import LatencyModel
+    from quport.pipeline import (
+        _BENCHMARK_METHOD_IDS,
+        benchmark_random_circuits,
+        sweep_topologies,
+    )
+
+    out = tmp_path / "sweep.csv"
+    strategies = ("balanced", "cluster")
+    kwargs = dict(n_logical=4, depth=2, trials=3, seed=5)
+
+    sweep_topologies(
+        out_csv=str(out),
+        intra_topologies=("clique",),
+        inter_topologies=("switch",),
+        comm_ports=(1,),
+        compute_per_qpu=3,
+        n_qpus=4,
+        strategies=strategies,
+        **kwargs,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+        inter_degree=2,
+    )
+    trials = benchmark_random_circuits(
+        cfg=cfg, latency=LatencyModel(), out_csv=None, strategies=strategies, **kwargs
+    )
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert len(rows) == len(strategies)
+    for strategy in strategies:
+        own = [r for r in trials if r["strategy"] == strategy]
+        assert len(own) == kwargs["trials"]
+        row = next(
+            r for r in rows if float(r["method"]) == _BENCHMARK_METHOD_IDS[strategy]
+        )
+        for csv_key, trial_key in (
+            ("swaps_mean", "swaps"),
+            ("remote_2q_mean", "remote_2q"),
+            ("depth_mean", "depth"),
+            ("cost_mean", "cost_total"),
+        ):
+            expected = statistics.mean(float(r[trial_key]) for r in own)
+            assert float(row[csv_key]) == pytest.approx(expected)

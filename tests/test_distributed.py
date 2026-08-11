@@ -1263,3 +1263,46 @@ def test_remote_operation_barriers_both_participating_qpus() -> None:
         ]
     assert barriers[0] == [(0,)]
     assert barriers[1] == [(2,)]
+
+
+def test_json_safe_set_items_are_sorted_for_reproducible_manifests() -> None:
+    """Set ordering must not depend on hash randomisation.
+
+    String sets iterate in a PYTHONHASHSEED-dependent order, so the items are
+    sorted before export to keep manifests byte-reproducible across runs.
+    """
+    from quport.distributed import _json_safe_value
+
+    assert _json_safe_value({"b", "a", "c"}) == {
+        "type": "set",
+        "items": ["a", "b", "c"],
+    }
+    assert _json_safe_value(frozenset({3, 1, 2})) == {
+        "type": "frozenset",
+        "items": [1, 2, 3],
+    }
+
+
+def test_json_safe_mapping_preserves_entries_when_string_keys_repeat() -> None:
+    """A mapping that yields a key twice must not silently lose an entry."""
+    from collections.abc import Mapping
+
+    from quport.distributed import _json_safe_value
+
+    class RepeatedKeys(Mapping):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter(["a", "a"])
+
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, key: object) -> int:
+            return 1
+
+        def items(self):  # type: ignore[no-untyped-def]
+            return [("a", 1), ("a", 2)]
+
+    assert _json_safe_value(RepeatedKeys()) == {
+        "type": "mapping",
+        "entries": [["a", 1], ["a", 2]],
+    }
