@@ -520,3 +520,69 @@ def test_interconnect_edges_are_unique_and_match_the_qpu_graph(
 
     global_edges = list(arch.build_coupling_map().get_edges())
     assert len(global_edges) == len(set(global_edges))
+
+
+@pytest.mark.parametrize("intra_topology", ["clique", "line", "ring", "grid2d"])
+@pytest.mark.parametrize("inter_topology", ["switch", "ring", "degree_d", "fat_tree"])
+def test_intra_coupling_map_contains_only_its_own_qpu_block(
+    intra_topology: str, inter_topology: str
+) -> None:
+    """Distributed compilation routes on these maps, so they must be QPU-local.
+
+    `compile_distributed` hands each QPU's map to SABRE precisely so routing can
+    never SWAP across an inter-QPU link.  Any edge leaking in from another block,
+    or from the interconnect, would silently void that guarantee.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=2,
+        intra_topology=intra_topology,
+        inter_topology=inter_topology,
+        inter_degree=2,
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    for qpu_id in range(cfg.n_qpus):
+        block = arch.block_of_qpu(qpu_id)
+        own = set(block.compute + block.comm)
+        coupling = arch.build_intra_coupling_map(qpu_id)
+
+        # The identity layout used by compile_distributed needs every physical
+        # qubit present, including those belonging to other QPUs.
+        assert coupling.size() == arch.n_phys
+
+        edges = [(int(u), int(v)) for u, v in coupling.get_edges()]
+        assert len(edges) == len(set(edges))
+        for u, v in edges:
+            assert u in own and v in own, f"QPU {qpu_id} map leaks edge {(u, v)}"
+            assert arch.qpu_of_phys(u) == arch.qpu_of_phys(v) == qpu_id
+
+        # It must be exactly this block's intra edges - nothing missing either.
+        assert set(edges) == set(arch._intra_edges(block))
+
+
+def test_intra_coupling_maps_never_share_an_edge_across_qpus() -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    seen: set[tuple[int, int]] = set()
+    for qpu_id in range(cfg.n_qpus):
+        edges = {
+            (int(u), int(v))
+            for u, v in arch.build_intra_coupling_map(qpu_id).get_edges()
+        }
+        assert not (edges & seen)
+        seen |= edges
+
+    # Together the per-QPU maps reconstruct exactly the global map minus the
+    # interconnect, so no intra edge is lost and no inter edge is included.
+    global_edges = {(int(u), int(v)) for u, v in arch.build_coupling_map().get_edges()}
+    inter_edges = {(int(u), int(v)) for u, v in arch._inter_edges()}
+    assert seen == global_edges - inter_edges

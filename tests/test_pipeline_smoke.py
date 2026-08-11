@@ -495,3 +495,46 @@ def test_benchmark_preserves_cluster_strategy_order() -> None:
 
     assert [row["strategy"] for row in rows] == ["cluster", "baseline"]
     assert [row["method"] for row in rows] == [4.0, 0.0]
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "cluster", "tpccap", "tpccap_sa"])
+@pytest.mark.parametrize("intra_topology", ["line", "ring", "grid2d"])
+def test_mapped_circuit_respects_coupling_map_and_preserves_the_unitary(
+    strategy: str, intra_topology: str
+) -> None:
+    """Global mapping must be legal on the device *and* semantics-preserving.
+
+    Every two-qubit operation has to land on a real directed coupling-map edge,
+    and undoing the transpiler's layout must recover the input circuit's unitary
+    (padded with identity on the ancilla qubits).
+    """
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Operator
+
+    from quport.architecture import MultiQPUArchitecture
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        intra_topology=intra_topology,
+        inter_topology="switch",
+        optimization_level=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    circuit = random_benchmark_circuit(n_logical=3, depth=3, seed=4)
+
+    mapped = map_and_transpile(circuit, cfg, seed=4, strategy=strategy).mapped_circuit
+
+    edges = set(arch.build_coupling_map().get_edges())
+    position = {qubit: index for index, qubit in enumerate(mapped.qubits)}
+    for instruction in mapped.data:
+        if getattr(instruction.operation, "_directive", False):
+            continue
+        if len(instruction.qubits) == 2:
+            pair = tuple(position[qubit] for qubit in instruction.qubits)
+            assert pair in edges, f"{instruction.operation.name} on non-edge {pair}"
+
+    padded = QuantumCircuit(mapped.num_qubits)
+    padded.compose(circuit, qubits=list(range(circuit.num_qubits)), inplace=True)
+    assert Operator.from_circuit(mapped).equiv(Operator(padded))

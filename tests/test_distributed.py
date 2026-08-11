@@ -1052,3 +1052,89 @@ def test_split_preserves_measurements_on_their_own_qpu() -> None:
                 total += 1
                 assert index[instruction.qubits[0]] in block
     assert total == arch.n_phys
+
+
+@pytest.mark.parametrize("intra_topology", ["clique", "line", "grid2d"])
+def test_split_conserves_every_operation_exactly_once(intra_topology: str) -> None:
+    """Splitting must neither drop nor duplicate work.
+
+    Each non-directive operation of the physical circuit has to reappear exactly
+    once, either in one QPU's local program or as a remote operation.
+    """
+    from collections import Counter
+
+    from quport.compiler import compile_distributed
+    from quport.distributed import split_into_qpus
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology=intra_topology,
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    physical = compile_distributed(
+        random_benchmark_circuit(n_logical=6, depth=4, seed=8),
+        cfg,
+        seed=8,
+        strategy="balanced",
+    ).physical_circuit
+    program = split_into_qpus(physical, arch)
+
+    def tally(circuit: QuantumCircuit) -> Counter:
+        position = {qubit: index for index, qubit in enumerate(circuit.qubits)}
+        counts: Counter = Counter()
+        for instruction in circuit.data:
+            if getattr(instruction.operation, "_directive", False):
+                continue
+            operands = tuple(position[qubit] for qubit in instruction.qubits)
+            counts[(instruction.operation.name, operands)] += 1
+        return counts
+
+    expected = tally(physical)
+    actual: Counter = Counter()
+    for local in program.local_circuits.values():
+        actual += tally(local)
+    for remote in program.remote_ops:
+        actual[(remote.name, (remote.q0_phys, remote.q1_phys))] += 1
+
+    assert actual == expected
+    assert sum(expected.values()) > 0
+
+
+def test_local_routing_preserves_each_local_program_unitary() -> None:
+    """Intra-QPU SABRE routing must not change what a local program computes."""
+    from qiskit.quantum_info import Operator
+
+    from quport.compiler import compile_distributed
+    from quport.distributed import split_into_qpus
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology="switch",
+        optimization_level=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    result = compile_distributed(
+        random_benchmark_circuit(n_logical=5, depth=4, seed=6),
+        cfg,
+        seed=6,
+        strategy="balanced",
+    )
+    program = split_into_qpus(result.physical_circuit, arch)
+
+    compared = 0
+    for qpu_id, routed in result.local_routed.items():
+        before = program.local_circuits[qpu_id]
+        if not before.data:
+            continue
+        compared += 1
+        assert Operator.from_circuit(routed).equiv(Operator(before))
+    assert compared > 0
