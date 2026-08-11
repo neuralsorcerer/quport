@@ -1130,3 +1130,24 @@ def test_build_qpu_graph_is_symmetric_and_free_of_self_loops(
         for neighbor in neighbors:
             assert 0 <= neighbor < n_qpus
             assert node in adjacency[neighbor]
+
+
+def test_ecmp_splits_flow_by_path_count_not_evenly_across_predecessors() -> None:
+    """ECMP shares must be proportional to how many shortest paths reach each hop.
+
+    Node 5 is reached through node 3 (two shortest paths) and node 4 (one), so a
+    load of 6 must divide 4/2, not 3/3 as an even per-predecessor split gives.
+    """
+    adjacency = [[1, 2], [0, 3, 4], [0, 3], [1, 2, 5], [1, 5], [3, 4]]
+    paths = all_pairs_shortest_paths(adjacency)
+    assert paths.dist[0][5] == 3
+
+    traffic = [[0.0] * 6 for _ in range(6)]
+    traffic[0][5] = traffic[5][0] = 6.0
+
+    loads = route_link_loads(traffic, paths, mode="ecmp")
+
+    assert loads[(3, 5)] == pytest.approx(4.0)
+    assert loads[(4, 5)] == pytest.approx(2.0)
+    # Flow is conserved across the cut just below the source.
+    assert loads[(0, 1)] + loads[(0, 2)] == pytest.approx(6.0)

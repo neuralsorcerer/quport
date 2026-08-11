@@ -586,3 +586,26 @@ def test_intra_coupling_maps_never_share_an_edge_across_qpus() -> None:
     global_edges = {(int(u), int(v)) for u, v in arch.build_coupling_map().get_edges()}
     inter_edges = {(int(u), int(v)) for u, v in arch._inter_edges()}
     assert seen == global_edges - inter_edges
+
+
+def test_intra_ring_does_not_duplicate_the_link_of_a_two_qubit_qpu() -> None:
+    """A two-qubit ring is a single link, not a cycle.
+
+    Closing the cycle unconditionally would re-add the path's only edge and emit
+    a duplicate physical link.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=1,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        intra_topology="ring",
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    edges = arch._intra_edges(arch.block_of_qpu(0))
+    assert sorted(edges) == [(0, 1), (1, 0)]
+    assert len(edges) == len(set(edges))
+
+    global_edges = list(arch.build_coupling_map().get_edges())
+    assert len(global_edges) == len(set(global_edges)) == 2

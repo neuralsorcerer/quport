@@ -1299,3 +1299,128 @@ def test_multi_qubit_barrier_across_qpus_is_never_a_remote_event() -> None:
     summary = estimate_topology_schedule_plan(circuit, arch, latency).summary
     assert summary.remote_ops == 0
     assert summary.makespan == 0.0
+
+
+def _one_layer_plan(
+    cfg: MultiQPUConfig, pairs: list[tuple[int, int]]
+) -> TopologySchedulePlan:
+    arch = MultiQPUArchitecture(cfg)
+    circuit = QuantumCircuit(arch.n_phys)
+    for control, target in pairs:
+        circuit.cx(control, target)
+    return estimate_topology_schedule_plan(circuit, arch, LatencyModel())
+
+
+def test_comm_port_budget_serializes_remote_ops_sharing_a_qpu() -> None:
+    """A QPU with one port cannot serve two remote ops in the same round.
+
+    Both ops touch QPU 0 but use different links, and link capacity is ample, so
+    only the port budget can force the second round.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        link_capacity=4,
+        switch_parallel_links=1000,
+    )
+
+    layer = _one_layer_plan(cfg, [(0, 2), (1, 4)]).layers[0]
+
+    assert layer.remote_ops == 2
+    assert len(layer.remote_rounds) == 2
+    assert {tuple(r.qpu_pairs) for r in layer.remote_rounds} == {((0, 1),), ((0, 2),)}
+    for remote_round in layer.remote_rounds:
+        assert max(remote_round.qpu_ports_used) <= 1
+
+
+def test_remote_cost_scales_with_qpu_hop_count() -> None:
+    """`d(a,b) * epr_gen` means each extra hop costs exactly one more `epr_gen`."""
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+    )
+    latency = LatencyModel()
+
+    one_hop = _one_layer_plan(cfg, [(0, 2)]).summary.makespan  # QPU0 <-> QPU1
+    two_hop = _one_layer_plan(cfg, [(0, 4)]).summary.makespan  # QPU0 <-> QPU2
+
+    assert two_hop - one_hop == pytest.approx(latency.epr_gen)
+    assert one_hop > latency.epr_gen
+
+
+def test_layer_duration_overlaps_local_work_with_remote_rounds() -> None:
+    """A layer takes `max(local, remote)`, not their sum."""
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+    )
+
+    # Remote op between QPU0 and QPU1, plus an unrelated local 2Q gate on QPU2.
+    layer = _one_layer_plan(cfg, [(0, 3), (6, 7)]).layers[0]
+
+    rounds_time = sum(remote_round.duration for remote_round in layer.remote_rounds)
+    assert layer.local_duration > 0.0
+    assert rounds_time > 0.0
+    assert layer.duration == pytest.approx(max(layer.local_duration, rounds_time))
+    assert layer.duration < layer.local_duration + rounds_time
+
+
+@pytest.mark.parametrize("async_overlap", [0.0, 0.25, 0.5, 0.75, 1.0])
+def test_classical_latency_hiding_scales_with_one_minus_overlap(
+    async_overlap: float,
+) -> None:
+    """Effective RTT is `(1 - overlap) * classical_rtt`.
+
+    At overlap 0.5 that is numerically identical to `overlap * classical_rtt`, so
+    the default alone cannot distinguish the two forms.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        async_classical=True,
+        async_overlap=async_overlap,
+    )
+    latency = LatencyModel()
+
+    makespan = _one_layer_plan(cfg, [(0, 2)]).summary.makespan
+
+    expected = (
+        latency.epr_gen
+        + latency.classical_rtt * (1.0 - async_overlap)
+        + latency.remote_gate_overhead
+    )
+    assert makespan == pytest.approx(expected)
+
+
+def test_unschedulable_layer_duration_also_overlaps_local_work() -> None:
+    """The zero-capacity branch overlaps local work with penalty rounds too.
+
+    With `link_capacity=0` every remote op becomes an unschedulable penalty
+    round, but the layer still runs local gates alongside them, so its duration
+    is the maximum rather than the sum.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        link_capacity=0,
+    )
+
+    # Remote op across QPU0/QPU1 plus an unrelated local 2Q gate on QPU2.
+    layer = _one_layer_plan(cfg, [(0, 3), (6, 7)]).layers[0]
+
+    rounds_time = sum(remote_round.duration for remote_round in layer.remote_rounds)
+    assert layer.local_duration > 0.0
+    assert rounds_time == pytest.approx(UNSCHEDULABLE_PENALTY)
+    assert all(r.unschedulable_ops == 1 for r in layer.remote_rounds)
+    assert layer.duration == pytest.approx(max(layer.local_duration, rounds_time))
+    assert layer.duration < layer.local_duration + rounds_time

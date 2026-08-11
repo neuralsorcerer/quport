@@ -1195,3 +1195,43 @@ def test_tpccap_sa_records_an_improvement_over_its_starting_partition() -> None:
     )
     assert repeat.part == result.part
     assert repeat_anneal == anneal
+
+
+def test_refinement_rejects_moves_that_do_not_reduce_the_cut() -> None:
+    """Only strict improvements may be applied.
+
+    An isolated vertex can always be relocated at zero cost; accepting such a
+    move would churn the partition without improving it.
+    """
+    from quport.partition import refine_local_moves
+
+    # An odd pass count is required: accepting neutral moves makes the partition
+    # oscillate with period two, so an even count would land back on the start.
+    for max_passes in (1, 3):
+        part, loads = refine_local_moves(
+            part=[0, 0],
+            loads=[2, 0],
+            nbrs=[[], []],
+            capacity=2,
+            max_passes=max_passes,
+            seed=0,
+        )
+
+        assert part == [0, 0]
+        assert loads == [2, 0]
+
+
+def test_heavy_edge_clustering_keeps_the_heaviest_edge_local() -> None:
+    """Clusters must be merged in descending weight order.
+
+    With capacity 2 only one of the three edges can stay internal; merging from
+    the lightest end would cut the weight-10 edge instead of the weight-5 ones.
+    """
+    weights = {(0, 1): 5.0, (1, 2): 10.0, (2, 3): 5.0}
+
+    part = heavy_edge_clustering_partition(4, weights, n_qpus=2, capacity=2)
+
+    assert part[1] == part[2], "the heaviest edge must not be cut"
+    assert part[0] != part[1]
+    assert part[2] != part[3]
+    assert sorted(part.count(qpu) for qpu in range(2)) == [2, 2]
