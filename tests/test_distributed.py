@@ -845,3 +845,87 @@ def test_compile_distributed_rejects_invalid_seed(seed: object, message: str) ->
 
     with pytest.raises(ValueError, match=message):
         compile_distributed(qc, cfg, seed=cast(Any, seed))
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "cluster", "tpccap", "tpccap_sa"])
+def test_compile_distributed_completes_for_every_supported_strategy(
+    strategy: str,
+) -> None:
+    """Every advertised strategy must produce a consistent distributed program.
+
+    ``tpccap_sa`` is both the ``compile_distributed`` default and the
+    ``compile-dist`` CLI default, so each strategy needs an end-to-end run
+    rather than only the argument-validation paths.
+    """
+    from quport.architecture import MultiQPUArchitecture
+    from quport.compiler import compile_distributed
+    from quport.metrics import compute_metrics
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    qc = QuantumCircuit(6)
+    for control in range(5):
+        qc.cx(control, control + 1)
+    qc.cx(0, 5)
+    qc.cx(1, 4)
+
+    result = compile_distributed(qc, cfg, strategy=strategy, seed=11)
+
+    assert result.strategy == strategy
+    assert len(result.partition) == qc.num_qubits
+    loads = [result.partition.count(qpu) for qpu in range(cfg.n_qpus)]
+    assert max(loads) <= cfg.capacity_per_qpu()
+    assert all(0 <= qpu < cfg.n_qpus for qpu in result.partition)
+
+    # One local program per QPU, and remote-op counts agree across every view.
+    assert set(result.local_routed) == set(range(cfg.n_qpus))
+    assert set(result.program.local_circuits) == set(range(cfg.n_qpus))
+    remote_ops = len(result.program.remote_ops)
+    assert compute_metrics(result.physical_circuit, arch).remote_2q == remote_ops
+    assert result.schedule.remote_ops == remote_ops
+    assert result.schedule_plan.summary == result.schedule
+
+    # Diagnostics are reported exactly for the strategies that compute them.
+    assert (result.partition_diagnostics is not None) == (
+        strategy in ("tpccap", "tpccap_sa")
+    )
+    assert (result.anneal_diagnostics is not None) == (strategy == "tpccap_sa")
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "cluster", "tpccap", "tpccap_sa"])
+def test_compile_distributed_keeps_local_programs_inside_their_qpu_block(
+    strategy: str,
+) -> None:
+    """Local routing must never place an operation on another QPU's qubits."""
+    from quport.architecture import MultiQPUArchitecture
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    qc = QuantumCircuit(7)
+    for control in range(6):
+        qc.cx(control, control + 1)
+
+    result = compile_distributed(qc, cfg, strategy=strategy, seed=5)
+
+    for qpu_id, circuit in result.local_routed.items():
+        block = arch.block_of_qpu(qpu_id)
+        allowed = set(block.compute + block.comm)
+        index = {qubit: position for position, qubit in enumerate(circuit.qubits)}
+        for instruction in circuit.data:
+            if getattr(instruction.operation, "_directive", False):
+                continue
+            for qubit in instruction.qubits:
+                assert index[qubit] in allowed

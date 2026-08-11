@@ -201,3 +201,156 @@ def test_topology_info_command_outputs_metrics() -> None:
     assert result.exit_code == 0
     assert "Inter-QPU Topology Metrics" in result.stdout
     assert "average_shortest_path" in result.stdout
+
+
+def _run(args: list[str]) -> "object":
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, f"{args} failed: {result.output}\n{result.exception}"
+    return result
+
+
+def test_gen_config_writes_a_loadable_config(tmp_path: Path) -> None:
+    from quport.config import MultiQPUConfig, load_config
+
+    out = tmp_path / "cfg.json"
+    _run(["gen-config", "--out", str(out)])
+
+    assert load_config(str(out)) == MultiQPUConfig()
+
+
+def test_bench_writes_one_csv_row_per_trial_and_strategy(tmp_path: Path) -> None:
+    import csv
+
+    config = tmp_path / "cfg.json"
+    _write_small_config(config)
+    out = tmp_path / "results.csv"
+
+    _run(
+        [
+            "bench",
+            "--n-logical",
+            "4",
+            "--depth",
+            "2",
+            "--trials",
+            "2",
+            "--strategies",
+            "balanced,cluster",
+            "--config",
+            str(config),
+            "--out",
+            str(out),
+        ]
+    )
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert len(rows) == 4
+    assert {row["strategy"] for row in rows} == {"balanced", "cluster"}
+    assert {row["seed"] for row in rows} == {"0.0", "1.0"}
+    for row in rows:
+        assert float(row["cost_total"]) >= 0.0
+
+
+def test_schedule_reports_makespan(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_small_config(config)
+
+    result = _run(
+        ["schedule", "--n-logical", "4", "--depth", "2", "--config", str(config)]
+    )
+
+    assert "Makespan:" in result.output  # type: ignore[attr-defined]
+    assert "RemoteOps:" in result.output  # type: ignore[attr-defined]
+
+
+def test_split_writes_one_qasm_per_qpu_plus_remote_ops(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_small_config(config)
+    out_dir = tmp_path / "split_out"
+
+    _run(
+        [
+            "split",
+            "--n-logical",
+            "4",
+            "--depth",
+            "2",
+            "--config",
+            str(config),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    assert {path.name for path in out_dir.iterdir()} == {
+        "qpu_0.qasm",
+        "qpu_1.qasm",
+        "remote_ops.json",
+    }
+    assert isinstance(json.loads((out_dir / "remote_ops.json").read_text()), list)
+
+
+def test_compile_dist_writes_routed_programs_and_schedule_manifests(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "cfg.json"
+    _write_small_config(config)
+    out_dir = tmp_path / "compile_out"
+
+    _run(
+        [
+            "compile-dist",
+            "--n-logical",
+            "4",
+            "--depth",
+            "2",
+            "--config",
+            str(config),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    assert {path.name for path in out_dir.iterdir()} == {
+        "qpu_0_routed.qasm",
+        "qpu_1_routed.qasm",
+        "remote_ops.json",
+        "schedule.json",
+        "schedule_trace.json",
+    }
+
+    summary = json.loads((out_dir / "schedule.json").read_text(encoding="utf-8"))
+    trace = json.loads((out_dir / "schedule_trace.json").read_text(encoding="utf-8"))
+    assert trace["summary"] == summary
+    assert len(trace["layers"]) == summary["layers"]
+    assert summary["remote_ops"] == sum(
+        layer["remote_ops"] for layer in trace["layers"]
+    )
+
+
+def test_sweep_writes_summary_csv(tmp_path: Path) -> None:
+    import csv
+
+    out = tmp_path / "sweep.csv"
+
+    _run(
+        [
+            "sweep",
+            "--n-logical",
+            "3",
+            "--depth",
+            "1",
+            "--trials",
+            "1",
+            "--strategies",
+            "balanced",
+            "--out",
+            str(out),
+        ]
+    )
+
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert rows
+    assert {row["intra"] for row in rows} <= {"clique", "line", "ring"}
+    assert {row["inter"] for row in rows} <= {"switch", "ring", "degree_d", "clos"}
+    assert all(float(row["ports"]) in (1.0, 2.0) for row in rows)

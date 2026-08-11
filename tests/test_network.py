@@ -1080,3 +1080,53 @@ def test_topology_metrics_normalizes_duplicate_edges_and_self_loops() -> None:
 def test_topology_metrics_rejects_malformed_adjacency(adj: object, error: str) -> None:
     with pytest.raises(ValueError, match=error):
         topology_metrics(adj)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("n_qpus", [12, 16, 20, 25, 36, 64])
+def test_fat_tree_stays_connected_at_scales_that_add_inter_pod_chords(
+    n_qpus: int,
+) -> None:
+    """Fat-tree pods gain ``+2`` representative chords once there are 4+ pods.
+
+    Smaller fat-trees only get the representative ring, so the chord branch is
+    reachable only at these larger QPU counts.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=n_qpus, comm_qubits_per_qpu=1, inter_topology="fat_tree"
+    )
+    adjacency = build_qpu_graph(cfg)
+    metrics = topology_metrics(adjacency)
+
+    group = max(2, round(math.sqrt(n_qpus)))
+    assert (n_qpus + group - 1) // group >= 4
+
+    assert metrics.n_qpus == n_qpus
+    assert metrics.connected is True
+    assert metrics.components == 1
+    assert metrics.unreachable_pairs == 0
+    # Pod cliques plus representative chords keep the network shallow.
+    assert 0 < metrics.diameter <= 4
+    assert metrics.min_degree >= 1
+
+
+@pytest.mark.parametrize("inter_topology", ALL_INTER_TOPOLOGIES)
+@pytest.mark.parametrize("n_qpus", [1, 2, 3, 4, 8])
+def test_build_qpu_graph_is_symmetric_and_free_of_self_loops(
+    inter_topology: InterTopology, n_qpus: int
+) -> None:
+    cfg = MultiQPUConfig(
+        n_qpus=n_qpus,
+        comm_qubits_per_qpu=2,
+        inter_topology=inter_topology,
+        inter_degree=3,
+    )
+    adjacency = build_qpu_graph(cfg)
+
+    assert len(adjacency) == n_qpus
+    for node, neighbors in enumerate(adjacency):
+        assert node not in neighbors
+        assert sorted(neighbors) == list(neighbors)
+        assert len(set(neighbors)) == len(neighbors)
+        for neighbor in neighbors:
+            assert 0 <= neighbor < n_qpus
+            assert node in adjacency[neighbor]
