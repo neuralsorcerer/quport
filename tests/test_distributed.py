@@ -1138,3 +1138,128 @@ def test_local_routing_preserves_each_local_program_unitary() -> None:
         compared += 1
         assert Operator.from_circuit(routed).equiv(Operator(before))
     assert compared > 0
+
+
+def test_compile_distributed_routes_only_on_per_qpu_coupling_maps() -> None:
+    """Local routing must never be handed the global map.
+
+    The no-cross-QPU-SWAP guarantee rests entirely on SABRE seeing only one
+    QPU's edges. Passing the global map instead is invisible in the output --
+    SABRE simply never finds an inter-QPU route attractive -- so the property is
+    asserted structurally rather than behaviourally.
+    """
+    from unittest.mock import patch
+
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology="ring",
+        optimization_level=1,
+    )
+    global_calls = 0
+    intra_calls: list[int] = []
+    build_global = MultiQPUArchitecture.build_coupling_map
+    build_intra = MultiQPUArchitecture.build_intra_coupling_map
+
+    def spy_global(self: MultiQPUArchitecture):  # type: ignore[no-untyped-def]
+        nonlocal global_calls
+        global_calls += 1
+        return build_global(self)
+
+    def spy_intra(self: MultiQPUArchitecture, qpu_id: int):  # type: ignore[no-untyped-def]
+        intra_calls.append(qpu_id)
+        return build_intra(self, qpu_id)
+
+    with (
+        patch.object(MultiQPUArchitecture, "build_coupling_map", spy_global),
+        patch.object(MultiQPUArchitecture, "build_intra_coupling_map", spy_intra),
+    ):
+        compile_distributed(
+            random_benchmark_circuit(n_logical=6, depth=5, seed=1),
+            cfg,
+            seed=1,
+            strategy="balanced",
+        )
+
+    assert global_calls == 0, "distributed compilation must not build the global map"
+    assert sorted(intra_calls) == list(range(cfg.n_qpus))
+
+
+@pytest.mark.parametrize(
+    ("strategy", "expected_mode"),
+    [
+        ("balanced", "topk"),
+        ("cluster", "topk"),
+        ("tpccap", "diverse"),
+        ("tpccap_sa", "diverse"),
+    ],
+)
+def test_compile_distributed_uses_diverse_comm_selection_for_tpccap(
+    strategy: str, expected_mode: str
+) -> None:
+    """Topology-aware strategies pair with diversity-aware port selection."""
+    from unittest.mock import patch
+
+    import quport.compiler as compiler
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=2,
+        intra_topology="line",
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    seen: list[str] = []
+    original = compiler.compute_layout_hints
+
+    def spy(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        seen.append(str(kwargs.get("comm_mode")))
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(compiler, "compute_layout_hints", spy):
+        compiler.compile_distributed(
+            random_benchmark_circuit(n_logical=6, depth=4, seed=2),
+            cfg,
+            seed=2,
+            strategy=strategy,
+        )
+
+    assert seen == [expected_mode]
+
+
+def test_remote_operation_barriers_both_participating_qpus() -> None:
+    """Both sides of a remote operation need an explicit synchronization point."""
+    from quport.distributed import split_into_qpus
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.cx(0, 2)  # QPU0 qubit 0 <-> QPU1 qubit 2
+
+    program = split_into_qpus(circuit, arch)
+
+    assert len(program.remote_ops) == 1
+    barriers = {}
+    for qpu_id, local in program.local_circuits.items():
+        position = {qubit: index for index, qubit in enumerate(local.qubits)}
+        barriers[qpu_id] = [
+            tuple(position[qubit] for qubit in instruction.qubits)
+            for instruction in local.data
+            if instruction.operation.name == "barrier"
+        ]
+    assert barriers[0] == [(0,)]
+    assert barriers[1] == [(2,)]

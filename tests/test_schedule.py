@@ -1424,3 +1424,35 @@ def test_unschedulable_layer_duration_also_overlaps_local_work() -> None:
     assert all(r.unschedulable_ops == 1 for r in layer.remote_rounds)
     assert layer.duration == pytest.approx(max(layer.local_duration, rounds_time))
     assert layer.duration < layer.local_duration + rounds_time
+
+
+def test_simple_estimator_synchronizes_both_qpus_at_a_remote_op() -> None:
+    """A remote op is a rendezvous: both timelines advance from the later one.
+
+    QPU0 runs five local gates, then a remote op, then QPU1 runs one more. Only
+    a real sync makes QPU1 inherit QPU0's elapsed time before its final gate.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)  # QPU0 = {0, 1}, QPU1 = {2, 3}
+    latency = LatencyModel()
+
+    circuit = QuantumCircuit(arch.n_phys)
+    for _ in range(5):
+        circuit.x(0)
+    circuit.cx(0, 2)
+    circuit.x(2)
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    remote_cost = latency.epr_gen + latency.classical_rtt + latency.remote_gate_overhead
+    assert summary.remote_ops == 1
+    assert summary.steps == 1
+    assert summary.makespan == pytest.approx(
+        5 * latency.oneq + remote_cost + latency.oneq
+    )

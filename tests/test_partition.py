@@ -1235,3 +1235,75 @@ def test_heavy_edge_clustering_keeps_the_heaviest_edge_local() -> None:
     assert part[0] != part[1]
     assert part[2] != part[3]
     assert sorted(part.count(qpu) for qpu in range(2)) == [2, 2]
+
+
+def test_tpccap_honors_the_candidate_qpu_budget() -> None:
+    """`max_candidate_qpus` must actually bound the per-vertex search.
+
+    Narrowing the budget to a single candidate changes which moves TPCCAP can
+    consider, so the resulting assignment differs from the wider search.
+    """
+    import random
+
+    n = 12
+    rng = random.Random(3)
+    weights = {
+        (i, j): float(rng.randint(1, 6))
+        for i in range(n)
+        for j in range(i + 1, n)
+        if rng.random() < 0.4
+    }
+    sp = all_pairs_shortest_paths([[1, 3], [0, 2], [1, 3], [0, 2]])
+
+    narrow, _ = tpccap_partition(n, weights, 4, 4, 1, sp, seed=3, max_candidate_qpus=1)
+    wide, _ = tpccap_partition(n, weights, 4, 4, 1, sp, seed=3, max_candidate_qpus=4)
+
+    assert narrow.part != wide.part
+    for result in (narrow, wide):
+        assert max(result.loads) <= 4
+        assert result.loads == [result.part.count(qpu) for qpu in range(4)]
+
+
+def test_annealing_temperature_schedule_cools_rather_than_heats() -> None:
+    """The schedule must run from `temp0` down to `temp_end`.
+
+    Only the aggregate acceptance count is exposed, so the direction is checked
+    through its signature: starting hot lets early steps accept worsening moves,
+    so a run that cools accepts materially more than the same run reversed. The
+    comparison is summed over a fixed seed set -- every value here is
+    deterministic, and the margin is roughly 13%, far outside per-seed noise.
+    """
+    import random
+
+    sp = all_pairs_shortest_paths([[1, 3], [0, 2], [1, 3], [0, 2]])
+    hot, cold = 1e6, 1e-9
+
+    def accepted(seed: int, temp0: float, temp_end: float) -> int:
+        rng = random.Random(seed)
+        n = 14
+        weights = {
+            (i, j): float(rng.randint(1, 9))
+            for i in range(n)
+            for j in range(i + 1, n)
+            if rng.random() < 0.5
+        }
+        _result, _diag, anneal = tpccap_sa_partition(
+            n,
+            weights,
+            4,
+            4,
+            1,
+            sp,
+            seed=seed,
+            steps=400,
+            temp0=temp0,
+            temp_end=temp_end,
+            p_swap=0.3,
+        )
+        return anneal.accepted
+
+    seeds = range(10)
+    cooling = sum(accepted(s, hot, cold) for s in seeds)
+    heating = sum(accepted(s, cold, hot) for s in seeds)
+
+    assert cooling > heating * 1.05

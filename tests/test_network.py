@@ -1151,3 +1151,20 @@ def test_ecmp_splits_flow_by_path_count_not_evenly_across_predecessors() -> None
     assert loads[(4, 5)] == pytest.approx(2.0)
     # Flow is conserved across the cut just below the source.
     assert loads[(0, 1)] + loads[(0, 2)] == pytest.approx(6.0)
+
+
+def test_topology_metrics_average_path_ignores_unreachable_pairs() -> None:
+    """The average shortest path is taken over reachable pairs only.
+
+    Two disjoint edges give four unreachable pairs out of six; averaging over
+    all six would report 1/3 instead of the reachable-only distance of 1.
+    """
+    adjacency = [[1], [0], [3], [2]]
+
+    metrics = topology_metrics(adjacency)
+
+    assert metrics.components == 2
+    assert metrics.connected is False
+    assert metrics.unreachable_pairs == 4
+    assert metrics.diameter == 1
+    assert metrics.average_shortest_path == pytest.approx(1.0)

@@ -538,3 +538,26 @@ def test_mapped_circuit_respects_coupling_map_and_preserves_the_unitary(
     padded = QuantumCircuit(mapped.num_qubits)
     padded.compose(circuit, qubits=list(range(circuit.num_qubits)), inplace=True)
     assert Operator.from_circuit(mapped).equiv(Operator(padded))
+
+
+def test_transpile_baseline_reports_partition_cut_as_not_applicable() -> None:
+    """The baseline does no partitioning, so its cut is the -1 sentinel.
+
+    Reporting 0.0 instead would read as a genuinely perfect partition in the
+    benchmark CSV.
+    """
+    from quport.pipeline import transpile_baseline
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+        optimization_level=0,
+    )
+    result = transpile_baseline(random_benchmark_circuit(4, 3, 1), cfg, seed=1)
+
+    assert result.partition_cut == -1.0
+    assert result.strategy == "baseline"
+    assert result.partition_diagnostics is None
