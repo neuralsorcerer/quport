@@ -89,6 +89,22 @@ that are likely to reduce cross-QPU traffic before routing/scheduling.
 `baseline` is available in benchmark workflows. `map_and_transpile` and
 `compile_distributed` accept `balanced`, `cluster`, `tpccap`, and `tpccap_sa`.
 
+```{note}
+The two entry points do not weight interactions the same way.
+`compile_distributed` applies temporal decay to both `tpccap` and `tpccap_sa`
+through its `temporal_decay` argument. `map_and_transpile` has no such argument:
+it runs `tpccap` on uniform interaction counts and `tpccap_sa` on temporal
+weights with the decay fixed at `0.98`.
+
+Under `map_and_transpile` the two strategies therefore differ in the search
+procedure *and* in the objective's input weights. `benchmark_random_circuits`
+and `sweep_topologies` both go through `map_and_transpile`, so their `method=2`
+and `method=3` rows do not isolate the effect of the annealing; on random
+circuits most of the gap between them comes from the weighting change. Compare
+the strategies through `compile_distributed`, which weights both identically,
+when the annealing itself is the thing being measured.
+```
+
 ## Capacity model
 
 A QPU can host at most `compute_qubits_per_qpu + comm_qubits_per_qpu` logical qubits

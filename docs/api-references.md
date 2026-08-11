@@ -113,6 +113,12 @@ End-to-end global mapping flow:
 
 Supported strategies: `balanced`, `cluster`, `tpccap`, `tpccap_sa`.
 
+There is no `temporal_decay` argument here: `tpccap` runs on uniform interaction
+counts while `tpccap_sa` runs on temporal weights with the decay fixed at `0.98`.
+Use `compile_distributed` when both strategies need the same weighting. See
+[Partitioning strategies](concepts.md#partitioning-strategies) for why this matters
+when interpreting benchmark output.
+
 `MapResult` fields:
 
 | Field | Meaning |
@@ -375,6 +381,16 @@ CircuitMetrics(swaps, depth, size, n_1q, n_2q, remote_2q)
 Returned by `compute_metrics(qc, arch)` and embedded in mapping/distributed results.
 `remote_2q` is derived by comparing the QPU ownership of each two-qubit operation's
 physical operands.
+
+`swaps` counts instructions literally named `swap`, which makes it basis-dependent.
+The default `basis_gates` of `("rz", "sx", "x", "cx")` has no `swap`, so Qiskit
+rewrites routing SWAPs into CX gates and `swaps` is `0` for every run, with the
+routing overhead appearing in `n_2q` instead. Include `"swap"` in `basis_gates` to
+keep the instructions and make the metric meaningful.
+
+A `swap` instruction counts toward both `swaps` and `n_2q`, so in `estimate_cost`
+the `swap` latency is an overhead on top of the two-qubit cost: a surviving SWAP
+costs `twoq + swap`, which is `40` under the default `LatencyModel` rather than `30`.
 
 ## Lower-level modules worth knowing
 

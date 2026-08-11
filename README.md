@@ -189,6 +189,20 @@ $$
 
 where $T_{ij}$ is the set of times at which logical qubits $i$ and $j$ interact. If $\gamma=1$, temporal weights reduce to ordinary interaction counts.
 
+Two consequences are worth keeping in mind when choosing $\gamma$:
+
+- The total weight of a circuit converges to $\sum_{t\ge 0}\gamma^{t}=1/(1-\gamma)$ regardless of how long the circuit is. For the default $\gamma=0.98$ that is $50$, and $99\%$ of it falls in the first $\approx 228$ two-qubit operations. On a circuit with thousands of two-qubit gates the partitioner is therefore driven almost entirely by a prefix, which is the intended emphasis but is easy to overlook.
+- Once $\gamma^{t}$ underflows to zero in double precision (around $t\approx 36{,}850$ for $\gamma=0.98$), an edge that first appears after that point contributes exactly zero and is dropped from the interaction graph.
+
+Which pipelines apply temporal weighting is not uniform, and it matters when comparing strategies:
+
+| entry point | `tpccap` | `tpccap_sa` |
+|---|---|---|
+| `compile_distributed` | temporal, via the `temporal_decay` argument | temporal, via the `temporal_decay` argument |
+| `map_and_transpile` | uniform counts | temporal with $\gamma$ fixed at $0.98$ |
+
+`map_and_transpile` has no `temporal_decay` argument, so under that entry point `tpccap` and `tpccap_sa` differ in both the search procedure and the interaction weights. Because `benchmark_random_circuits` and `sweep_topologies` both call `map_and_transpile`, the `method=2` and `method=3` rows they emit are not an ablation of the annealing alone. On random circuits most of the gap between those rows comes from the weighting rather than the annealing, and `tpccap_sa` can score worse on uniform cut precisely because it is optimizing an early-weighted objective. Use `compile_distributed`, which applies the same weighting to both strategies, when the annealing itself is what you want to measure.
+
 ### Partition capacity
 
 Each QPU can host at most
@@ -535,6 +549,18 @@ A two-qubit physical operation on physical qubits $p_{0},p_{1}$ is remote when:
 
 `qpu_of_phys`$(p_{0}) \ne$ `qpu_of_phys`$(p_{1})$.
 
+`swaps` counts instructions literally named `swap`, so it is basis-dependent. The
+default `basis_gates` of `("rz", "sx", "x", "cx")` contains no `swap`, so Qiskit
+rewrites every routing SWAP into CX gates and `swaps` reads $0$ for every run
+while the routing overhead shows up inside `n_2q` instead. Add `"swap"` to
+`basis_gates` to keep SWAP instructions intact and make the metric non-zero.
+This applies wherever the metric surfaces, including the `SWAPs:` line printed
+by `quport map`, the `swaps` column of the benchmark CSV, and `swaps_mean` in the
+topology sweep.
+
+A `swap` instruction is also a two-qubit instruction, so it is counted in both
+`swaps` and `n_2q`.
+
 ### Cost model
 
 The default `LatencyModel` contains:
@@ -553,6 +579,11 @@ The local component is:
 $$
 C_{\mathrm{local}}=c_{1q}n_{1q}+c_{2q}n_{2q}+c_{\mathrm{swap}}n_{\mathrm{swap}}.
 $$
+
+Because a `swap` instruction is counted in both $n_{2q}$ and $n_{\mathrm{swap}}$,
+$c_{\mathrm{swap}}$ acts as an overhead charged on top of the ordinary two-qubit
+cost: a surviving SWAP contributes $c_{2q}+c_{\mathrm{swap}}$, which is $40$ under
+the defaults rather than $30$.
 
 The remote component is:
 
