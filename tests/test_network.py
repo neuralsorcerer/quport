@@ -1204,3 +1204,24 @@ def test_path_edges_returns_canonically_oriented_undirected_links() -> None:
         for dst in range(3):
             for u, v in path_edges(paths, src, dst):
                 assert u < v
+
+
+def test_zero_weight_edges_do_not_create_boundary_qubits() -> None:
+    """A zero-weight edge is not an interaction, so it implies no port pressure.
+
+    Counting it would inflate the boundary tally that TPCCAP turns into a
+    port-overflow penalty.
+    """
+    assert compute_boundary_counts({(0, 1): 0.0}, [0, 1], 2) == [0, 0]
+    assert compute_traffic_matrix({(0, 1): 0.0}, [0, 1], 2) == [[0.0, 0.0], [0.0, 0.0]]
+
+    # A positive edge across the same cut does count.
+    assert compute_boundary_counts({(0, 1): 2.0}, [0, 1], 2) == [1, 1]
+
+
+def test_route_link_loads_rejects_a_ragged_traffic_matrix() -> None:
+    """Row lengths are validated, so malformed input fails cleanly."""
+    paths = all_pairs_shortest_paths([[1], [0]])
+
+    with pytest.raises(ValueError, match="traffic matrix must be square"):
+        route_link_loads([[0.0, 1.0], [1.0]], paths)

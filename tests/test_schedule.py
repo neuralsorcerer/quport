@@ -1520,3 +1520,51 @@ def test_peak_link_utilisation_counts_the_link_in_use() -> None:
     assert summary.remote_ops == 1
     assert summary.peak_link_util == 1
     assert summary.peak_qpu_ports_used == 1
+
+
+def test_layered_estimator_always_charges_at_least_one_remote_round() -> None:
+    """Rounds are `ceil(degree / ports)`; flooring would make an op free.
+
+    With two ports and a single remote op, a floored division yields zero rounds
+    and the communication cost vanishes from the layer.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=2,
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    latency = LatencyModel()
+
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.cx(0, 3)
+
+    summary = estimate_parallel_makespan_layered(circuit, arch, latency)
+
+    assert summary.remote_ops == 1
+    assert summary.makespan == pytest.approx(
+        latency.epr_gen + latency.classical_rtt + latency.remote_gate_overhead
+    )
+
+
+def test_layered_estimator_runs_same_qpu_gates_in_a_layer_concurrently() -> None:
+    """Within a DAG layer a QPU's local work is parallel, so durations max."""
+    cfg = MultiQPUConfig(
+        n_qpus=1,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=0,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    latency = LatencyModel()
+
+    circuit = QuantumCircuit(arch.n_phys)
+    for qubit in range(3):
+        circuit.x(qubit)  # disjoint qubits: one DAG layer
+
+    summary = estimate_parallel_makespan_layered(circuit, arch, latency)
+
+    assert summary.steps == 1
+    assert summary.makespan == pytest.approx(latency.oneq)
