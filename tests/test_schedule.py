@@ -1765,3 +1765,15 @@ def test_zero_async_overlap_charges_the_full_classical_round_trip() -> None:
         latency.epr_gen + latency.classical_rtt + latency.remote_gate_overhead
     )
     assert hidden_rtt == pytest.approx(full_rtt - latency.classical_rtt)
+
+    # `async_classical=False` skips the overlap arithmetic entirely: no part of
+    # the round trip is hidden, whatever async_overlap says.
+    synchronous_cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        async_classical=False,
+        async_overlap=1.0,
+    )
+    assert remote_makespan(synchronous_cfg) == pytest.approx(full_rtt)
