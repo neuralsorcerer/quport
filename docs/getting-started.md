@@ -61,13 +61,16 @@ What to inspect:
 Generate a config:
 
 ```bash
-quport gen-config --out quport_config.yaml
+quport gen-config
 ```
+
+That writes `quport_config.json`. A `.yaml`/`.yml` suffix emits YAML instead and
+requires the `yaml` extra.
 
 Map and transpile a random circuit:
 
 ```bash
-quport map --n-logical 6 --depth 5 --seed 1 --strategy balanced --config quport_config.yaml
+quport map --n-logical 6 --depth 5 --seed 1 --strategy balanced --config quport_config.json
 ```
 
 Compile into a distributed program bundle:

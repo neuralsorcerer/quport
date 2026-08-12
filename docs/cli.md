@@ -19,17 +19,19 @@ custom workflows, use the Python API documented in [API reference](api-reference
 ## `quport gen-config`
 
 ```bash
-quport gen-config --out quport_config.yaml
+quport gen-config
 ```
 
-Writes an example JSON/YAML config and prints the resolved `MultiQPUConfig`.
+Writes an example config to `quport_config.json` and prints the resolved
+`MultiQPUConfig`. The format follows the `--out` extension; `.yaml`/`.yml`
+requires the `yaml` extra.
 Use this as the safest starting point for editing architecture fields because it
 contains all current config keys.
 
 ## `quport topology-info`
 
 ```bash
-quport topology-info --config quport_config.yaml
+quport topology-info --config quport_config.json
 ```
 
 Builds the configured inter-QPU graph and prints structural metrics before any
@@ -42,7 +44,7 @@ models.
 ## `quport map`
 
 ```bash
-quport map --n-logical 6 --depth 5 --seed 1 --strategy balanced --config quport_config.yaml --out mapped.qasm
+quport map --n-logical 6 --depth 5 --seed 1 --strategy balanced --config quport_config.json --out mapped.qasm
 ```
 
 Generates a random circuit, maps/transpiles it on the global architecture, prints

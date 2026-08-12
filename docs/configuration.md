@@ -70,11 +70,11 @@ schedule estimator.
 Use the CLI to create a config file:
 
 ```bash
-quport gen-config --out quport_config.yaml
+quport gen-config
 ```
 
-JSON and YAML are supported by `load_config`/`dump_config`; YAML requires the
-`yaml` extra. Config files must contain a mapping/object and unknown fields are
+JSON and YAML are supported by `load_config`/`dump_config`, selected by the file
+extension; the default output is JSON because YAML requires the `yaml` extra. Config files must contain a mapping/object and unknown fields are
 rejected so misspelled settings do not silently take effect.
 
 Example JSON:

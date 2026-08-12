@@ -649,10 +649,12 @@ python -m quport --help
 ### Generate a config file
 
 ```bash
-quport gen-config --out quport_config.yaml
+quport gen-config
 ```
 
-This writes a default `MultiQPUConfig` to JSON or YAML depending on the file extension.
+This writes a default `MultiQPUConfig` to `quport_config.json`. Pass `--out` with a
+`.yaml`/`.yml` suffix to emit YAML instead, which requires the `yaml` extra
+(`pip install quport[yaml]`); the format follows the file extension.
 
 ### Map and globally transpile a random circuit
 
@@ -679,7 +681,7 @@ quport map \
   --depth 20 \
   --seed 7 \
   --strategy tpccap_sa \
-  --config quport_config.yaml
+  --config quport_config.json
 ```
 
 ### Benchmark strategies

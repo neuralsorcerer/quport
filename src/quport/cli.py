@@ -145,6 +145,30 @@ def _load_or_random_circuit(
     return random_benchmark_circuit(n_logical, depth, seed)
 
 
+def _load_config_or_default(config: str | None) -> MultiQPUConfig:
+    """Load a config file, or fall back to defaults when none is given.
+
+    ``load_config`` raises ``RuntimeError`` when a YAML path is requested without
+    the optional PyYAML dependency.  Surface that as a CLI error so users see the
+    install hint instead of a traceback, matching how the plotting extra is
+    handled.
+    """
+    if config is None:
+        return MultiQPUConfig()
+    try:
+        return load_config(config)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _dump_config_or_fail(cfg: MultiQPUConfig, out: str) -> None:
+    """Write a config file, reporting a missing optional dependency cleanly."""
+    try:
+        dump_config(cfg, out)
+    except RuntimeError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 def _load_plot_modules() -> tuple[Any, Any]:
     missing = [
         module_name
@@ -169,11 +193,14 @@ def _pretty_config(cfg: MultiQPUConfig) -> None:
 
 @app.command()
 def gen_config(
-    out: str = typer.Option("quport_config.yaml", help="Output path (.json/.yaml)"),
+    out: str = typer.Option(
+        "quport_config.json",
+        help="Output path. Use a .yaml/.yml suffix for YAML (needs quport[yaml]).",
+    ),
 ) -> None:
     """Generate an example config file."""
     cfg = MultiQPUConfig()
-    dump_config(cfg, out)
+    _dump_config_or_fail(cfg, out)
     console.print(f"Wrote config to {out}")
     _pretty_config(cfg)
 
@@ -183,7 +210,7 @@ def topology_info(
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
 ) -> None:
     """Print structural metrics for the configured inter-QPU topology."""
-    cfg = load_config(config) if config else MultiQPUConfig()
+    cfg = _load_config_or_default(config)
     metrics = topology_metrics(build_qpu_graph(cfg))
 
     t = Table(title="Inter-QPU Topology Metrics")
@@ -216,7 +243,7 @@ def map(
     out: str | None = typer.Option(None, help="Write mapped circuit as OpenQASM 3.0"),
 ) -> None:
     """Map+transpile a single random circuit and print key metrics."""
-    cfg = load_config(config) if config else MultiQPUConfig()
+    cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
         input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
@@ -254,7 +281,7 @@ def bench(
     out: str = typer.Option("results.csv", help="Output CSV path"),
 ) -> None:
     """Benchmark baseline vs QuPort on multiple random circuits."""
-    cfg = load_config(config) if config else MultiQPUConfig()
+    cfg = _load_config_or_default(config)
     latency = LatencyModel()
 
     strats = [s.strip() for s in strategies.split(",") if s.strip()]
@@ -339,7 +366,7 @@ def schedule(
     from .architecture import MultiQPUArchitecture
     from .schedule import estimate_parallel_makespan_layered
 
-    cfg = load_config(config) if config else MultiQPUConfig()
+    cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
         input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
@@ -376,7 +403,7 @@ def split(
     from .architecture import MultiQPUArchitecture
     from .distributed import split_into_qpus
 
-    cfg = load_config(config) if config else MultiQPUConfig()
+    cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
         input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
@@ -431,7 +458,7 @@ def compile_dist(
       - schedule.json       : topology-aware schedule summary
       - schedule_trace.json : detailed per-layer/per-round communication plan with absolute timing
     """
-    cfg = load_config(config) if config else MultiQPUConfig()
+    cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
         input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed

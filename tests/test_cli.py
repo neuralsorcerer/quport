@@ -390,3 +390,58 @@ def test_bench_accepts_strategies_with_surrounding_whitespace(tmp_path: Path) ->
 
     rows = list(csv.DictReader(out.open(encoding="utf-8")))
     assert {row["strategy"] for row in rows} == {"balanced", "cluster"}
+
+
+def test_gen_config_default_output_needs_no_optional_extras(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`quport gen-config` with no arguments must work on a base install.
+
+    YAML support is an optional extra, so the default output cannot be a YAML
+    path or the first documented command fails for anyone who installed the
+    package without extras.
+    """
+    from quport.config import MultiQPUConfig, load_config
+
+    monkeypatch.chdir(tmp_path)
+    _run(["gen-config"])
+
+    written = tmp_path / "quport_config.json"
+    assert written.is_file()
+    assert load_config(str(written)) == MultiQPUConfig()
+
+
+def test_gen_config_reports_missing_yaml_extra_as_a_cli_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing optional dependency is a usage error, not a traceback."""
+    import quport.config
+
+    monkeypatch.setattr(
+        quport.config, "optional_module_available", lambda module_name: False
+    )
+    result = CliRunner().invoke(
+        app, ["gen-config", "--out", str(tmp_path / "cfg.yaml")]
+    )
+
+    assert result.exit_code != 0
+    assert "quport[yaml]" in result.output
+    assert not isinstance(result.exception, RuntimeError)
+
+
+def test_commands_report_missing_yaml_extra_when_loading_a_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import quport.config
+
+    config = tmp_path / "cfg.yaml"
+    config.write_text("n_qpus: 2\n", encoding="utf-8")
+    monkeypatch.setattr(
+        quport.config, "optional_module_available", lambda module_name: False
+    )
+
+    result = CliRunner().invoke(app, ["topology-info", "--config", str(config)])
+
+    assert result.exit_code != 0
+    assert "quport[yaml]" in result.output
+    assert not isinstance(result.exception, RuntimeError)
