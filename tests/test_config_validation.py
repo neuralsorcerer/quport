@@ -92,3 +92,34 @@ def test_load_config_rejects_a_non_mapping_document(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="must contain a mapping/object"):
         load_config(str(config))
+
+
+def test_yaml_config_round_trips_through_dump_and_load(tmp_path: Path) -> None:
+    """The YAML branches of `dump_config`/`load_config` had no round-trip test.
+
+    Only the JSON path was exercised, so a broken YAML writer would have shipped
+    behind the optional extra.
+    """
+    pytest.importorskip("yaml")
+    from quport.config import MultiQPUConfig, dump_config, load_config
+
+    original = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=4,
+        comm_qubits_per_qpu=2,
+        intra_topology="grid2d",
+        inter_topology="clos",
+        optimization_level=2,
+    )
+    path = tmp_path / "cfg.yaml"
+
+    dump_config(original, str(path))
+    assert path.exists()
+
+    # YAML is a superset of JSON, so round-tripping alone cannot tell a YAML
+    # writer from a JSON one: assert the file is written in YAML block style.
+    written = path.read_text(encoding="utf-8")
+    assert "n_qpus: 3" in written
+    assert not written.lstrip().startswith("{")
+
+    assert load_config(str(path)) == original
