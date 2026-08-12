@@ -1306,3 +1306,40 @@ def test_json_safe_mapping_preserves_entries_when_string_keys_repeat() -> None:
         "type": "mapping",
         "entries": [["a", 1], ["a", 2]],
     }
+
+
+def test_zero_qubit_barrier_is_broadcast_to_every_qpu() -> None:
+    """A barrier carrying no qubits is a global sync point, not a no-op.
+
+    `split_into_qpus` routes ops by the QPUs their qubits live on; an op with no
+    qubits has none, so it has to be replicated onto every local circuit or the
+    per-QPU programs lose the synchronization the original circuit expressed.
+    """
+    from qiskit.circuit import Barrier
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.append(Barrier(0), [], [])
+
+    program = split_into_qpus(circuit, arch)
+
+    assert len(program.local_circuits) == cfg.n_qpus
+    for local in program.local_circuits.values():
+        assert [inst.operation.name for inst in local.data] == ["barrier"]
+    assert program.remote_ops == []
+
+
+def test_grouping_rejects_mismatched_qubit_and_qpu_lengths() -> None:
+    """The operand-order grouping helper pairs the two lists element-wise."""
+    from quport.distributed import _group_qubits_by_qpu_in_operand_order
+
+    with pytest.raises(ValueError, match="same length"):
+        _group_qubits_by_qpu_in_operand_order([0, 1, 2], [0, 1])

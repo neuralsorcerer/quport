@@ -848,8 +848,12 @@ def _topology_schedule_plan(
                 round_max_cost = max(round_max_cost, remote_cost(a, b))
 
             if not placed_any:
-                # Constraints can make a "reachable" pair unschedulable (e.g., switch_parallel_links=0).
-                # Charge one penalty round and defer the rest.
+                # Termination guard, not a costing path. Every round starts with
+                # empty port/link/pair usage, so the three deferral tests above
+                # reduce to ports <= 0, link_capacity == 0 and switch_parallel_links
+                # == 0 -- each already diverted by a fast path before this loop.
+                # A round that places nothing would leave `remaining` unchanged and
+                # spin forever, so charge one penalty round and defer the rest.
                 skipped = remaining[0]
                 next_remaining = remaining[1:]
                 rounds_time = append_unschedulable_round_trace(

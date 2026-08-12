@@ -1384,3 +1384,51 @@ def test_tpccap_sa_single_step_anneals_at_the_end_temperature() -> None:
     assert hot_start == cold_start
     # The end temperature is cold enough to reject the single worsening proposal.
     assert hot_start[1] == 0
+
+
+def test_dsu_union_merges_by_size_and_reports_new_joins() -> None:
+    """`DSU.union` is the public entry point; only `union_roots` had coverage.
+
+    Union-by-size only affects tree depth, so a broken merge shows up as wrong
+    membership rather than a crash.
+    """
+    from quport.partition import DSU
+
+    dsu = DSU(8)
+
+    assert dsu.union(0, 1) is True
+    assert dsu.union(0, 1) is False
+    assert dsu.union(1, 0) is False
+
+    dsu.union(2, 3)
+    dsu.union(0, 2)
+    assert len({dsu.find(i) for i in range(4)}) == 1
+
+    # a singleton joining a larger tree keeps the larger tree's root
+    larger_root = dsu.find(0)
+    assert dsu.union(7, 0) is True
+    assert dsu.find(7) == larger_root
+    assert dsu.find(6) != larger_root
+
+    components = dsu.components()
+    assert sorted(sorted(members) for members in components.values()) == [
+        [0, 1, 2, 3, 7],
+        [4],
+        [5],
+        [6],
+    ]
+
+
+def test_clustering_skips_edges_inside_an_existing_cluster() -> None:
+    """A triangle unions two nodes transitively before its third edge is seen.
+
+    That edge must be skipped, not merged again -- re-merging would double-count
+    the cluster's size and push it past capacity.
+    """
+    weights = {(0, 1): 3.0, (1, 2): 3.0, (0, 2): 3.0}
+
+    part = heavy_edge_clustering_partition(3, weights, n_qpus=2, capacity=3)
+
+    assert len(part) == 3
+    assert len(set(part)) == 1
+    assert all(0 <= qpu < 2 for qpu in part)

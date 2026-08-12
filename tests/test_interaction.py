@@ -186,3 +186,19 @@ def test_validate_temporal_decay_rejects_invalid_values(
 @pytest.mark.parametrize("decay", [1, 1.0, "0.5", Decimal("0.25")])
 def test_validate_temporal_decay_accepts_valid_values(decay: object) -> None:
     assert 0.0 < validate_temporal_decay(decay) <= 1.0
+
+
+def test_cut_weight_rejects_non_integer_logical_indices() -> None:
+    """Weight keys index the partition list, so a float index is a caller error.
+
+    Silently coercing it would score an edge against the wrong qubit.
+    """
+    from quport.interaction import cut_weight
+
+    with pytest.raises(ValueError, match="integer logical indices"):
+        cut_weight({(0.5, 1): 1.0}, [0, 1])
+
+    with pytest.raises(ValueError, match="integer logical indices"):
+        cut_weight({(0, "1"): 1.0}, [0, 1])
+
+    assert cut_weight({(0, 1): 1.0}, [0, 1]) == 1.0

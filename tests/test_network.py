@@ -1225,3 +1225,32 @@ def test_route_link_loads_rejects_a_ragged_traffic_matrix() -> None:
 
     with pytest.raises(ValueError, match="traffic matrix must be square"):
         route_link_loads([[0.0, 1.0], [1.0]], paths)
+
+
+def test_shortest_path_walk_is_empty_for_an_unreachable_pair() -> None:
+    """A next_hop of -1 marks "no route"; the walk must stop, not loop or raise."""
+    paths = QpuShortestPaths(
+        dist=[[0, UNREACHABLE_DISTANCE], [UNREACHABLE_DISTANCE, 0]],
+        next_hop=[[0, -1], [-1, 1]],
+    )
+
+    assert paths.path(0, 1) == []
+    assert paths.path(1, 0) == []
+    assert paths.path(0, 0) == [0]
+
+
+def test_ecmp_rejects_traffic_between_disconnected_qpus() -> None:
+    """ECMP cannot route across components, and must say so rather than drop load."""
+    adjacency = [[1], [0], [3], [2]]
+    paths = all_pairs_shortest_paths(adjacency)
+
+    traffic = [[0.0] * 4 for _ in range(4)]
+    traffic[0][2] = traffic[2][0] = 3.0
+
+    with pytest.raises(ValueError, match="no path between QPU"):
+        route_link_loads(traffic, paths, mode="ecmp")
+
+    # the reachable pair on its own still routes
+    traffic = [[0.0] * 4 for _ in range(4)]
+    traffic[0][1] = traffic[1][0] = 3.0
+    assert route_link_loads(traffic, paths, mode="ecmp") == {(0, 1): 3.0}
