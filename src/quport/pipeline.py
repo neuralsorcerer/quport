@@ -215,19 +215,23 @@ def map_and_transpile(
     weights = extract_twoq_weights(qc_basis)
     capacity = cfg.capacity_per_qpu()
 
-    # Topology-aware weighting.  ``None`` reproduces the historical split, where
-    # only tpccap_sa decayed its weights; an explicit value is applied to both
-    # topology-aware strategies so they can be compared on equal terms.
-    decay = (
-        None
-        if temporal_decay is None
-        else validate_temporal_decay(temporal_decay, label="temporal_decay")
-    )
-
     def topology_weights(
         default_decay: float | None,
     ) -> Mapping[tuple[int, int], float]:
-        effective = default_decay if decay is None else decay
+        """Interaction weights for a topology-aware strategy.
+
+        ``temporal_decay=None`` reproduces the historical split, where only
+        tpccap_sa decayed its weights; an explicit value is applied to both
+        topology-aware strategies so they can be compared on equal terms.
+
+        Validation happens here rather than up front so that, exactly as in
+        :func:`quport.compiler.compile_distributed`, a decay supplied alongside a
+        strategy that does not use it is ignored rather than rejected.
+        """
+        effective = default_decay
+        if temporal_decay is not None:
+            effective = validate_temporal_decay(temporal_decay, label="temporal_decay")
+        # decay == 1.0 yields exactly the uniform counts, so skip recomputing them.
         if effective is None or effective >= 1.0:
             return weights
         return extract_temporal_twoq_weights(qc_basis, decay=effective)

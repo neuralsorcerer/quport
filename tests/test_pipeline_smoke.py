@@ -689,3 +689,56 @@ def test_temporal_decay_rejects_values_outside_the_valid_range(bad: object) -> N
 @pytest.mark.parametrize("strategy", ["balanced", "cluster"])
 def test_temporal_decay_does_not_affect_non_topology_strategies(strategy: str) -> None:
     assert _tpccap_partition_for(strategy, None) == _tpccap_partition_for(strategy, 0.5)
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "cluster"])
+def test_temporal_decay_is_ignored_not_rejected_for_strategies_that_skip_it(
+    strategy: str,
+) -> None:
+    """Validation timing must match `compile_distributed`.
+
+    That function deliberately ignores an out-of-range decay for strategies
+    which never consult it; the same argument on the same kind of call should
+    not behave differently here.
+    """
+    from quport.compiler import compile_distributed
+    from quport.pipeline import map_and_transpile, random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        optimization_level=0,
+    )
+    circuit = random_benchmark_circuit(n_logical=3, depth=2, seed=0)
+
+    mapped = map_and_transpile(
+        circuit, cfg, seed=0, strategy=strategy, temporal_decay=1.5
+    )
+    assert mapped.strategy == strategy
+
+    distributed = compile_distributed(
+        circuit, cfg, seed=0, strategy=strategy, temporal_decay=1.5
+    )
+    assert distributed.strategy == strategy
+
+
+def test_temporal_decay_of_one_matches_uniform_interaction_counts() -> None:
+    """`decay = 1.0` gives `1.0 ** t == 1.0`, i.e. exactly the plain counts."""
+    from quport.interaction import extract_temporal_twoq_weights, extract_twoq_weights
+    from quport.pipeline import _translate_to_basis, random_benchmark_circuit
+
+    cfg = MultiQPUConfig()
+    circuit = _translate_to_basis(
+        random_benchmark_circuit(n_logical=8, depth=6, seed=2), cfg.basis_gates, 2
+    )
+
+    uniform = {
+        key: float(value) for key, value in extract_twoq_weights(circuit).items()
+    }
+    decayed = {
+        key: float(value)
+        for key, value in extract_temporal_twoq_weights(circuit, decay=1.0).items()
+    }
+
+    assert uniform == decayed
