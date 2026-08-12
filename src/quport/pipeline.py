@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import csv
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TypeAlias, TypeVar
 
@@ -19,7 +19,11 @@ from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
-from quport.interaction import extract_temporal_twoq_weights, extract_twoq_weights
+from quport.interaction import (
+    extract_temporal_twoq_weights,
+    extract_twoq_weights,
+    validate_temporal_decay,
+)
 from quport.layout import compute_layout_hints, naive_layout
 from quport.metrics import CircuitMetrics, compute_metrics
 from quport.partition import (
@@ -153,6 +157,7 @@ def map_and_transpile(
     latency: LatencyModel | None = None,
     seed: int | None = None,
     strategy: str = "balanced",
+    temporal_decay: float | None = None,
 ) -> MapResult:
     """End-to-end pipeline: partition -> initial layout -> transpile -> metrics -> cost.
 
@@ -172,6 +177,19 @@ def map_and_transpile(
         - "cluster" : heavy-edge clustering baseline
         - "tpccap"    : topology+port+congestion aware partitioner (novel)
         - "tpccap_sa" : TPCCAP + simulated annealing refinement (best)
+    temporal_decay:
+        Interaction weighting for the topology-aware strategies, matching the
+        argument of the same name on :func:`quport.compiler.compile_distributed`.
+        A value in (0, 1) emphasises earlier two-qubit gates; ``1.0`` is plain
+        interaction counts. It applies to ``tpccap`` and ``tpccap_sa`` alike, so
+        a run isolates the annealing rather than also changing the objective's
+        inputs.
+
+        Leaving it as ``None`` keeps the historical per-strategy behaviour, in
+        which ``tpccap`` uses uniform counts and ``tpccap_sa`` uses a decay of
+        0.98. That default is preserved so existing benchmark numbers do not
+        move, but it means the two strategies differ in more than the search;
+        pass an explicit value to compare them on equal terms.
 
     Returns
     -------
@@ -197,6 +215,23 @@ def map_and_transpile(
     weights = extract_twoq_weights(qc_basis)
     capacity = cfg.capacity_per_qpu()
 
+    # Topology-aware weighting.  ``None`` reproduces the historical split, where
+    # only tpccap_sa decayed its weights; an explicit value is applied to both
+    # topology-aware strategies so they can be compared on equal terms.
+    decay = (
+        None
+        if temporal_decay is None
+        else validate_temporal_decay(temporal_decay, label="temporal_decay")
+    )
+
+    def topology_weights(
+        default_decay: float | None,
+    ) -> Mapping[tuple[int, int], float]:
+        effective = default_decay if decay is None else decay
+        if effective is None or effective >= 1.0:
+            return weights
+        return extract_temporal_twoq_weights(qc_basis, decay=effective)
+
     partition_diag: PartitionDiagnostics | None = None
     comm_mode = "topk"
 
@@ -216,7 +251,7 @@ def map_and_transpile(
         sp = arch.qpu_shortest_paths()
         pres, diag = tpccap_partition(
             n=qc_basis.num_qubits,
-            weights=weights,
+            weights=topology_weights(None),
             n_qpus=cfg.n_qpus,
             capacity=capacity,
             comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
@@ -231,10 +266,9 @@ def map_and_transpile(
     elif strategy == "tpccap_sa":
         sp = arch.qpu_shortest_paths()
         # time-decayed weights often improve early remote behavior on random circuits
-        weights_td = extract_temporal_twoq_weights(qc_basis, decay=0.98)
         pres, diag, _anneal = tpccap_sa_partition(
             n=qc_basis.num_qubits,
-            weights=weights_td,
+            weights=topology_weights(0.98),
             n_qpus=cfg.n_qpus,
             capacity=capacity,
             comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),

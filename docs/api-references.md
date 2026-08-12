@@ -99,7 +99,8 @@ folding them into the average.
 ### `map_and_transpile`
 
 ```python
-map_and_transpile(qc, cfg, latency=None, seed=None, strategy="balanced") -> MapResult
+map_and_transpile(qc, cfg, latency=None, seed=None, strategy="balanced",
+                  temporal_decay=None) -> MapResult
 ```
 
 End-to-end global mapping flow:
@@ -113,11 +114,14 @@ End-to-end global mapping flow:
 
 Supported strategies: `balanced`, `cluster`, `tpccap`, `tpccap_sa`.
 
-There is no `temporal_decay` argument here: `tpccap` runs on uniform interaction
-counts while `tpccap_sa` runs on temporal weights with the decay fixed at `0.98`.
-Use `compile_distributed` when both strategies need the same weighting. See
-[Partitioning strategies](concepts.md#partitioning-strategies) for why this matters
-when interpreting benchmark output.
+`temporal_decay` selects the interaction weighting for the topology-aware
+strategies and applies to `tpccap` and `tpccap_sa` alike, so a run isolates the
+annealing rather than also changing the objective's inputs. Leaving it `None`
+keeps the historical split, in which `tpccap` uses uniform counts and
+`tpccap_sa` uses a decay of `0.98`; that default is unchanged so existing
+benchmark numbers do not move. See
+[Partitioning strategies](concepts.md#partitioning-strategies) for why this
+matters when interpreting benchmark output.
 
 `MapResult` fields:
 

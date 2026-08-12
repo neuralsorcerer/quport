@@ -622,3 +622,70 @@ def test_sweep_means_are_averaged_over_that_strategy_only(tmp_path: Path) -> Non
         ):
             expected = statistics.mean(float(r[trial_key]) for r in own)
             assert float(row[csv_key]) == pytest.approx(expected)
+
+
+def _tpccap_partition_for(strategy: str, temporal_decay: float | None) -> list[int]:
+    from quport.pipeline import map_and_transpile, random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    circuit = random_benchmark_circuit(n_logical=10, depth=8, seed=4)
+    return map_and_transpile(
+        circuit, cfg, seed=4, strategy=strategy, temporal_decay=temporal_decay
+    ).partition
+
+
+def test_temporal_decay_default_preserves_the_historical_weighting() -> None:
+    """`None` must reproduce the shipped per-strategy behaviour exactly.
+
+    Historically `tpccap` used uniform interaction counts while `tpccap_sa` used
+    a decay of 0.98. That asymmetry is preserved by default so existing
+    benchmark numbers do not move.
+    """
+    assert _tpccap_partition_for("tpccap", None) == _tpccap_partition_for("tpccap", 1.0)
+    assert _tpccap_partition_for("tpccap_sa", None) == _tpccap_partition_for(
+        "tpccap_sa", 0.98
+    )
+
+
+def test_temporal_decay_applies_to_both_topology_aware_strategies() -> None:
+    """An explicit value weights `tpccap` and `tpccap_sa` the same way.
+
+    That is what makes a comparison between them an ablation of the annealing
+    rather than of the annealing plus a different objective input.
+    """
+    # tpccap_sa defaults to 0.98, so asking for uniform weights must change it.
+    assert _tpccap_partition_for("tpccap_sa", 1.0) != _tpccap_partition_for(
+        "tpccap_sa", None
+    )
+    # tpccap defaults to uniform, so asking for decay must change it.
+    assert _tpccap_partition_for("tpccap", 0.5) != _tpccap_partition_for("tpccap", None)
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.5, 1.5, float("nan"), float("inf"), True])
+def test_temporal_decay_rejects_values_outside_the_valid_range(bad: object) -> None:
+    from quport.pipeline import map_and_transpile, random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        optimization_level=0,
+    )
+    circuit = random_benchmark_circuit(n_logical=3, depth=2, seed=0)
+
+    with pytest.raises(ValueError, match="temporal_decay"):
+        map_and_transpile(
+            circuit, cfg, seed=0, strategy="tpccap", temporal_decay=bad  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "cluster"])
+def test_temporal_decay_does_not_affect_non_topology_strategies(strategy: str) -> None:
+    assert _tpccap_partition_for(strategy, None) == _tpccap_partition_for(strategy, 0.5)
