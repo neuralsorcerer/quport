@@ -143,8 +143,8 @@ def _first_remote_partner(qpus: Sequence[int]) -> int | None:
     more qubits that spans several QPUs into one remote event, between the QPU
     of its first operand and the first operand sitting on a different QPU. The
     layered and topology estimators mirror that choice so that every view of a
-    circuit — the split program, the remote-op manifest and all three schedule
-    estimators — agrees on how many remote events the circuit contains.
+    circuit agrees on how many remote events it contains: the split program, the
+    remote-op manifest, and all three schedule estimators.
 
     Returns ``None`` when every operand shares one QPU, i.e. the operation is
     local and costs local two-qubit time.
