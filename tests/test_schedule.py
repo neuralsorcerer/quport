@@ -1697,3 +1697,71 @@ def test_topology_makespan_charges_local_swaps_at_swap_latency() -> None:
     assert swap_summary.makespan == pytest.approx(latency.swap)
     assert twoq_summary.makespan == pytest.approx(latency.twoq)
     assert swap_summary.remote_ops == 0
+
+
+def test_estimators_ignore_operations_that_carry_no_qubits() -> None:
+    """A zero-qubit op belongs to no QPU and must consume no time anywhere.
+
+    Barriers are filtered earlier as directives, but a non-directive op with an
+    empty qarg list -- a global phase, say -- reaches the estimators' `len == 0`
+    guard. Without it the op would be attributed to a QPU it never touched.
+    """
+    from qiskit.circuit.library import GlobalPhaseGate
+
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    block = arch.block_of_qpu(0)
+
+    plain = QuantumCircuit(arch.n_phys)
+    plain.cx(block.compute[0], block.compute[1])
+
+    with_phase = QuantumCircuit(arch.n_phys)
+    with_phase.append(GlobalPhaseGate(0.25), [], [])
+    with_phase.cx(block.compute[0], block.compute[1])
+
+    for estimator in (
+        estimate_parallel_makespan,
+        estimate_parallel_makespan_layered,
+        estimate_parallel_makespan_topology,
+    ):
+        baseline = estimator(plain, arch, latency)
+        with_zero_qubit_op = estimator(with_phase, arch, latency)
+        assert with_zero_qubit_op.makespan == pytest.approx(baseline.makespan)
+        assert with_zero_qubit_op.makespan == pytest.approx(latency.twoq)
+        assert with_zero_qubit_op.remote_ops == baseline.remote_ops == 0
+
+
+def test_zero_async_overlap_charges_the_full_classical_round_trip() -> None:
+    """`async_overlap` hides part of the classical RTT; at 0.0 none of it is hidden."""
+    overlapped_cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        async_overlap=1.0,
+    )
+    plain_cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        async_overlap=0.0,
+    )
+    latency = LatencyModel()
+
+    def remote_makespan(cfg: MultiQPUConfig) -> float:
+        arch = MultiQPUArchitecture(cfg)
+        circuit = QuantumCircuit(arch.n_phys)
+        circuit.cx(
+            arch.block_of_qpu(0).compute[0],
+            arch.block_of_qpu(1).compute[0],
+        )
+        return estimate_parallel_makespan_topology(circuit, arch, latency).makespan
+
+    full_rtt = remote_makespan(plain_cfg)
+    hidden_rtt = remote_makespan(overlapped_cfg)
+
+    assert full_rtt == pytest.approx(
+        latency.epr_gen + latency.classical_rtt + latency.remote_gate_overhead
+    )
+    assert hidden_rtt == pytest.approx(full_rtt - latency.classical_rtt)
