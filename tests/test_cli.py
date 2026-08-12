@@ -50,6 +50,9 @@ def _write_qasm(path: Path, *, leading_text: str = "") -> None:
         ("/* block comment */\nOPENQASM 3.0;\n", 3),
         ("/* unterminated block comment", None),
         ("qreg q[1];\n", None),
+        ("// trailing line comment with no newline", None),
+        ("// one\n// two\nOPENQASM 3;\n", 3),
+        ("OPENQASM 4.0;\n", None),
     ],
 )
 def test_qasm_version_detects_headers_after_leading_comments(
@@ -445,3 +448,261 @@ def test_commands_report_missing_yaml_extra_when_loading_a_config(
     assert result.exit_code != 0
     assert "quport[yaml]" in result.output
     assert not isinstance(result.exception, RuntimeError)
+
+
+def test_sweep_writes_a_plot_when_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `--plot` branch of `sweep` was never executed, even with viz installed.
+
+    A blank figure is still a valid PNG, so checking the file alone would pass
+    even if no series were drawn. Record the scatter calls instead.
+    """
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("pandas")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from quport.pipeline import benchmark_method_labels
+
+    series: list[str] = []
+    real_scatter = plt.scatter
+
+    def recording_scatter(*args: object, **kwargs: object) -> object:
+        series.append(str(kwargs.get("label")))
+        return real_scatter(*args, **kwargs)
+
+    monkeypatch.setattr(plt, "scatter", recording_scatter)
+
+    out_csv = tmp_path / "sweep.csv"
+    out_png = tmp_path / "sweep.png"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--depth",
+            "1",
+            "--trials",
+            "1",
+            "--strategies",
+            "baseline,tpccap",
+            "--out",
+            str(out_csv),
+            "--plot",
+            str(out_png),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert out_csv.is_file()
+    assert out_png.is_file()
+    assert out_png.read_bytes().startswith(b"\x89PNG")
+    assert str(out_png) in result.output
+
+    # one labelled series per strategy, named -- not left as a bare method id
+    assert sorted(series) == ["baseline", "tpccap"]
+    assert set(series) <= set(benchmark_method_labels().values())
+
+
+def test_sweep_reports_missing_viz_extra_as_a_cli_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing plotting extra is a usage error, not a traceback."""
+    import quport.cli
+
+    monkeypatch.setattr(
+        quport.cli, "optional_module_available", lambda module_name: False
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--depth",
+            "1",
+            "--trials",
+            "1",
+            "--out",
+            str(tmp_path / "sweep.csv"),
+            "--plot",
+            str(tmp_path / "sweep.png"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "[viz]" in result.output
+    assert not isinstance(result.exception, ImportError)
+    assert not (tmp_path / "sweep.png").exists()
+
+
+def test_module_entry_point_runs_the_cli() -> None:
+    """`python -m quport` is a shipped entry point that nothing exercised.
+
+    A subprocess does not inherit the `src`-first `sys.path` that conftest sets
+    up, so point it at the working tree explicitly. Otherwise this silently
+    tests whatever copy of quport happens to be installed.
+    """
+    import os
+    import subprocess
+    import sys
+
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        src + os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else src
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "quport", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "QuPort" in result.stdout
+    assert "sweep" in result.stdout
+
+
+def _write_malformed_qasm(path: Path) -> None:
+    path.write_text("this is not a QASM program at all\n", encoding="utf-8")
+
+
+def test_input_qasm_loader_reports_a_bad_qasm2_body(tmp_path: Path) -> None:
+    """A declared OpenQASM 2 header with an unparsable body names the version."""
+    input_path = tmp_path / "broken2.qasm"
+    input_path.write_text("OPENQASM 2.0;\nnot_a_gate q[0];\n", encoding="utf-8")
+
+    with pytest.raises(typer.BadParameter, match="Unable to parse OpenQASM 2"):
+        _load_or_random_circuit(
+            input_qasm=str(input_path),
+            n_logical=None,
+            depth=1,
+            seed=0,
+        )
+
+
+def test_input_qasm_loader_reports_a_bad_qasm3_body(tmp_path: Path) -> None:
+    """A declared OpenQASM 3 header with an unparsable body names the version.
+
+    The parse failure must not be mistaken for the missing-importer case, which
+    is reported with an install hint instead.
+    """
+    input_path = tmp_path / "broken3.qasm"
+    input_path.write_text("OPENQASM 3.0;\nnot_a_gate q[0];\n", encoding="utf-8")
+
+    def _fails(*_args: object, **_kwargs: object) -> QuantumCircuit:
+        raise ValueError("bad qasm3 body")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("quport.cli.qasm3.load", _fails)
+        with pytest.raises(typer.BadParameter, match="Unable to parse OpenQASM 3"):
+            _load_or_random_circuit(
+                input_qasm=str(input_path),
+                n_logical=None,
+                depth=1,
+                seed=0,
+            )
+
+
+def test_headerless_input_falls_back_from_qasm3_to_qasm2(tmp_path: Path) -> None:
+    """Without a version header, a QASM 3 failure must still try QASM 2."""
+    input_path = tmp_path / "headerless.qasm"
+    _write_qasm(input_path)
+    body = input_path.read_text(encoding="utf-8")
+    input_path.write_text(
+        "\n".join(line for line in body.splitlines() if not line.startswith("OPENQASM"))
+        + "\n",
+        encoding="utf-8",
+    )
+    assert _qasm_version(input_path.read_text(encoding="utf-8")) is None
+
+    def _fails(*_args: object, **_kwargs: object) -> QuantumCircuit:
+        raise ValueError("no qasm3 here")
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("quport.cli.qasm3.load", _fails)
+        circuit = _load_or_random_circuit(
+            input_qasm=str(input_path),
+            n_logical=None,
+            depth=1,
+            seed=0,
+        )
+
+    assert circuit.num_qubits > 0
+
+
+def test_headerless_input_falls_back_when_the_qasm3_importer_is_missing(
+    tmp_path: Path,
+) -> None:
+    """The missing-importer branch of the headerless ladder also retries QASM 2."""
+    input_path = tmp_path / "headerless.qasm"
+    _write_qasm(input_path)
+    body = input_path.read_text(encoding="utf-8")
+    input_path.write_text(
+        "\n".join(line for line in body.splitlines() if not line.startswith("OPENQASM"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def _missing_importer(*_args: object, **_kwargs: object) -> QuantumCircuit:
+        raise MissingOptionalLibraryError(
+            libname="qiskit_qasm3_import",
+            name="OpenQASM 3 importer",
+            pip_install="pip install qiskit_qasm3_import",
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("quport.cli.qasm3.load", _missing_importer)
+        circuit = _load_or_random_circuit(
+            input_qasm=str(input_path),
+            n_logical=None,
+            depth=1,
+            seed=0,
+        )
+
+    assert circuit.num_qubits > 0
+
+
+@pytest.mark.parametrize("qasm3_error", ["missing_importer", "parse_error"])
+def test_headerless_input_reports_both_parser_failures(
+    tmp_path: Path, qasm3_error: str
+) -> None:
+    """When neither parser can read a headerless file, say so for both."""
+    input_path = tmp_path / "garbage.qasm"
+    _write_malformed_qasm(input_path)
+
+    def _missing_importer(*_args: object, **_kwargs: object) -> QuantumCircuit:
+        raise MissingOptionalLibraryError(
+            libname="qiskit_qasm3_import",
+            name="OpenQASM 3 importer",
+            pip_install="pip install qiskit_qasm3_import",
+        )
+
+    def _parse_error(*_args: object, **_kwargs: object) -> QuantumCircuit:
+        raise ValueError("no qasm3 here")
+
+    expected = (
+        "could not be parsed as OpenQASM 2"
+        if qasm3_error == "missing_importer"
+        else "Parsing failed as OpenQASM 3"
+    )
+    failure = _missing_importer if qasm3_error == "missing_importer" else _parse_error
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("quport.cli.qasm3.load", failure)
+        with pytest.raises(typer.BadParameter, match=expected):
+            _load_or_random_circuit(
+                input_qasm=str(input_path),
+                n_logical=None,
+                depth=1,
+                seed=0,
+            )
