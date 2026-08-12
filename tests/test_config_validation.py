@@ -66,3 +66,29 @@ def test_dumped_json_config_round_trips_basis_gates(tmp_path: Path) -> None:
     loaded = load_config(str(path))
 
     assert loaded.basis_gates == cfg.basis_gates
+
+
+def test_load_config_rejects_non_string_keys(tmp_path: Path) -> None:
+    """YAML permits non-string mapping keys; JSON does not.
+
+    Without this check the key reaches ``MultiQPUConfig(**data)`` and surfaces as
+    a ``TypeError`` about keyword arguments instead of naming the offending key.
+    """
+    pytest.importorskip("yaml")
+    from quport.config import load_config
+
+    config = tmp_path / "cfg.yaml"
+    config.write_text("1: 2\nn_qpus: 3\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-string key"):
+        load_config(str(config))
+
+
+def test_load_config_rejects_a_non_mapping_document(tmp_path: Path) -> None:
+    from quport.config import load_config
+
+    config = tmp_path / "cfg.json"
+    config.write_text("[1, 2, 3]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must contain a mapping/object"):
+        load_config(str(config))
