@@ -249,14 +249,12 @@ def choose_comm_logicals_diverse(
                     )
 
                 score = total_ext[i] - penalty * overlap
+                # `nodes` is built in ascending logical order, so a tie is always
+                # reached with i > best. Requiring a strict improvement therefore
+                # already resolves ties toward the lowest logical index.
                 if best_score is None or score > best_score:
                     best_score = score
                     best = i
-                elif (
-                    best_score is not None and score == best_score and best is not None
-                ):
-                    if i < best:
-                        best = i
 
             if best is None:
                 break

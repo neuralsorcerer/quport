@@ -80,3 +80,18 @@ def test_count_ops_tallies_each_instruction_once() -> None:
     circuit.h(0)
 
     assert dict(count_ops(circuit)) == {"h": 2, "cx": 2, "barrier": 1}
+
+
+def test_compute_cut_sums_only_cross_partition_weight() -> None:
+    """`compute_cut` is exported but was never called by the suite.
+
+    It must count an edge exactly when its endpoints sit on different QPUs.
+    """
+    from quport.metrics import compute_cut
+
+    weights = {(0, 1): 2.0, (1, 2): 5.0, (0, 2): 7.0}
+
+    assert compute_cut(weights, [0, 1, 1]) == pytest.approx(9.0)
+    assert compute_cut(weights, [0, 0, 0]) == pytest.approx(0.0)
+    assert compute_cut(weights, [0, 1, 2]) == pytest.approx(14.0)
+    assert compute_cut({}, [0, 1]) == pytest.approx(0.0)

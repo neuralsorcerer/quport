@@ -1568,3 +1568,132 @@ def test_layered_estimator_runs_same_qpu_gates_in_a_layer_concurrently() -> None
 
     assert summary.steps == 1
     assert summary.makespan == pytest.approx(latency.oneq)
+
+
+def _single_qpu_pair_arch() -> MultiQPUArchitecture:
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    return MultiQPUArchitecture(cfg)
+
+
+def test_linear_makespan_charges_local_two_qubit_gates_at_two_qubit_latency() -> None:
+    """A same-QPU 2Q gate advances that QPU by `twoq` -- not `oneq`, and not a sync.
+
+    `estimate_parallel_makespan` only reaches its two-qubit branch for gates that
+    `split_into_qpus` left local: every cross-QPU pair is consumed by the remote-op
+    path above it. Circuits built from the default basis on a partitioned layout
+    happen to route every 2Q gate down one of those other paths, so without this
+    test the branch never runs and a wrong latency term stays invisible.
+    """
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    block = arch.block_of_qpu(0)
+
+    circuit = QuantumCircuit(arch.n_phys)
+    for _ in range(3):
+        circuit.cx(block.compute[0], block.compute[1])
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    assert summary.makespan == pytest.approx(3 * latency.twoq)
+    assert summary.remote_ops == 0
+    assert summary.steps == 0
+
+
+def test_linear_makespan_charges_local_swaps_at_swap_latency() -> None:
+    """A same-QPU SWAP costs `swap`, which is distinct from `twoq`."""
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    block = arch.block_of_qpu(0)
+
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.swap(block.compute[0], block.compute[1])
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    assert latency.swap != latency.twoq
+    assert summary.makespan == pytest.approx(latency.swap)
+    assert summary.steps == 0
+
+
+def test_linear_makespan_adds_local_gate_costs_along_one_timeline() -> None:
+    """Local 1Q/2Q/SWAP gates on one QPU serialize; the makespan is their sum."""
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    block = arch.block_of_qpu(0)
+
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.x(block.compute[0])
+    circuit.cx(block.compute[0], block.compute[1])
+    circuit.swap(block.compute[0], block.compute[1])
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    assert summary.makespan == pytest.approx(latency.oneq + latency.twoq + latency.swap)
+
+
+def test_linear_makespan_syncs_both_timelines_only_on_remote_ops() -> None:
+    """A local gate stays on its own timeline; the following remote op syncs both."""
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    local_block = arch.block_of_qpu(0)
+    remote_block = arch.block_of_qpu(1)
+    remote_cost = latency.epr_gen + latency.classical_rtt + latency.remote_gate_overhead
+
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.cx(local_block.compute[0], local_block.compute[1])
+    circuit.cx(local_block.compute[0], remote_block.compute[0])
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    assert summary.remote_ops == 1
+    assert summary.steps == 1
+    assert summary.makespan == pytest.approx(latency.twoq + remote_cost)
+
+
+def test_layered_makespan_charges_local_swaps_at_swap_latency() -> None:
+    """The layered estimator distinguishes SWAP from a generic 2Q gate too."""
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    block = arch.block_of_qpu(0)
+
+    swap_circuit = QuantumCircuit(arch.n_phys)
+    swap_circuit.swap(block.compute[0], block.compute[1])
+    twoq_circuit = QuantumCircuit(arch.n_phys)
+    twoq_circuit.cx(block.compute[0], block.compute[1])
+
+    assert estimate_parallel_makespan_layered(
+        swap_circuit, arch, latency
+    ).makespan == pytest.approx(latency.swap)
+    assert estimate_parallel_makespan_layered(
+        twoq_circuit, arch, latency
+    ).makespan == pytest.approx(latency.twoq)
+
+
+def test_topology_makespan_charges_local_swaps_at_swap_latency() -> None:
+    """The topology-aware estimator keeps its own SWAP branch, so pin it separately.
+
+    `_topology_schedule_plan` re-implements the per-layer local-duration walk rather
+    than sharing the layered estimator's, so a wrong latency term in one is invisible
+    to a test that only drives the other.
+    """
+    arch = _single_qpu_pair_arch()
+    latency = LatencyModel()
+    block = arch.block_of_qpu(0)
+
+    swap_circuit = QuantumCircuit(arch.n_phys)
+    swap_circuit.swap(block.compute[0], block.compute[1])
+    twoq_circuit = QuantumCircuit(arch.n_phys)
+    twoq_circuit.cx(block.compute[0], block.compute[1])
+
+    swap_summary = estimate_parallel_makespan_topology(swap_circuit, arch, latency)
+    twoq_summary = estimate_parallel_makespan_topology(twoq_circuit, arch, latency)
+
+    assert swap_summary.makespan == pytest.approx(latency.swap)
+    assert twoq_summary.makespan == pytest.approx(latency.twoq)
+    assert swap_summary.remote_ops == 0

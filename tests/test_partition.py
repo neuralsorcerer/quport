@@ -1341,3 +1341,46 @@ def test_tpccap_congestion_weight_changes_the_partition() -> None:
     dominant, _ = tpccap_partition(n, weights, 4, 4, 1, sp, seed=5, w_cong=500.0)
 
     assert ignored.part != dominant.part
+
+
+def test_tpccap_sa_single_step_anneals_at_the_end_temperature() -> None:
+    """With one step there is no schedule to interpolate, so `temp0` must not matter.
+
+    `tpccap_sa_partition` interpolates temperature over `steps - 1` intervals, which
+    is undefined for `steps <= 1`; the code collapses that case to `temp_end`. Reading
+    `temp0` there instead would let a starting temperature nobody reaches decide
+    whether a worsening move is accepted.
+    """
+    sp = all_pairs_shortest_paths([[1, 2], [0, 2], [0, 1]])
+    weights = {
+        (0, 1): 4.0,
+        (0, 2): 1.0,
+        (1, 2): 4.0,
+        (2, 3): 1.0,
+        (3, 4): 4.0,
+        (4, 5): 4.0,
+        (3, 5): 1.0,
+        (0, 5): 2.0,
+    }
+
+    def run_one_step(temp0: float) -> tuple[list[int], int, float]:
+        result, _diagnostics, anneal = tpccap_sa_partition(
+            n=6,
+            weights=weights,
+            n_qpus=3,
+            capacity=4,
+            comm_ports_per_qpu=1,
+            sp=sp,
+            seed=0,
+            steps=1,
+            temp0=temp0,
+            temp_end=0.02,
+        )
+        return result.part, anneal.accepted, result.cut
+
+    hot_start = run_one_step(1000.0)
+    cold_start = run_one_step(0.02)
+
+    assert hot_start == cold_start
+    # The end temperature is cold enough to reject the single worsening proposal.
+    assert hot_start[1] == 0

@@ -609,3 +609,26 @@ def test_intra_ring_does_not_duplicate_the_link_of_a_two_qubit_qpu() -> None:
 
     global_edges = list(arch.build_coupling_map().get_edges())
     assert len(global_edges) == len(set(global_edges)) == 2
+
+
+def test_all_blocks_returns_every_qpu_block_in_order() -> None:
+    """`all_blocks` is exported but was never called by the suite.
+
+    It must agree with `block_of_qpu` for every QPU, including the last one.
+    """
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=2,
+        intra_topology="clique",
+        inter_topology="ring",
+    )
+    arch = MultiQPUArchitecture(cfg)
+
+    blocks = arch.all_blocks()
+
+    assert len(blocks) == cfg.n_qpus
+    assert blocks == [arch.block_of_qpu(i) for i in range(cfg.n_qpus)]
+
+    covered = [phys for block in blocks for phys in (*block.compute, *block.comm)]
+    assert sorted(covered) == list(range(arch.n_phys))
