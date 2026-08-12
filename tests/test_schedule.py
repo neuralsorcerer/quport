@@ -1702,11 +1702,20 @@ def test_topology_makespan_charges_local_swaps_at_swap_latency() -> None:
 def test_estimators_ignore_operations_that_carry_no_qubits() -> None:
     """A zero-qubit op belongs to no QPU and must consume no time anywhere.
 
-    Barriers are filtered earlier as directives, but a non-directive op with an
-    empty qarg list -- a global phase, say -- reaches the estimators' `len == 0`
-    guard. Without it the op would be attributed to a QPU it never touched.
+    The three estimators reach that conclusion by different routes, and the
+    difference matters for what this test can claim. The linear estimator walks
+    `circuit.data`, so it really does receive the op and skip it on its own
+    `len == 0` guard. The layered and topology estimators walk `dag.layers()`,
+    which groups nodes by the qubits they occupy and therefore omits qubit-less
+    ops before any quport code runs -- their guards are unreachable today, and
+    asserting they "ignore" the op would prove nothing about them.
+
+    So pin the observable invariant for all three, and pin the DAG property the
+    other two depend on. If a future Qiskit starts emitting qubit-less ops in
+    layers, that second assertion fails and the guards become load-bearing.
     """
     from qiskit.circuit.library import GlobalPhaseGate
+    from qiskit.converters import circuit_to_dag
 
     arch = _single_qpu_pair_arch()
     latency = LatencyModel()
@@ -1718,6 +1727,20 @@ def test_estimators_ignore_operations_that_carry_no_qubits() -> None:
     with_phase = QuantumCircuit(arch.n_phys)
     with_phase.append(GlobalPhaseGate(0.25), [], [])
     with_phase.cx(block.compute[0], block.compute[1])
+
+    # the op is in the circuit and in the DAG ...
+    assert [inst.operation.name for inst in with_phase.data] == ["global_phase", "cx"]
+    dag = circuit_to_dag(with_phase)
+    assert [node.op.name for node in dag.op_nodes() if not node.qargs] == [
+        "global_phase"
+    ]
+    # ... but layers() drops it, which is why only the linear estimator sees it
+    assert [
+        node.op.name
+        for layer in dag.layers()
+        for node in layer["graph"].op_nodes()
+        if not node.qargs
+    ] == []
 
     for estimator in (
         estimate_parallel_makespan,
