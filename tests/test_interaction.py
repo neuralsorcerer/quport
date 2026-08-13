@@ -202,3 +202,126 @@ def test_cut_weight_rejects_non_integer_logical_indices() -> None:
         cut_weight({(0, "1"): 1.0}, [0, 1])
 
     assert cut_weight({(0, 1): 1.0}, [0, 1]) == 1.0
+
+
+def test_temporal_weights_converge_to_the_documented_geometric_total() -> None:
+    """README quantifies how much of a circuit the decay actually looks at.
+
+    It states the total weight converges to 1/(1-gamma) -- 50 for the default
+    gamma=0.98 -- with 99% of it inside the first ~228 two-qubit operations.
+    That is the argument for why the partitioner is driven by a prefix, so it
+    should fail loudly if the weighting scheme changes.
+    """
+    from qiskit import QuantumCircuit
+
+    from quport.interaction import extract_temporal_twoq_weights
+
+    gamma = 0.98
+    assert 1.0 / (1.0 - gamma) == pytest.approx(50.0)
+
+    def weight_after(n_ops: int) -> float:
+        circuit = QuantumCircuit(2)
+        for _ in range(n_ops):
+            circuit.cx(0, 1)
+        return extract_temporal_twoq_weights(circuit, decay=gamma)[(0, 1)]
+
+    # 228 is the first count reaching 99% of the limit; 227 falls just short
+    assert weight_after(228) >= 0.99 * 50.0
+    assert weight_after(227) < 0.99 * 50.0
+
+    # and the total is bounded by the limit no matter how long the circuit runs
+    assert weight_after(2000) < 50.0
+    assert weight_after(2000) == pytest.approx(50.0, rel=1e-12)
+
+
+def test_temporal_weight_underflows_to_zero_at_the_documented_step() -> None:
+    """README names the exact step where gamma**t stops being representable.
+
+    Past it an edge contributes exactly zero and drops out of the interaction
+    graph, which is a real modelling limit rather than a rounding detail.
+    """
+    from qiskit import QuantumCircuit
+
+    from quport.interaction import extract_temporal_twoq_weights
+
+    gamma = 0.98
+    assert gamma**36_882 > 0.0
+    assert gamma**36_883 == 0.0
+
+    # the behavioural consequence, with a decay that underflows immediately
+    tiny = 1e-200
+    assert tiny**2 == 0.0
+
+    circuit = QuantumCircuit(4)
+    circuit.cx(0, 1)
+    circuit.cx(0, 1)
+    circuit.cx(2, 3)  # third two-qubit op: gamma**2 has already underflowed
+
+    weights = extract_temporal_twoq_weights(circuit, decay=tiny)
+
+    assert weights[(2, 3)] == 0.0
+    assert weights[(0, 1)] > 0.0
+
+
+def test_every_temporal_decay_default_is_the_documented_one() -> None:
+    """The README's decay figures are quoted "for the default gamma=0.98".
+
+    That default is written out in four independent places -- the extractor, the
+    distributed compiler, the CLI option, and the tpccap_sa branch of the mapping
+    pipeline. If one drifts, the documented convergence and underflow figures
+    become true for some entry points and false for others, which is exactly the
+    kind of inconsistency the decay table in the README warns about.
+    """
+    import inspect
+
+    from quport.architecture import MultiQPUConfig
+    from quport.cli import app
+    from quport.compiler import compile_distributed
+    from quport.interaction import extract_temporal_twoq_weights
+    from quport.pipeline import map_and_transpile, random_benchmark_circuit
+
+    documented = 0.98
+
+    assert (
+        inspect.signature(extract_temporal_twoq_weights).parameters["decay"].default
+        == documented
+    )
+    assert (
+        inspect.signature(compile_distributed).parameters["temporal_decay"].default
+        == documented
+    )
+
+    cli_defaults = []
+    for command in app.registered_commands:
+        callback = command.callback
+        assert callback is not None
+        parameter = inspect.signature(callback).parameters.get("temporal_decay")
+        if parameter is not None:
+            option = parameter.default
+            cli_defaults.append(getattr(option, "default", option))
+    assert cli_defaults, "expected at least one CLI command to expose --temporal-decay"
+    assert all(value == documented for value in cli_defaults), cli_defaults
+
+    # the pipeline's tpccap_sa branch hardcodes the same value; pin it by behaviour
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        optimization_level=0,
+    )
+    # depth 12 / seed 3 is chosen so that even a small drift in the decay changes
+    # the partition; a shallower circuit gives the same answer for 0.95 and 0.98
+    # and would let the literal move without failing anything.
+    circuit = random_benchmark_circuit(n_logical=6, depth=12, seed=3)
+
+    implicit = map_and_transpile(circuit, cfg, seed=3, strategy="tpccap_sa")
+    explicit = map_and_transpile(
+        circuit, cfg, seed=3, strategy="tpccap_sa", temporal_decay=documented
+    )
+    nearby = map_and_transpile(
+        circuit, cfg, seed=3, strategy="tpccap_sa", temporal_decay=0.95
+    )
+
+    assert implicit.partition == explicit.partition
+    # guard against the comparison being vacuous
+    assert implicit.partition != nearby.partition
