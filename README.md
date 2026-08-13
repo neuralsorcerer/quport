@@ -719,6 +719,16 @@ quport sweep \
   --plot sweep.png
 ```
 
+### Inspect the inter-QPU topology
+
+```bash
+quport topology-info --config quport_config.json
+```
+
+Prints structural metrics for the configured interconnect (degree, diameter,
+average shortest path, connectivity) without compiling anything, which is a cheap
+way to compare candidate topologies before a sweep.
+
 ### Estimate a schedule
 
 ```bash

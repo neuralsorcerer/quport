@@ -117,3 +117,103 @@ def test_api_reference_signatures_match_the_code() -> None:
             mismatches.append(f"{name}: documented {doc_params} != actual {actual}")
 
     assert not mismatches, "\n".join(mismatches)
+
+
+_DOCS_DIR = _API_REFERENCE.parent
+_CONFIGURATION = _DOCS_DIR / "configuration.md"
+_CLI_REFERENCE = _DOCS_DIR / "cli.md"
+_README = _DOCS_DIR.parent / "README.md"
+
+_TABLE_ROW = re.compile(r"^\|\s*`([A-Za-z_]\w*)`\s*\|\s*`([^`]*)`\s*\|")
+
+
+def _documented_defaults(path: Path, cls: type) -> dict[str, str]:
+    """Collect `| name | default |` rows naming a field of `cls`."""
+    import dataclasses
+
+    field_names = {field.name for field in dataclasses.fields(cls)}
+    found: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        match = _TABLE_ROW.match(line)
+        if match and match.group(1) in field_names:
+            found[match.group(1)] = match.group(2)
+    return found
+
+
+def _actual_default(cls: type, name: str) -> Any:
+    import dataclasses
+
+    for field in dataclasses.fields(cls):
+        if field.name == name:
+            if field.default is not dataclasses.MISSING:
+                return field.default
+            if field.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+                return field.default_factory()  # type: ignore[misc]
+    raise AssertionError(f"{cls.__name__} has no field {name}")
+
+
+@pytest.mark.skipif(
+    not _CONFIGURATION.is_file(), reason="docs/ is not present in this checkout"
+)
+@pytest.mark.parametrize("cls_name", ["MultiQPUConfig", "LatencyModel"])
+def test_documented_defaults_match_the_dataclasses(cls_name: str) -> None:
+    """Every default printed in the configuration reference must be the real one.
+
+    These tables are what a reader trusts when reproducing a benchmark, and a
+    changed default leaves them wrong with nothing failing.
+    """
+    import ast
+    import dataclasses
+
+    cls = getattr(quport.config, cls_name)
+    documented = _documented_defaults(_CONFIGURATION, cls)
+
+    field_names = {field.name for field in dataclasses.fields(cls)}
+    assert (
+        set(documented) == field_names
+    ), f"{cls_name}: documented {sorted(documented)} != fields {sorted(field_names)}"
+
+    mismatches: list[str] = []
+    for name, text in sorted(documented.items()):
+        actual = _actual_default(cls, name)
+        try:
+            parsed = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            parsed = text
+        if isinstance(actual, tuple) and isinstance(parsed, tuple):
+            equal = list(parsed) == list(actual)
+        else:
+            equal = parsed == actual
+        if not equal:
+            mismatches.append(f"{name}: documented {text!r} != actual {actual!r}")
+
+    assert not mismatches, "\n".join(mismatches)
+
+
+def _registered_cli_commands() -> set[str]:
+    from quport.cli import app
+
+    names = set()
+    for command in app.registered_commands:
+        callback = command.callback
+        assert callback is not None
+        names.add(command.name or callback.__name__.replace("_", "-"))
+    return names
+
+
+@pytest.mark.skipif(
+    not _CLI_REFERENCE.is_file(), reason="docs/ is not present in this checkout"
+)
+def test_every_cli_command_is_documented() -> None:
+    """A command nobody documents is a command nobody finds."""
+    commands = _registered_cli_commands()
+    assert len(commands) >= 5, "expected the CLI to register several commands"
+
+    cli_text = _CLI_REFERENCE.read_text(encoding="utf-8")
+    undocumented = sorted(c for c in commands if f"quport {c}" not in cli_text)
+    assert not undocumented, f"docs/cli.md omits: {undocumented}"
+
+    if _README.is_file():
+        readme = _README.read_text(encoding="utf-8")
+        missing = sorted(c for c in commands if f"quport {c}" not in readme)
+        assert not missing, f"README.md omits: {missing}"
