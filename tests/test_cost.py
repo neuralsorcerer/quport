@@ -174,3 +174,23 @@ def test_nonnegative_finite_float_validator_accepts_finite_values() -> None:
 
     assert validate_nonnegative_finite_float(0.0, label="x") == 0.0
     assert validate_nonnegative_finite_float(2, label="x") == 2.0
+
+
+def test_swap_is_charged_as_an_increment_over_the_two_qubit_cost() -> None:
+    """A SWAP costs `twoq + swap`, not `swap` -- the documented, deliberate reading.
+
+    `compute_metrics` counts a SWAP in both `swaps` and `n_2q`, and `estimate_cost`
+    multiplies each by its own latency, so `LatencyModel.swap` is an increment over
+    the base two-qubit cost. docs/api-references.md states this; nothing tested it,
+    so the two definitions could drift apart silently and move every published cost.
+    """
+    model = LatencyModel()
+    swap_metrics = CircuitMetrics(swaps=1, depth=1, size=1, n_1q=0, n_2q=1, remote_2q=0)
+    cx_metrics = CircuitMetrics(swaps=0, depth=1, size=1, n_1q=0, n_2q=1, remote_2q=0)
+
+    swap_cost = estimate_cost(swap_metrics, model)
+    cx_cost = estimate_cost(cx_metrics, model)
+
+    assert swap_cost.local == pytest.approx(model.twoq + model.swap)
+    assert cx_cost.local == pytest.approx(model.twoq)
+    assert swap_cost.local - cx_cost.local == pytest.approx(model.swap)
