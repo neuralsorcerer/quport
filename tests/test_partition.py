@@ -1432,3 +1432,83 @@ def test_clustering_skips_edges_inside_an_existing_cluster() -> None:
     assert len(part) == 3
     assert len(set(part)) == 1
     assert all(0 <= qpu < 2 for qpu in part)
+
+
+def _tpccap_objective(part, weights, n_qpus, comm_ports, sp, w_cong):
+    from quport.partition import _objective_tpccap
+
+    objective, _diagnostics = _objective_tpccap(
+        weights=weights,
+        part=list(part),
+        n_qpus=n_qpus,
+        comm_ports_per_qpu=comm_ports,
+        sp=sp,
+        w_dist=1.0,
+        w_port=5.0,
+        w_cong=w_cong,
+        congestion_routing="ecmp",
+    )
+    return objective
+
+
+def test_annealing_optimizes_a_heavier_congestion_weight_than_its_seed() -> None:
+    """TPCCAP-SA seeds at `w_cong=0.05` and then anneals at `w_cong=0.2`.
+
+    Both are bare literals inside `tpccap_sa_partition`, four times apart, and the
+    function exposes no `w_cong` knob. The consequence is not a bug in the
+    annealing -- it returns the best state under its own objective and never loses
+    ground there -- but it does mean the refinement can hand back a partition that
+    scores worse than its own seed under TPCCAP's weighting.
+
+    This pins both halves. If either literal moves, one of these fails, so the
+    asymmetry can only change deliberately.
+    """
+    # a 3-QPU ring: adjacency [[1, 2], [0, 2], [0, 1]] with 4 compute + 2 comm each
+    sp = all_pairs_shortest_paths([[1, 2], [0, 2], [0, 1]])
+    capacity = 6
+    ports = 2
+
+    weights = {
+        (0, 3): 3.0,
+        (0, 5): 3.0,
+        (0, 7): 2.0,
+        (0, 8): 3.0,
+        (0, 9): 1.0,
+        (1, 3): 5.0,
+        (1, 7): 1.0,
+        (2, 3): 1.0,
+        (2, 4): 3.0,
+        (2, 8): 5.0,
+        (2, 9): 5.0,
+        (3, 5): 4.0,
+        (4, 6): 3.0,
+        (4, 8): 5.0,
+        (4, 9): 2.0,
+        (5, 7): 1.0,
+        (6, 8): 3.0,
+        (6, 9): 1.0,
+        (7, 8): 5.0,
+        (7, 9): 5.0,
+        (8, 9): 3.0,
+    }
+
+    seed_part = tpccap_partition(
+        n=10,
+        weights=weights,
+        n_qpus=3,
+        capacity=capacity,
+        comm_ports_per_qpu=ports,
+        sp=sp,
+        seed=0,
+    )[0].part
+    annealed = tpccap_sa_partition(
+        10, weights, 3, capacity, ports, sp, seed=0, steps=600
+    )[0].part
+
+    def score(part, w_cong):
+        return _tpccap_objective(part, weights, 3, ports, sp, w_cong)
+
+    # under the weighting the annealing actually optimizes, it improves
+    assert score(annealed, 0.2) < score(seed_part, 0.2)
+    # under the weighting its seed optimized, this instance comes out worse
+    assert score(annealed, 0.05) > score(seed_part, 0.05)
