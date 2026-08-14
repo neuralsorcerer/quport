@@ -1343,3 +1343,55 @@ def test_grouping_rejects_mismatched_qubit_and_qpu_lengths() -> None:
 
     with pytest.raises(ValueError, match="same length"):
         _group_qubits_by_qpu_in_operand_order([0, 1, 2], [0, 1])
+
+
+@pytest.mark.parametrize(
+    "inter_topology", ["switch", "mesh", "ring", "degree_d", "clos", "fat_tree"]
+)
+@pytest.mark.parametrize("strategy", ["balanced", "tpccap"])
+def test_local_circuits_only_ever_touch_their_own_qpus_qubits(
+    inter_topology: str, strategy: str
+) -> None:
+    """The headline guarantee, asserted on the emitted program rather than the setup.
+
+    `test_compile_distributed_routes_only_on_per_qpu_coupling_maps` pins the
+    structural cause -- SABRE only ever sees one QPU's edges. This pins the effect,
+    so a violation arriving by any other route is caught too: every instruction in
+    local circuit q must touch only q's physical qubits, and every RemoteOp must
+    name two genuinely different QPUs.
+    """
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=2,
+        intra_topology="line",
+        inter_topology=inter_topology,
+        optimization_level=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    circuit = random_benchmark_circuit(n_logical=8, depth=8, seed=0)
+
+    program = compile_distributed(circuit, cfg, seed=0, strategy=strategy).program
+
+    owned = {
+        qpu: set(arch.block_of_qpu(qpu).compute) | set(arch.block_of_qpu(qpu).comm)
+        for qpu in range(cfg.n_qpus)
+    }
+
+    for qpu, local in program.local_circuits.items():
+        position = {qubit: index for index, qubit in enumerate(local.qubits)}
+        for instruction in local.data:
+            touched = {position[qubit] for qubit in instruction.qubits}
+            assert touched <= owned[qpu], (
+                f"local circuit {qpu} touches {sorted(touched - owned[qpu])}, "
+                f"which it does not own"
+            )
+
+    assert program.remote_ops, "expected this circuit to need remote operations"
+    for remote in program.remote_ops:
+        assert remote.qpu0 != remote.qpu1
+        assert remote.q0_phys in owned[remote.qpu0]
+        assert remote.q1_phys in owned[remote.qpu1]
