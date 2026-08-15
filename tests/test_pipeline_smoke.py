@@ -152,7 +152,7 @@ def test_sweep_writes_header_when_all_configs_are_skipped(tmp_path: Path) -> Non
 
     assert out.read_text(encoding="utf-8") == (
         "intra,inter,ports,method,swaps_mean,remote_2q_mean,depth_mean,"
-        "cost_mean,transpile_time_mean\n"
+        "cost_mean,cost_median,transpile_time_mean\n"
     )
 
 
@@ -474,8 +474,8 @@ def test_sweep_supports_cluster_strategy_with_zero_trials(tmp_path: Path) -> Non
 
     assert out.read_text(encoding="utf-8") == (
         "intra,inter,ports,method,swaps_mean,remote_2q_mean,depth_mean,"
-        "cost_mean,transpile_time_mean\n"
-        "clique,switch,0.0,4.0,0.0,0.0,0.0,0.0,0.0\n"
+        "cost_mean,cost_median,transpile_time_mean\n"
+        "clique,switch,0.0,4.0,0.0,0.0,0.0,0.0,0.0,0.0\n"
     )
 
 
@@ -623,6 +623,9 @@ def test_sweep_means_are_averaged_over_that_strategy_only(tmp_path: Path) -> Non
             expected = statistics.mean(float(r[trial_key]) for r in own)
             assert float(row[csv_key]) == pytest.approx(expected)
 
+        expected_median = statistics.median(float(r["cost_total"]) for r in own)
+        assert float(row["cost_median"]) == pytest.approx(expected_median)
+
 
 def _tpccap_partition_for(strategy: str, temporal_decay: float | None) -> list[int]:
     from quport.pipeline import map_and_transpile, random_benchmark_circuit
@@ -742,3 +745,48 @@ def test_temporal_decay_of_one_matches_uniform_interaction_counts() -> None:
     }
 
     assert uniform == decayed
+
+
+def test_sweep_cost_median_is_not_just_a_copy_of_the_mean(tmp_path: Path) -> None:
+    """The median column earns its place only if it can disagree with the mean.
+
+    Estimated cost is heavily skewed across random circuits, which is the whole
+    reason both are reported: a few hard instances can pull the mean past the
+    median far enough to reverse which strategy looks better. Pin that the column
+    is a real median rather than a duplicate.
+    """
+    import csv
+    import statistics
+
+    from quport.pipeline import sweep_topologies
+
+    out = tmp_path / "sweep.csv"
+    sweep_topologies(
+        n_logical=6,
+        depth=6,
+        trials=5,
+        seed=0,
+        out_csv=str(out),
+        intra_topologies=("clique",),
+        inter_topologies=("switch",),
+        comm_ports=(1,),
+        compute_per_qpu=3,
+        n_qpus=3,
+        strategies=("baseline", "tpccap"),
+    )
+
+    with out.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert rows
+    assert all("cost_median" in row for row in rows)
+    # with an odd trial count the median is one of the observed values
+    assert any(
+        float(row["cost_median"]) != pytest.approx(float(row["cost_mean"]))
+        for row in rows
+    ), "expected at least one skewed aggregate; median never differed from mean"
+
+    # and it really is the median of a skewed sample, not a second mean
+    sample = [1.0, 1.0, 1.0, 1.0, 100.0]
+    assert statistics.median(sample) == 1.0
+    assert statistics.mean(sample) == 20.8

@@ -967,7 +967,15 @@ rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
 | `remote_2q_mean` | Mean remote two-qubit count. |
 | `depth_mean` | Mean depth. |
 | `cost_mean` | Mean total estimated cost. |
+| `cost_median` | Median total estimated cost. |
 | `transpile_time_mean` | Mean transpilation time. |
+
+Cost is reported both ways because it is heavily skewed across random circuits.
+Comparing two strategies instance by instance, the per-instance ratio spans roughly
+$-50\%$ to $+200\%$, so a handful of hard instances can move the mean far enough to
+reverse which strategy looks better while the median points the other way. Quote
+whichever you prefer, but say which one, and do not read a small difference in
+`cost_mean` as a ranking on its own.
 
 ---
 

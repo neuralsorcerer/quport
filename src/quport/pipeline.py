@@ -588,6 +588,22 @@ def sweep_topologies(
                     def mean(k: str) -> float:
                         return sum(float(r[k]) for r in rs) / max(1, len(rs))
 
+                    def median(k: str) -> float:
+                        """Median alongside the mean, because cost is heavily skewed.
+
+                        Across random circuits the per-instance cost ratio between two
+                        strategies spans roughly -50% to +200%, so a handful of hard
+                        instances can move the mean far enough to reverse which
+                        strategy looks better. Reporting only the mean hides that.
+                        """
+                        values = sorted(float(r[k]) for r in rs)
+                        if not values:
+                            return 0.0
+                        mid = len(values) // 2
+                        if len(values) % 2:
+                            return values[mid]
+                        return (values[mid - 1] + values[mid]) / 2.0
+
                     return {
                         "intra": intra_id,
                         "inter": inter_id,
@@ -597,6 +613,7 @@ def sweep_topologies(
                         "remote_2q_mean": mean("remote_2q"),
                         "depth_mean": mean("depth"),
                         "cost_mean": mean("cost_total"),
+                        "cost_median": median("cost_total"),
                         "transpile_time_mean": mean("transpile_time_s"),
                     }
 
@@ -612,6 +629,7 @@ def sweep_topologies(
         "remote_2q_mean",
         "depth_mean",
         "cost_mean",
+        "cost_median",
         "transpile_time_mean",
     ]
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
