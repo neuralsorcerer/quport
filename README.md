@@ -364,6 +364,20 @@ $$
 
 where $T$ is a temperature that cools over iterations. This helps escape local minima created by greedy or local-search decisions.
 
+The objective $J$ is not identical in the two stages. The seed is built with
+`w_cong = 0.05`, matching `tpccap`, while the annealing optimizes
+`anneal_w_cong = 0.2` — four times the congestion penalty. The annealing returns the
+best state it saw under *its* objective, so it never loses ground there, but the
+partition it hands back can score worse than its own seed when measured with the
+seed's weighting; on random instances that happens for roughly $40\%$ of them. Both
+are parameters of `tpccap_sa_partition`, and `anneal_w_cong=None` anneals on exactly
+the objective the seed was built for. The defaults are the values every published
+QuPort result was produced with.
+
+Together with the interaction-weight difference described above, this is the second
+reason a `tpccap` versus `tpccap_sa` comparison has to state its configuration: the
+two strategies can otherwise be ranked on different scales.
+
 ---
 
 ## Layout and communication-port placement
