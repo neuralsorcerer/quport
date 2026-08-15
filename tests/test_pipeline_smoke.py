@@ -803,9 +803,7 @@ def test_sweep_reports_a_real_cost_median(tmp_path: Path, trials: int) -> None:
     disagreed = False
     for strategy in strategies:
         row = next(
-            r
-            for r in summary
-            if float(r["method"]) == _BENCHMARK_METHOD_IDS[strategy]
+            r for r in summary if float(r["method"]) == _BENCHMARK_METHOD_IDS[strategy]
         )
         own = [float(r["cost_total"]) for r in rows if r["strategy"] == strategy]
         assert len(own) == trials
