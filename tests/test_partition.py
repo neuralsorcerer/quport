@@ -1512,3 +1512,85 @@ def test_annealing_optimizes_a_heavier_congestion_weight_than_its_seed() -> None
     assert score(annealed, 0.2) < score(seed_part, 0.2)
     # under the weighting its seed optimized, this instance comes out worse
     assert score(annealed, 0.05) > score(seed_part, 0.05)
+
+
+def test_annealing_congestion_weight_is_a_parameter_with_a_default_preserving_value() -> (
+    None
+):
+    """The two-objective asymmetry is a knob now, not a pair of hidden literals.
+
+    Defaults must reproduce the historical behaviour exactly, so no published number
+    moves; `anneal_w_cong=None` must give the objective the docstring originally
+    claimed, where the annealing optimizes exactly what its seed was built for.
+    """
+    sp = all_pairs_shortest_paths([[1, 2], [0, 2], [0, 1]])
+    weights = {
+        (0, 3): 3.0,
+        (0, 5): 3.0,
+        (0, 7): 2.0,
+        (0, 8): 3.0,
+        (0, 9): 1.0,
+        (1, 3): 5.0,
+        (1, 7): 1.0,
+        (2, 3): 1.0,
+        (2, 4): 3.0,
+        (2, 8): 5.0,
+        (2, 9): 5.0,
+        (3, 5): 4.0,
+        (4, 6): 3.0,
+        (4, 8): 5.0,
+        (4, 9): 2.0,
+        (5, 7): 1.0,
+        (6, 8): 3.0,
+        (6, 9): 1.0,
+        (7, 8): 5.0,
+        (7, 9): 5.0,
+        (8, 9): 3.0,
+    }
+
+    def run(**kwargs: object) -> list[int]:
+        result, _diagnostics, _anneal = tpccap_sa_partition(
+            10, weights, 3, 6, 2, sp, seed=0, steps=600, **kwargs  # type: ignore[arg-type]
+        )
+        return result.part
+
+    default = run()
+    explicit = run(w_cong=0.05, anneal_w_cong=0.2)
+    assert default == explicit, "defaults must reproduce the historical weighting"
+
+    # None means "anneal on the seed's own objective"
+    matched = run(anneal_w_cong=None)
+    same_by_value = run(anneal_w_cong=0.05)
+    assert matched == same_by_value
+
+    seed_part = tpccap_partition(
+        n=10,
+        weights=weights,
+        n_qpus=3,
+        capacity=6,
+        comm_ports_per_qpu=2,
+        sp=sp,
+        seed=0,
+    )[0].part
+
+    def score(part: list[int], w_cong: float) -> float:
+        return _tpccap_objective(part, weights, 3, 2, sp, w_cong)
+
+    # annealing on the seed's objective cannot come out behind the seed
+    assert score(matched, 0.05) <= score(seed_part, 0.05)
+    # while the shipped default can, and does here
+    assert score(default, 0.05) > score(seed_part, 0.05)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("w_dist", -1.0), ("w_port", -1.0), ("w_cong", -1.0), ("anneal_w_cong", -1.0)],
+)
+def test_tpccap_sa_rejects_negative_objective_weights(field: str, value: float) -> None:
+    """New parameters are validated like every other public input."""
+    sp = all_pairs_shortest_paths([[1], [0]])
+
+    with pytest.raises(ValueError, match=f"{field} must be non-negative"):
+        tpccap_sa_partition(
+            2, {(0, 1): 1.0}, 2, 2, 1, sp, seed=0, steps=1, **{field: value}
+        )

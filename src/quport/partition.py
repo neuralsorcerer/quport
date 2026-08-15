@@ -892,6 +892,12 @@ def tpccap_sa_partition(
     comm_ports_per_qpu: int,
     sp: QpuShortestPaths,
     seed: int | None = None,
+    # objective weights for the TPCCAP seed (research knobs)
+    w_dist: float = 1.0,
+    w_port: float = 5.0,
+    w_cong: float = 0.05,
+    # congestion weight the annealing stage optimizes; None means "same as w_cong"
+    anneal_w_cong: float | None = 0.2,
     # annealing knobs
     steps: int = 2000,
     temp0: float = 1.0,
@@ -913,8 +919,23 @@ def tpccap_sa_partition(
 
     Objective
     ---------
-    Uses the same objective as TPCCAP (distance + port overflow + congestion), with
-    soft penalties for capacity overflow (kept very large so feasible solutions dominate).
+    Same three terms as TPCCAP (distance + port overflow + congestion), with soft
+    penalties for capacity overflow (kept very large so feasible solutions dominate)
+    -- but by default **not the same weighting**. The seed is built with ``w_cong``
+    (default ``0.05``, matching :func:`tpccap_partition`); the annealing stage then
+    optimizes ``anneal_w_cong`` (default ``0.2``), four times the congestion penalty.
+    Pass ``anneal_w_cong=None`` to anneal on exactly the objective the seed was built
+    for.
+
+    That asymmetry decides how results compare. Annealing returns the best state it
+    saw under its own objective, so it never loses ground there, but the partition it
+    returns can score worse than its seed when measured with the seed's weighting --
+    on random instances that happens for roughly 40% of them. Any comparison between
+    ``tpccap`` and ``tpccap_sa`` therefore has to say which weighting it scored with,
+    or the two are being ranked on different scales.
+
+    The defaults reproduce the historical behaviour exactly, so existing benchmark
+    numbers are unaffected by exposing these as parameters.
 
     Notes
     -----
@@ -934,6 +955,16 @@ def tpccap_sa_partition(
         p_swap=p_swap,
     )
     _validate_tpccap_parameters(comm_ports_per_qpu=comm_ports_per_qpu)
+    w_dist, w_port, w_cong = _validate_tpccap_objective_parameters(
+        w_dist=w_dist,
+        w_port=w_port,
+        w_cong=w_cong,
+        congestion_routing="ecmp",
+    )
+    if anneal_w_cong is not None:
+        anneal_w_cong = _validate_nonnegative_float(
+            anneal_w_cong, label="anneal_w_cong"
+        )
     _validate_sp_dimensions(sp, n_qpus)
     normalized_weights = _validate_and_normalize_partition_inputs(
         n=n,
@@ -956,9 +987,9 @@ def tpccap_sa_partition(
         comm_ports_per_qpu=comm_ports_per_qpu,
         sp=sp,
         seed=seed,
-        w_dist=1.0,
-        w_port=5.0,
-        w_cong=0.05,
+        w_dist=w_dist,
+        w_port=w_port,
+        w_cong=w_cong,
         max_passes=6,
         max_candidate_qpus=4,
         congestion_routing="ecmp",
@@ -967,6 +998,8 @@ def tpccap_sa_partition(
     part = list(pres.part)
     loads = list(pres.loads)
 
+    anneal_cong = w_cong if anneal_w_cong is None else anneal_w_cong
+
     def objective(part_: list[int]) -> tuple[float, PartitionDiagnostics]:
         return _objective_tpccap(
             weights=normalized_weights,
@@ -974,9 +1007,9 @@ def tpccap_sa_partition(
             n_qpus=n_qpus,
             comm_ports_per_qpu=comm_ports_per_qpu,
             sp=sp,
-            w_dist=1.0,
-            w_port=5.0,
-            w_cong=0.2,
+            w_dist=w_dist,
+            w_port=w_port,
+            w_cong=anneal_cong,
             congestion_routing="ecmp",
         )
 
