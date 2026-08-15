@@ -747,46 +747,71 @@ def test_temporal_decay_of_one_matches_uniform_interaction_counts() -> None:
     assert uniform == decayed
 
 
-def test_sweep_cost_median_is_not_just_a_copy_of_the_mean(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trials", [4, 5])
+def test_sweep_reports_a_real_cost_median(tmp_path: Path, trials: int) -> None:
     """The median column earns its place only if it can disagree with the mean.
 
-    Estimated cost is heavily skewed across random circuits, which is the whole
-    reason both are reported: a few hard instances can pull the mean past the
-    median far enough to reverse which strategy looks better. Pin that the column
-    is a real median rather than a duplicate.
+    Estimated cost is heavily skewed across random circuits, which is why both are
+    reported: a few hard instances can pull the mean past the median far enough to
+    reverse which strategy looks better.
+
+    Both parities are covered because they take different branches -- an even count
+    averages the two middle values -- and the comparison is against
+    `statistics.median`, which also sorts, so an unsorted implementation fails here
+    rather than only on inputs that happen to arrive ordered.
     """
     import csv
     import statistics
 
-    from quport.pipeline import sweep_topologies
+    from quport.config import LatencyModel
+    from quport.pipeline import (
+        _BENCHMARK_METHOD_IDS,
+        benchmark_random_circuits,
+        sweep_topologies,
+    )
 
     out = tmp_path / "sweep.csv"
+    strategies = ("baseline", "tpccap")
+    kwargs = dict(n_logical=6, depth=6, trials=trials, seed=0)
+
     sweep_topologies(
-        n_logical=6,
-        depth=6,
-        trials=5,
-        seed=0,
         out_csv=str(out),
         intra_topologies=("clique",),
         inter_topologies=("switch",),
         comm_ports=(1,),
         compute_per_qpu=3,
         n_qpus=3,
-        strategies=("baseline", "tpccap"),
+        strategies=strategies,
+        **kwargs,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        inter_topology="switch",
+    )
+    rows = benchmark_random_circuits(
+        cfg, latency=LatencyModel(), strategies=strategies, **kwargs
     )
 
     with out.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        summary = list(csv.DictReader(handle))
+    assert len(summary) == len(strategies)
 
-    assert rows
-    assert all("cost_median" in row for row in rows)
-    # with an odd trial count the median is one of the observed values
-    assert any(
-        float(row["cost_median"]) != pytest.approx(float(row["cost_mean"]))
-        for row in rows
-    ), "expected at least one skewed aggregate; median never differed from mean"
+    disagreed = False
+    for strategy in strategies:
+        row = next(
+            r
+            for r in summary
+            if float(r["method"]) == _BENCHMARK_METHOD_IDS[strategy]
+        )
+        own = [float(r["cost_total"]) for r in rows if r["strategy"] == strategy]
+        assert len(own) == trials
+        assert float(row["cost_median"]) == pytest.approx(statistics.median(own))
+        assert float(row["cost_mean"]) == pytest.approx(statistics.mean(own))
+        if float(row["cost_median"]) != pytest.approx(float(row["cost_mean"])):
+            disagreed = True
 
-    # and it really is the median of a skewed sample, not a second mean
-    sample = [1.0, 1.0, 1.0, 1.0, 100.0]
-    assert statistics.median(sample) == 1.0
-    assert statistics.mean(sample) == 20.8
+    assert disagreed, "expected the median and mean to differ on at least one row"
