@@ -19,4 +19,4 @@ identifiers:
     value: 10.48550/arXiv.2605.12583
 repository-code: 'https://github.com/neuralsorcerer/quport'
 repository: 'https://arxiv.org/abs/2605.12583'
-license: MIT
+license: Apache-2.0

@@ -68,7 +68,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Distributed compilation into per-QPU OpenQASM 3 programs, remote-operation JSON, and schedule JSON.
 - Schedule estimation under QPU-port, link-capacity, network-hop, switch-pair, and switch-reconfiguration constraints.
 - Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, and makespan.
-- CLI commands for configuration generation, mapping, benchmarking, topology sweeps, schedule estimation, splitting, and distributed compilation.
+- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
 
 ---
@@ -198,10 +198,23 @@ Which pipelines apply temporal weighting is not uniform, and it matters when com
 
 | entry point | `tpccap` | `tpccap_sa` |
 |---|---|---|
-| `compile_distributed` | temporal, via the `temporal_decay` argument | temporal, via the `temporal_decay` argument |
-| `map_and_transpile` | uniform counts | temporal with $\gamma$ fixed at $0.98$ |
+| `compile_distributed` | `temporal_decay`, default $\gamma=0.98$ | `temporal_decay`, default $\gamma=0.98$ |
+| `map_and_transpile` | `temporal_decay`, default uniform counts | `temporal_decay`, default $\gamma=0.98$ |
 
-`map_and_transpile` has no `temporal_decay` argument, so under that entry point `tpccap` and `tpccap_sa` differ in both the search procedure and the interaction weights. Because `benchmark_random_circuits` and `sweep_topologies` both call `map_and_transpile`, the `method=2` and `method=3` rows they emit are not an ablation of the annealing alone. On random circuits most of the gap between those rows comes from the weighting rather than the annealing, and `tpccap_sa` can score worse on uniform cut precisely because it is optimizing an early-weighted objective. Use `compile_distributed`, which applies the same weighting to both strategies, when the annealing itself is what you want to measure.
+Both entry points accept `temporal_decay`, and both ignore it for `balanced` and
+`cluster`, which always partition on uniform interaction counts. What differs is
+the default: `compile_distributed` applies $\gamma=0.98$ to either topology-aware
+strategy, while `map_and_transpile` leaves `tpccap` on uniform counts and puts
+`tpccap_sa` on $\gamma=0.98$.
+
+That default asymmetry matters when reading benchmark output. `benchmark_random_circuits`
+and `sweep_topologies` both call `map_and_transpile` without a decay, so their `method=2`
+and `method=3` rows differ in the interaction weights as well as the search procedure and
+are not an ablation of the annealing alone. On random circuits much of the gap between
+those rows comes from the weighting rather than the annealing, and `tpccap_sa` can score
+worse on uniform cut precisely because it is optimizing an early-weighted objective. To
+measure the annealing itself, pass the same `temporal_decay` to both strategies, or use
+`compile_distributed`, whose defaults already match.
 
 ### Partition capacity
 
@@ -414,6 +427,12 @@ $$
 d_i^{\mathrm{remote}}=\left|\{\pi(j):w_{ij}>0,\pi(j)\ne\pi(i)\}\right|.
 $$
 
+The diversity term is applied as a penalty against destinations already covered by
+ports chosen earlier in the same QPU, so it has nothing to act on until the second
+port. `tpccap` and `tpccap_sa` request `diverse` under both entry points, but at the
+default `comm_qubits_per_qpu` of $1$ it selects exactly what `topk` would; give each
+QPU at least two ports before attributing any result to port diversity.
+
 The final layout maps selected boundary qubits to communication physical qubits first, then maps remaining qubits to compute qubits and any unused communication qubits.
 
 ---
@@ -453,9 +472,10 @@ A remote operation records:
 
 - operation name;
 - global instruction index;
-- physical qubit indices;
-- source/destination QPU ids;
-- local qubits participating in the operation.
+- the two physical qubit indices it acts on;
+- the QPU id owning each of those qubits;
+- gate parameters;
+- classical bit indices the operation reads or writes.
 
 This split makes the boundary explicit: local gates remain in QPU-local programs, while cross-QPU two-qubit gates become remote events handled by orchestration, entanglement generation, teleportation-style protocols, or another execution backend.
 
@@ -1001,7 +1021,9 @@ Install the project and run:
 pytest
 ```
 
-For quiet output using the repository pytest defaults:
+The repository sets `addopts = "-q"` under `[tool.pytest.ini_options]` in
+`pyproject.toml`, so both invocations are quiet and pick up the same settings. The
+module form additionally prepends the current directory to `sys.path`:
 
 ```bash
 python -m pytest
