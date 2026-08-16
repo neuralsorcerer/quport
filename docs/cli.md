@@ -126,6 +126,13 @@ copies per QPU, the port-unconstrained e-bit count, and both the entanglement-aw
 and topology-aware makespans. `--out` writes the full plan, including each block's
 root qubit, host QPU, protocol, and served gate indices.
 
+`--emit-qasm PATH` additionally writes the executable protocol circuit as
+OpenQASM 3, with explicit EPR pairs, mid-circuit measurement, and `if`
+feedforward. `--verify` simulates the unitary form of that circuit and confirms
+it reproduces the mapped circuit, exiting non-zero if it does not; it reports a
+clear error when the architecture has too few comm ports for the plan to be
+runnable, or when the circuit is too wide to simulate.
+
 See [Entanglement model](entanglement.md) for what these numbers mean.
 
 ## `quport compile-dist`

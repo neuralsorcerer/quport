@@ -66,6 +66,8 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Computational-basis diagonality analysis that decides which gates one cat-entanglement can serve.
 - Distributable-packet extraction and the hypergraph $\lambda-1$ e-bit metric.
 - Communication aggregation of cross-QPU gates into cat-entanglement and teleport blocks under a comm-port budget.
+- Executable cat-entangler/cat-disentangler circuit emission, in a unitary form and a mid-circuit-measurement form with classical feedforward.
+- State-vector verification that an emitted communication plan reproduces the circuit it came from.
 - Communication-port placement hints for boundary-heavy and neighbor-diverse logical qubits.
 - Global transpilation with configurable basis gates, layout method, routing method, optimization level, and seed.
 - Distributed compilation into per-QPU OpenQASM 3 programs, remote-operation JSON, and schedule JSON.
@@ -545,6 +547,49 @@ to establish and $\tau_{\mathrm{RTT}}^{\mathrm{eff}}$ to disentangle; a teleport
 pays a second distribution for the return trip. Gates inside a block cost ordinary
 local two-qubit time.
 
+### From plan to circuit, and proving it
+
+A communication plan is only worth as much as the protocol it stands for, so
+QuPort emits that protocol. `build_telegate_circuit` expands every block into the
+gadget it represents. For a block with root $c$ on QPU $A$, cat copy on QPU $B$,
+and EPR halves $a$ and $b$:
+
+```
+entangler:     h(a); cx(a, b); cx(c, a); cx(a, b)
+block gates:   every gate of the block, with c replaced by b
+disentangler:  h(b); cz(b, c)
+```
+
+This is the deferred-measurement form: `measure a` with `if m: x(b)` becomes
+`cx(a, b)`, and an X-basis measurement of $b$ with `if m: z(c)` becomes
+`h(b); cz(b, c)`. Writing it unitarily is what makes it checkable. Tracing the
+algebra through, the entangler leaves
+
+$$
+|\psi\rangle_c|0\rangle_a|0\rangle_b\;\longrightarrow\;
+\Bigl(\sum_z\alpha_z|z\rangle_c|z\rangle_b\Bigr)\otimes|+\rangle_a,
+$$
+
+so $a$ factors out and $b$ carries $c$'s computational-basis label; the
+disentangler returns $b$ to $|+\rangle$ with $c$ holding the result. Both
+ancillas end in a known product state regardless of the data, so an `h` restores
+them to $|0\rangle$ and the next block reuses them — the emitted width tracks
+concurrent cat copies, not block count. Passing `coherent=False` emits the real
+thing instead: mid-circuit measurement, `if` feedforward, and `reset`, which
+exports to OpenQASM 3 and runs on hardware that supports dynamic circuits.
+
+`verify_telegate_equivalence` then runs the unitary form on a pseudo-random
+product input, traces the ancillas out, and compares the reduced state of the
+data qubits against the mapped circuit. Unit fidelity certifies both halves of
+the claim at once: the data are right, **and** the ancillas came back
+unentangled — residual entanglement would show up as a mixed reduced state.
+
+That check is what makes the diagonality rule a tested property rather than a
+stated assumption. Feeding in a hand-built plan that keeps a cat copy live
+across an `X` on its root — precisely what `aggregate_remote_operations` refuses
+to emit — sends the fidelity to zero, not merely down a little
+(`tests/test_protocol.py::test_verification_fails_when_a_block_spans_a_non_diagonal_root_gate`).
+
 ### Measured effect
 
 Reproduce with `n_qpus=4`, `compute_qubits_per_qpu=4`, `comm_qubits_per_qpu=2`,
@@ -979,6 +1024,18 @@ $\lambda-1$ e-bit count, and both makespan figures. `--out` additionally writes 
 full plan, including every block's root, host QPU, protocol, and served gate
 indices.
 
+Two further flags turn the plan into a circuit:
+
+```bash
+quport ebits --n-logical 4 --depth 4 --config small.json --verify --emit-qasm telegate.qasm
+```
+
+`--emit-qasm` writes the executable protocol as OpenQASM 3, with explicit EPR
+pairs, mid-circuit measurement, and `if` feedforward. `--verify` simulates the
+unitary form and confirms it reproduces the mapped circuit; it exits non-zero if
+it does not, and reports a clear error when the architecture has too few comm
+ports for the plan to be runnable at all.
+
 ### Split a mapped global circuit into local circuits and remote operations
 
 ```bash
@@ -1106,6 +1163,33 @@ print(summary.makespan, summary.peak_ports_in_use)
 print(ebit_cost(result.packets, result.partition, cfg.n_qpus))
 print(ebit_cost(build_distributable_packets(qc), [0] * qc.num_qubits, cfg.n_qpus))
 ```
+
+### Emitting and verifying the protocol
+
+```python
+from quport import (
+    MultiQPUArchitecture,
+    build_telegate_circuit,
+    verify_telegate_equivalence,
+)
+from qiskit import qasm3
+
+arch = MultiQPUArchitecture(cfg)
+
+# Unitary form: checkable by simulation.
+program = build_telegate_circuit(result.physical_circuit, arch, result.aggregation)
+print(program.n_ancillas, "protocol ancillas for", program.blocks, "blocks")
+assert verify_telegate_equivalence(result.physical_circuit, arch, result.aggregation)
+
+# Executable form: real measurement and feedforward, exportable to OpenQASM 3.
+runnable = build_telegate_circuit(
+    result.physical_circuit, arch, result.aggregation, coherent=False
+)
+qasm3.dumps(runnable.circuit)
+```
+
+Verification is a state-vector simulation, so keep the circuit small — it is
+refused above 24 qubits.
 
 ### Custom architecture inspection
 
@@ -1312,7 +1396,8 @@ quport --help
 - Diagonality analysis is conservative: an operation QuPort cannot prove diagonal closes the packet, which over-counts EPR pairs rather than claiming a cat copy that would not survive.
 - Each gate is charged to exactly one packet root, so the e-bit count is exact for that assignment and an upper bound over all assignments of symmetric gates.
 - Teleport blocks are not merged: every non-diagonal cross-QPU gate pays its own round trip of two e-bits.
-- Aggregation and entanglement scheduling describe a communication plan; QuPort does not emit the cat-entangler and cat-disentangler circuits themselves.
+- Emitted protocol circuits expand cat blocks in full; teleport blocks show the state movement as a `swap` in and out of the host ancilla rather than the Bell-measurement gadget, because the return trip needs a mid-circuit reset that would make the program non-unitary and so unverifiable by the same route.
+- State-vector verification is exponential in circuit width and is refused above 24 qubits.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.
 

@@ -337,6 +337,70 @@ def test_ebits_command_reports_and_writes_a_plan(tmp_path: Path) -> None:
     )
 
 
+def test_ebits_command_emits_and_verifies_the_protocol(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_config(config)
+    qasm = tmp_path / "telegate.qasm"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "ebits",
+            "--n-logical",
+            "4",
+            "--depth",
+            "4",
+            "--seed",
+            "2",
+            "--config",
+            str(config),
+            "--verify",
+            "--emit-qasm",
+            str(qasm),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Verified" in result.output
+    source = qasm.read_text(encoding="utf-8")
+    assert source.startswith("OPENQASM 3.0;")
+    # The emitted program carries real feedforward, not just gate names.
+    assert "if (" in source
+
+
+def test_ebits_command_reports_a_plan_it_cannot_verify(tmp_path: Path) -> None:
+    """A port-less architecture has no runnable protocol; say so, do not crash."""
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        json.dumps(
+            {
+                "n_qpus": 2,
+                "compute_qubits_per_qpu": 3,
+                "comm_qubits_per_qpu": 0,
+                "optimization_level": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "ebits",
+            "--n-logical",
+            "6",
+            "--depth",
+            "8",
+            "--config",
+            str(config),
+            "--verify",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Cannot verify" in result.output
+
+
 def test_ebits_command_requires_a_circuit_source() -> None:
     result = CliRunner().invoke(app, ["ebits"])
 

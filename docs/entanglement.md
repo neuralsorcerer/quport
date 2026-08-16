@@ -3,7 +3,9 @@
 Cut weight — the number of two-qubit gates whose operands land on different QPUs —
 is the objective every classical partitioner minimizes, and it is not the quantity a
 cat-entanglement machine pays. This page describes the model QuPort uses instead,
-the three modules that implement it, and how they fit together.
+the modules that implement it, and how they fit together — from a partitioning
+objective, through a port-constrained communication plan, down to the circuit that
+performs it and a proof that it does.
 
 | Module | Question it answers | When it runs |
 |---|---|---|
@@ -11,6 +13,7 @@ the three modules that implement it, and how they fit together.
 | `quport.hypergraph` | How many EPR pairs does this *partition* need? | Partition time, inside the search loop |
 | `quport.aggregation` | Which EPR blocks does this *mapped circuit* need, under a real port budget? | Compile time, on physical qubits |
 | `quport.schedule.estimate_entanglement_schedule` | How long does that plan take on this interconnect? | Schedule time |
+| `quport.protocol` | What circuit actually performs the plan, and is it right? | Emission and verification |
 
 ## Why cat-entanglement changes the objective
 
@@ -135,6 +138,55 @@ A plan and the schedule that consumes it must agree on the port budget. Passing 
 plan built with a larger `ports_per_qpu` raises rather than silently reporting the
 work as unschedulable.
 ```
+
+## From plan to circuit
+
+`build_telegate_circuit` expands a plan into the circuit it stands for. Each cat
+block becomes, with root `c`, cat copy `b`, and EPR helper `a`:
+
+```
+entangler:     h(a); cx(a, b); cx(c, a); cx(a, b)
+block gates:   every gate of the block, with c replaced by b
+disentangler:  h(b); cz(b, c)
+```
+
+That is the deferred-measurement form: `measure a` plus `if m: x(b)` collapses to
+`cx(a, b)`, and an X-basis measurement of `b` plus `if m: z(c)` collapses to
+`h(b); cz(b, c)`. It is worth writing that way because a unitary circuit can be
+checked with a state vector.
+
+Both ancillas provably end in `|+>` regardless of the data, so an `h` returns
+them to `|0>` and the next block reuses them. The emitted width therefore tracks
+how many cat copies are live at once, not how many blocks there are.
+
+`coherent=False` emits the executable form instead — real mid-circuit
+measurement, `if` feedforward, and `reset` — which exports to OpenQASM 3.
+
+```{note}
+Teleport blocks show the state movement as a `swap` in and out of the host
+ancilla rather than the Bell-measurement gadget. Expanding the return trip needs
+a mid-circuit reset, which would make the program non-unitary and therefore
+unverifiable by the route below. The two e-bits it costs are still accounted for.
+```
+
+## Verifying it
+
+`verify_telegate_equivalence` runs the unitary form on a pseudo-random product
+input, traces out the ancillas, and compares the reduced state of the data qubits
+with the mapped circuit's. Unit fidelity certifies both halves at once: the data
+are right, and the ancillas came back unentangled — leftover entanglement would
+leave the reduced state mixed and the fidelity below one.
+
+This is what makes the diagonality rule a tested property rather than a stated
+assumption. A hand-built plan that keeps a cat copy live across an `X` on its
+root — exactly what `aggregate_remote_operations` refuses to emit — drives the
+fidelity to zero, not merely down.
+
+```bash
+quport ebits --n-logical 4 --depth 4 --config small.json --verify --emit-qasm telegate.qasm
+```
+
+Verification is a state-vector simulation and is refused above 24 qubits.
 
 ## Reading the numbers
 

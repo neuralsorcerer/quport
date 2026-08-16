@@ -385,6 +385,32 @@ fills in the `ebits` and `weighted_ebit_distance` diagnostics.
 `compile_distributed` returns `packets`, `ebits`, `aggregation`, and
 `entanglement_schedule` alongside its existing fields.
 
+### Protocol emission and verification
+
+```python
+build_telegate_circuit(mapped, arch, plan=None, *, coherent=True,
+                       ports_per_qpu=None) -> TelegateProgram
+verify_telegate_equivalence(mapped, arch, plan=None, *, seed=0, atol=1e-9,
+                            ports_per_qpu=None) -> bool
+```
+
+`build_telegate_circuit` expands an aggregation plan into the circuit that
+performs it. `coherent=True` (default) emits the deferred-measurement form,
+which is unitary and therefore verifiable; `coherent=False` emits real
+mid-circuit measurement with `if` feedforward and `reset`, suitable for OpenQASM
+3 export. Ancillas are recycled between blocks, so the emitted width follows the
+number of concurrently live cat copies.
+
+`TelegateProgram(circuit, n_data, ancillas, blocks, epr_pairs,
+unschedulable_gates, measured)` — the first `n_data` qubits of `circuit` are the
+mapped circuit's, in order; the rest are protocol ancillas that start and end in
+the ground state. `n_ancillas` is a convenience property.
+
+`verify_telegate_equivalence` simulates the unitary form on a pseudo-random
+product input, traces out the ancillas, and compares the data qubits' reduced
+state with the mapped circuit's. It raises for plans with unschedulable gates,
+and for circuits wider than `quport.protocol.MAX_VERIFIABLE_QUBITS` (24).
+
 ### Schedule dataclasses
 
 - `ScheduleSummary(makespan, steps, remote_ops)`

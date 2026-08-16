@@ -463,6 +463,22 @@ def ebits(
     out: str | None = typer.Option(
         None, help="Optional JSON path for the full entanglement plan"
     ),
+    emit_qasm: str | None = typer.Option(
+        None,
+        "--emit-qasm",
+        help=(
+            "Optional OpenQASM 3 path for the executable telegate circuit "
+            "(explicit EPR pairs, mid-circuit measurement, and feedforward)"
+        ),
+    ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help=(
+            "Check by state-vector simulation that the emitted protocol "
+            "reproduces the mapped circuit (small circuits only)"
+        ),
+    ),
 ) -> None:
     """Report EPR-pair (e-bit) demand after communication aggregation.
 
@@ -512,6 +528,33 @@ def ebits(
             encoding="utf-8",
         )
         _print_path(f"Wrote entanglement plan to {out}")
+
+    if emit_qasm or verify:
+        from .architecture import MultiQPUArchitecture
+        from .protocol import build_telegate_circuit, verify_telegate_equivalence
+
+        arch = MultiQPUArchitecture(cfg)
+
+    if emit_qasm:
+        program = build_telegate_circuit(
+            res.physical_circuit, arch, plan, coherent=False
+        )
+        Path(emit_qasm).write_text(qasm3.dumps(program.circuit), encoding="utf-8")
+        _print_path(
+            f"Wrote telegate circuit ({program.n_ancillas} protocol ancillas) "
+            f"to {emit_qasm}"
+        )
+
+    if verify:
+        try:
+            equivalent = verify_telegate_equivalence(res.physical_circuit, arch, plan)
+        except ValueError as exc:
+            raise typer.BadParameter(f"Cannot verify this plan: {exc}") from exc
+        if equivalent:
+            console.print("[bold green]Verified:[/bold green] protocol matches circuit")
+        else:
+            console.print("[bold red]Verification failed[/bold red]")
+            raise typer.Exit(code=1)
 
 
 @app.command()

@@ -38,6 +38,11 @@ from quport.pipeline import (
     map_and_transpile,
     sweep_topologies,
 )
+from quport.protocol import (
+    TelegateProgram,
+    build_telegate_circuit,
+    verify_telegate_equivalence,
+)
 from quport.schedule import (
     EntanglementScheduleSummary,
     LayerScheduleTrace,
@@ -68,12 +73,14 @@ __all__ = [
     "RemoteOp",
     "RemoteRoundTrace",
     "ScheduleSummary",
+    "TelegateProgram",
     "TopologySchedulePlan",
     "TopologyMetrics",
     "TopologyScheduleSummary",
     "aggregate_remote_operations",
     "benchmark_random_circuits",
     "build_distributable_packets",
+    "build_telegate_circuit",
     "compile_distributed",
     "diagonal_positions",
     "ebit_cost",
@@ -91,4 +98,5 @@ __all__ = [
     "write_remote_ops_json",
     "sweep_topologies",
     "topology_metrics",
+    "verify_telegate_equivalence",
 ]
