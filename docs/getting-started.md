@@ -116,5 +116,5 @@ routing method, and optimization level when comparing results.
 | Logical qubits exceed physical qubits | `n_logical > cfg.total_physical_qubits()` | Increase QPUs/qubits or reduce the circuit size |
 | YAML config fails to load | PyYAML extra is missing | Install `python -m pip install -e '.[yaml]'` |
 | Plotting a sweep fails | visualization extras are missing | Install `python -m pip install -e '.[viz]'` |
-| Strategy is rejected | strategy is not supported by that workflow | Use `balanced`, `cluster`, `tpccap`, or `tpccap_sa`; `baseline` is benchmark-only |
+| Strategy is rejected | strategy is not supported by that workflow | Use `balanced`, `cluster`, `ebit`, `tpccap`, or `tpccap_sa`; `baseline` is benchmark-only |
 | Seed is rejected | seed is boolean, negative, or non-integral | Use a non-negative integer such as `0` or `123` |

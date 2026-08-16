@@ -39,9 +39,16 @@ from dataclasses import dataclass
 from qiskit import QuantumCircuit, transpile
 
 from quport._validation import validate_nonnegative_integral
+from quport.aggregation import AggregationPlan, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig
 from quport.distributed import DistributedProgram, split_into_qpus
+from quport.hypergraph import (
+    EbitReport,
+    PacketDecomposition,
+    build_distributable_packets,
+    ebit_report,
+)
 from quport.interaction import (
     extract_temporal_twoq_weights,
     extract_twoq_weights,
@@ -58,8 +65,10 @@ from quport.partition import (
     tpccap_sa_partition,
 )
 from quport.schedule import (
+    EntanglementScheduleSummary,
     TopologySchedulePlan,
     TopologyScheduleSummary,
+    estimate_entanglement_schedule,
     estimate_topology_schedule_plan,
 )
 
@@ -100,6 +109,12 @@ class DistributedCompileResult:
     schedule: TopologyScheduleSummary
     schedule_plan: TopologySchedulePlan
 
+    # Entanglement accounting
+    packets: PacketDecomposition
+    ebits: EbitReport
+    aggregation: AggregationPlan
+    entanglement_schedule: EntanglementScheduleSummary
+
     # Times
     mapping_time_s: float
     local_transpile_time_s: float
@@ -121,11 +136,22 @@ def compile_distributed(
     - "cluster"    : heavy-edge clustering baseline
     - "tpccap"     : TPCCAP (topology+port+congestion aware)
     - "tpccap_sa"  : TPCCAP + simulated annealing refinement (recommended)
+    - "ebit"       : TPCCAP-SA driven by hop-scaled e-bit demand instead of cut
+                     weight, i.e. minimising the EPR pairs a cat-entanglement
+                     compiler consumes after communication aggregation
 
     temporal_decay
     --------------
     If < 1, uses time-decayed weights to bias the partitioner toward reducing
     *early* remote interactions.
+
+    Notes
+    -----
+    The ``"ebit"`` objective replaces the weighted-cut-distance term with
+    hop-scaled e-bit demand and keeps the port and congestion terms. Congestion
+    is still estimated from gate-level traffic, which upper-bounds e-bit traffic
+    because aggregation only ever removes transactions; use
+    :func:`quport.hypergraph.ebit_traffic_matrix` for the exact EPR demand.
     """
     latency = latency or LatencyModel()
     if seed is not None:
@@ -136,11 +162,11 @@ def compile_distributed(
             f"Logical qubits={qc.num_qubits} exceed physical qubits={cfg.total_physical_qubits()} in config."
         )
 
-    supported_strategies = {"balanced", "cluster", "tpccap", "tpccap_sa"}
+    supported_strategies = {"balanced", "cluster", "tpccap", "tpccap_sa", "ebit"}
     if strategy not in supported_strategies:
         raise ValueError("Unknown strategy.")
 
-    is_tpccap = strategy in ("tpccap", "tpccap_sa")
+    is_tpccap = strategy in ("tpccap", "tpccap_sa", "ebit")
     temporal_decay_value = (
         validate_temporal_decay(temporal_decay, label="temporal_decay")
         if is_tpccap
@@ -162,6 +188,10 @@ def compile_distributed(
         )  # float weights
     else:
         partition_weights = extract_twoq_weights(qc_basis)  # int weights
+
+    # Packets are partition independent, so they are built once and reused by
+    # the e-bit objective, the diagnostics, and the aggregation cross-check.
+    packets = build_distributable_packets(qc_basis)
 
     capacity = cfg.capacity_per_qpu()
     part: list[int]
@@ -224,6 +254,27 @@ def compile_distributed(
         part_diag = diag
         anneal_diag = ad
 
+    elif strategy == "ebit":
+        sp = arch.qpu_shortest_paths()
+        pres, diag, ad = tpccap_sa_partition(
+            n=qc_basis.num_qubits,
+            weights=partition_weights,
+            n_qpus=cfg.n_qpus,
+            capacity=capacity,
+            comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
+            sp=sp,
+            seed=seed,
+            # Communication volume is measured in e-bits, so the cut-distance
+            # term is switched off rather than added on top of it.
+            w_dist=0.0,
+            packets=packets,
+            w_ebit=1.0,
+        )
+        part = pres.part
+        cut = pres.cut
+        part_diag = diag
+        anneal_diag = ad
+
     else:
         raise ValueError("Unknown strategy.")
 
@@ -271,6 +322,14 @@ def compile_distributed(
     global_metrics = compute_metrics(physical, arch)
     sched_plan = estimate_topology_schedule_plan(physical, arch, latency)
 
+    # 7) Entanglement accounting: aggregate cross-QPU gates into blocks and
+    #    schedule them against the real comm-port and link budgets.
+    ebit_diagnostics = ebit_report(packets, part, cfg.n_qpus)
+    aggregation = aggregate_remote_operations(physical, arch)
+    entanglement = estimate_entanglement_schedule(
+        physical, arch, latency, plan=aggregation
+    )
+
     return DistributedCompileResult(
         physical_circuit=physical,
         cfg=cfg,
@@ -285,6 +344,10 @@ def compile_distributed(
         local_metrics=local_counts,
         schedule=sched_plan.summary,
         schedule_plan=sched_plan,
+        packets=packets,
+        ebits=ebit_diagnostics,
+        aggregation=aggregation,
+        entanglement_schedule=entanglement,
         mapping_time_s=mapping_time,
         local_transpile_time_s=local_time,
     )

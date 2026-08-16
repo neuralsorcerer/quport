@@ -245,7 +245,8 @@ def map(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
-        "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -288,7 +289,7 @@ def bench(
     seed: int = typer.Option(0, help="Base seed"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,cluster,tpccap,tpccap_sa",
+        help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     out: str = typer.Option("results.csv", help="Output CSV path"),
@@ -321,7 +322,7 @@ def sweep(
     out: str = typer.Option("sweep.csv", help="Output CSV summary"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,cluster,tpccap,tpccap_sa",
+        help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     plot: str | None = typer.Option(
         None, help="Optional PNG plot (requires quport[viz])"
@@ -366,7 +367,8 @@ def schedule(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
-        "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -400,7 +402,8 @@ def split(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
-        "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -441,6 +444,77 @@ def split(
 
 
 @app.command()
+def ebits(
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
+    depth: int = typer.Option(20, help="Random circuit depth"),
+    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    strategy: str = typer.Option(
+        "ebit",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
+    ),
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
+    out: str | None = typer.Option(
+        None, help="Optional JSON path for the full entanglement plan"
+    ),
+) -> None:
+    """Report EPR-pair (e-bit) demand after communication aggregation.
+
+    Compares the entanglement a per-gate telegate compiler would consume against
+    the aggregated plan, then schedules that plan against the configured
+    comm-port and link budgets.
+    """
+    cfg = _load_config_or_default(config)
+    latency = LatencyModel()
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
+
+    res = compile_distributed(qc, cfg, latency=latency, seed=seed, strategy=strategy)
+    plan = res.aggregation
+    report = res.ebits
+    sched = res.entanglement_schedule
+
+    table = Table(title="Entanglement Demand")
+    table.add_column("metric")
+    table.add_column("value")
+    table.add_row("cross-QPU gates", str(plan.remote_gates))
+    table.add_row("EPR pairs (aggregated)", str(plan.epr_pairs))
+    table.add_row("EPR pairs (per gate)", str(plan.baseline_epr_pairs))
+    table.add_row("saved", f"{plan.reduction * 100:.1f}%")
+    table.add_row("blocks", str(len(plan.blocks)))
+    table.add_row("port evictions", str(plan.evictions))
+    table.add_row("peak cat copies per QPU", str(list(plan.peak_cat_copies)))
+    table.add_row("e-bits (port-unconstrained)", str(report.ebits))
+    table.add_row("distributable packets", str(report.active_packets))
+    table.add_row("makespan (entanglement-aware)", f"{sched.makespan:.2f}")
+    table.add_row("makespan (topology-aware)", f"{res.schedule.makespan:.2f}")
+    table.add_row("unschedulable gates", str(sched.unschedulable_gates))
+    console.print(table)
+
+    if out:
+        Path(out).write_text(
+            json.dumps(
+                {
+                    "aggregation": plan.to_dict(),
+                    "ebits": report.to_dict(),
+                    "schedule": sched.to_dict(),
+                },
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        _print_path(f"Wrote entanglement plan to {out}")
+
+
+@app.command()
 def compile_dist(
     n_logical: int | None = typer.Option(
         None, help="Number of logical qubits for generated random circuits"
@@ -448,7 +522,8 @@ def compile_dist(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
-        "tpccap_sa", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap_sa",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     temporal_decay: float = typer.Option(
         0.98, help="Time-decay factor for 2Q weights (<=1). Use 1 for uniform."
@@ -470,6 +545,8 @@ def compile_dist(
       - remote_ops.json     : ordered remote-op trace
       - schedule.json       : topology-aware schedule summary
       - schedule_trace.json : detailed per-layer/per-round communication plan with absolute timing
+      - entanglement_plan.json : aggregated EPR blocks, e-bit report, and the
+        entanglement-aware schedule summary
     """
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
@@ -501,13 +578,34 @@ def compile_dist(
         json.dumps(res.schedule_plan.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",
     )
+    (outp / "entanglement_plan.json").write_text(
+        json.dumps(
+            {
+                "aggregation": res.aggregation.to_dict(),
+                "ebits": res.ebits.to_dict(),
+                "schedule": res.entanglement_schedule.to_dict(),
+            },
+            indent=2,
+            allow_nan=False,
+        ),
+        encoding="utf-8",
+    )
 
     swaps_total = sum(m.get("swap", 0) for m in res.local_metrics.values())
     console.print(
         f"[bold]Remote2Q:[/bold] {res.global_metrics.remote_2q}  [bold]Local SWAPs:[/bold] {swaps_total}"
     )
     console.print(
+        f"[bold]EPR pairs:[/bold] {res.aggregation.epr_pairs} "
+        f"(un-aggregated {res.aggregation.baseline_epr_pairs}, "
+        f"saved {res.aggregation.reduction * 100:.1f}%)  "
+        f"[bold]Blocks:[/bold] {len(res.aggregation.blocks)}"
+    )
+    console.print(
         f"[bold]Makespan (topology-aware):[/bold] {res.schedule.makespan:.2f}  [bold]Remote rounds:[/bold] {res.schedule.remote_rounds}"
+    )
+    console.print(
+        f"[bold]Makespan (entanglement-aware):[/bold] {res.entanglement_schedule.makespan:.2f}"
     )
     console.print(
         f"[bold]Times:[/bold] mapping={res.mapping_time_s:.4f}s  local_transpile={res.local_transpile_time_s:.4f}s"

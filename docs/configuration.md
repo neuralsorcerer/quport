@@ -59,11 +59,18 @@ files beside benchmark outputs.
 | `epr_gen` | `200.0` | entanglement generation/network setup cost | remote operation cost |
 | `classical_rtt` | `20.0` | classical round-trip component | remote operation cost and async overlap model |
 | `remote_gate_overhead` | `50.0` | remote gate protocol overhead | remote operation cost |
+| `epr_success_prob` | `1.0` | heralded entanglement success probability per attempt, in `(0, 1]` | entanglement-aware schedule only |
 
 `estimate_latency(n_1q, n_2q, swaps, remote_2q, depth=None)` computes a scalar
 latency proxy and validates all counts and coefficients before computing. The
 optional `depth` argument adds a soft depth penalty and is not a replacement for a
 schedule estimator.
+
+`expected_epr_time(hops)` returns `hops * epr_gen / epr_success_prob`, the expected
+time to distribute one EPR pair across `hops` links: entanglement generation is
+heralded, so one usable pair needs `1 / epr_success_prob` attempts on average. Only
+`estimate_entanglement_schedule` reads `epr_success_prob`, and its default of `1.0`
+models a deterministic link, so every other estimator is unchanged.
 
 ## Config files
 

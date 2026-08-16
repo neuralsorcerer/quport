@@ -74,6 +74,52 @@ The written bundle contains local QASM programs and a remote-operation manifest.
 If you need locally routed QPU programs exactly as produced by `compile_distributed`,
 write `res.local_routed` yourself or use the CLI `compile-dist` command.
 
+## EPR-pair accounting and communication aggregation
+
+```python
+from quport import (
+    LatencyModel,
+    MultiQPUArchitecture,
+    MultiQPUConfig,
+    aggregate_remote_operations,
+    compile_distributed,
+    ebit_cost,
+    estimate_entanglement_schedule,
+)
+from quport.pipeline import random_benchmark_circuit
+
+cfg = MultiQPUConfig(n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2)
+qc = random_benchmark_circuit(16, depth=20, seed=0)
+res = compile_distributed(qc, cfg, LatencyModel(), seed=0, strategy="ebit")
+
+print(res.ebits.ebits, "e-bits with unlimited ports")
+print(res.aggregation.epr_pairs, "EPR pairs under the real port budget")
+print(res.aggregation.baseline_epr_pairs, "EPR pairs without aggregation")
+print(f"{res.aggregation.reduction:.1%} saved")
+print(res.entanglement_schedule.makespan)
+
+for block in res.aggregation.blocks[:3]:
+    print(block.protocol, block.root_phys, "->", block.remote_qpu, block.gate_indices)
+```
+
+Score an alternative partition without recompiling, then re-plan and re-schedule
+against a different port budget — a plan and its schedule must share that budget:
+
+```python
+arch = MultiQPUArchitecture(cfg)
+print(ebit_cost(res.packets, res.partition, cfg.n_qpus))
+
+plan = aggregate_remote_operations(res.physical_circuit, arch, ports_per_qpu=6)
+summary = estimate_entanglement_schedule(
+    res.physical_circuit,
+    arch,
+    LatencyModel(epr_success_prob=0.5),
+    plan=plan,
+    ports_per_qpu=6,
+)
+print(summary.makespan, summary.peak_ports_in_use)
+```
+
 ## Detailed schedule trace
 
 ```python

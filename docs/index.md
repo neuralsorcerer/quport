@@ -13,6 +13,7 @@ distributed-compilation workflows.
 
 getting-started
 concepts
+entanglement
 configuration
 cli
 api-references
@@ -35,6 +36,7 @@ Package releases <https://github.com/neuralsorcerer/quport/releases>
 |---|---|---|
 | [Getting started](getting-started.md) | How do I install QuPort and run the first mapping/compile? | New users |
 | [Concepts](concepts.md) | What are the machine, partitioning, routing, and scheduling models? | Researchers and users interpreting results |
+| [Entanglement model](entanglement.md) | How many EPR pairs does a partition cost, and how are cross-QPU gates aggregated? | Researchers comparing communication cost |
 | [Configuration](configuration.md) | What does every config/latency field mean, and how do fields interact? | Experiment authors |
 | [CLI reference](cli.md) | What commands are available and what files do they produce? | CLI users and automation authors |
 | [API reference](api-references.md) | What Python objects/functions are public and what do they return? | Library users |
@@ -45,10 +47,11 @@ Package releases <https://github.com/neuralsorcerer/quport/releases>
 
 1. Start with [Getting started](getting-started.md) if you want to run QuPort quickly.
 2. Read [Concepts](concepts.md) before interpreting benchmark or scheduling numbers.
-3. Use [Configuration](configuration.md) while designing architecture sweeps.
-4. Use [API reference](api-references.md) while writing experiments against the Python API.
-5. Use [CLI reference](cli.md) when scripting command-line workflows.
-6. Use [Development](development.md) before contributing changes.
+3. Read [Entanglement model](entanglement.md) before comparing EPR-pair or e-bit figures.
+4. Use [Configuration](configuration.md) while designing architecture sweeps.
+5. Use [API reference](api-references.md) while writing experiments against the Python API.
+6. Use [CLI reference](cli.md) when scripting command-line workflows.
+7. Use [Development](development.md) before contributing changes.
 
 ## Workflow decision guide
 
@@ -58,6 +61,7 @@ Package releases <https://github.com/neuralsorcerer/quport/releases>
 | Produce per-QPU local programs and explicit remote operations | `compile_distributed` or `quport compile-dist` | Keeps cross-QPU gates as remote events instead of hiding them inside global routing |
 | Run repeated random-circuit comparisons | `benchmark_random_circuits` or `quport bench` | Writes row-oriented benchmark metrics suitable for CSV analysis |
 | Sweep topology/port settings | `sweep_topologies` or `quport sweep` | Aggregates repeated benchmark rows by architecture setting |
+| Count EPR pairs and inspect the communication plan | `quport ebits` or `compile_distributed(...).aggregation` | Reports e-bit demand after cat-entanglement aggregation, not just cut gates |
 | Inspect communication bottlenecks | `estimate_topology_schedule_plan` | Returns layer/round traces with absolute timing, port usage, link utilization, and a validated JSON-ready `to_dict()` manifest |
 
 ## Documentation accuracy policy

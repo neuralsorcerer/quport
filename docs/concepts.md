@@ -85,9 +85,16 @@ that are likely to reduce cross-QPU traffic before routing/scheduling.
 | `cluster` | heavy-edge clustering baseline | keep strongly interacting qubits together |
 | `tpccap` | topology, port, and congestion-aware partitioning | reduce cut and route pressure together |
 | `tpccap_sa` | `tpccap` with simulated annealing refinement | refine topology-aware objective after construction |
+| `ebit` | machines whose remote gates use cat-entanglement | minimize hop-scaled EPR-pair demand instead of cut weight |
 
 `baseline` is available in benchmark workflows. `map_and_transpile` and
-`compile_distributed` accept `balanced`, `cluster`, `tpccap`, and `tpccap_sa`.
+`compile_distributed` accept `balanced`, `cluster`, `ebit`, `tpccap`, and
+`tpccap_sa`.
+
+`ebit` differs from the others in what it counts, not how it searches: one
+cat-entanglement can serve every gate in which its root stays diagonal, so a run of
+gates from one control into one QPU costs one EPR pair rather than one per gate. See
+[Entanglement model](entanglement.md).
 
 ```{note}
 The two entry points do not weight interactions the same way.
@@ -144,12 +151,20 @@ produces the artifacts needed for such a controller or simulator to consume.
 
 ## Scheduling
 
-QuPort exposes three schedule estimators:
+QuPort exposes four schedule estimators:
 
 - `estimate_parallel_makespan`: coarse QPU timeline synchronization model;
 - `estimate_parallel_makespan_layered`: DAG-layer model with QPU port limits;
 - `estimate_parallel_makespan_topology`: topology-aware model with QPU ports, link capacity,
-  switch pair budgets, reconfiguration delay, and unreachable-pair penalties.
+  switch pair budgets, reconfiguration delay, and unreachable-pair penalties;
+- `estimate_entanglement_schedule`: event-driven model over aggregated EPR blocks, with
+  per-port hold times, per-link channels, and probabilistic entanglement distribution.
+
+The first three slice the circuit into DAG layers, which imposes a global barrier
+between layers and charges one entanglement transaction per cross-QPU gate. The
+fourth does neither, so its makespan is usually well below the others on the same
+circuit; the two families answer different questions and should not be mixed inside
+one comparison. See [Entanglement model](entanglement.md).
 
 Use `estimate_topology_schedule_plan` when you need the detailed layer and round trace.
 Its trace includes absolute `start_time` / `end_time` offsets for both layers and
@@ -173,6 +188,8 @@ counts, and non-self QPU/link pairs before returning the manifest.
 | Cut weight | weighted partition boundary cost | computed before final routing |
 | Makespan | schedule-estimator time proxy | model-dependent, not hardware-calibrated by default |
 | Peak link utilization | maximum simultaneous per-link pressure in a round | topology-scheduler metric |
+| EPR pairs | entanglement consumed after communication aggregation | depends on the comm-port budget; compare against `baseline_epr_pairs` |
+| e-bits | EPR pairs a partition needs with unlimited ports | a lower bound on the compiled plan |
 
 For fair comparisons, keep random seeds, config, transpiler settings, strategies,
 and latency model fixed except for the variable being studied.

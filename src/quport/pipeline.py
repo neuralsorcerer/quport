@@ -19,6 +19,7 @@ from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
+from quport.hypergraph import build_distributable_packets
 from quport.interaction import (
     extract_temporal_twoq_weights,
     extract_twoq_weights,
@@ -44,6 +45,7 @@ _BENCHMARK_METHOD_IDS = {
     "tpccap": 2.0,
     "tpccap_sa": 3.0,
     "cluster": 4.0,
+    "ebit": 5.0,
 }
 _BENCHMARK_METHOD_LABELS = {
     method_id: strategy for strategy, method_id in _BENCHMARK_METHOD_IDS.items()
@@ -177,6 +179,8 @@ def map_and_transpile(
         - "cluster" : heavy-edge clustering baseline
         - "tpccap"    : topology+port+congestion aware partitioner (novel)
         - "tpccap_sa" : TPCCAP + simulated annealing refinement (best)
+        - "ebit"      : TPCCAP-SA minimising hop-scaled e-bit demand instead of
+          cut weight, i.e. the EPR pairs left after communication aggregation
     temporal_decay:
         Interaction weighting for the topology-aware strategies, matching the
         argument of the same name on :func:`quport.compiler.compile_distributed`.
@@ -284,6 +288,27 @@ def map_and_transpile(
         partition_diag = diag
         comm_mode = "diverse"
 
+    elif strategy == "ebit":
+        sp = arch.qpu_shortest_paths()
+        pres, diag, _anneal = tpccap_sa_partition(
+            n=qc_basis.num_qubits,
+            weights=topology_weights(0.98),
+            n_qpus=cfg.n_qpus,
+            capacity=capacity,
+            comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
+            sp=sp,
+            seed=seed,
+            # Communication volume is measured in e-bits, so the cut-distance
+            # term is switched off rather than added on top of it.
+            w_dist=0.0,
+            packets=build_distributable_packets(qc_basis),
+            w_ebit=1.0,
+        )
+        part = pres.part
+        cut = pres.cut
+        partition_diag = diag
+        comm_mode = "diverse"
+
     elif strategy == "cluster":
         part = heavy_edge_clustering_partition(
             n=qc_basis.num_qubits,
@@ -299,7 +324,8 @@ def map_and_transpile(
 
     else:
         raise ValueError(
-            "Unknown strategy. Use 'balanced', 'cluster', 'tpccap', or 'tpccap_sa'."
+            "Unknown strategy. Use 'balanced', 'cluster', 'ebit', 'tpccap', "
+            "or 'tpccap_sa'."
         )
 
     hints = compute_layout_hints(qc_basis, arch, part, comm_mode=comm_mode)
@@ -429,11 +455,12 @@ def benchmark_random_circuits(
         - "cluster": heavy-edge clustering partitioner
         - "tpccap": QuPort novel partitioner (topology+port+congestion aware)
         - "tpccap_sa": TPCCAP plus simulated-annealing refinement
+        - "ebit": TPCCAP-SA driven by e-bit demand after aggregation
 
     Notes
     -----
     The CSV is deliberately numeric-friendly. The column `method` encodes:
-        baseline=0, balanced=1, tpccap=2, tpccap_sa=3, cluster=4
+        baseline=0, balanced=1, tpccap=2, tpccap_sa=3, cluster=4, ebit=5
     and the column `strategy` stores the string name for readability.
     """
     latency = latency or LatencyModel()

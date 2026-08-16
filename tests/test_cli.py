@@ -338,6 +338,7 @@ def test_compile_dist_writes_routed_programs_and_schedule_manifests(
         "remote_ops.json",
         "schedule.json",
         "schedule_trace.json",
+        "entanglement_plan.json",
     }
 
     summary = json.loads((out_dir / "schedule.json").read_text(encoding="utf-8"))
@@ -347,6 +348,16 @@ def test_compile_dist_writes_routed_programs_and_schedule_manifests(
     assert summary["remote_ops"] == sum(
         layer["remote_ops"] for layer in trace["layers"]
     )
+
+    entanglement = json.loads(
+        (out_dir / "entanglement_plan.json").read_text(encoding="utf-8")
+    )
+    aggregation = entanglement["aggregation"]
+    assert aggregation["epr_pairs"] == sum(
+        block["epr_pairs"] for block in aggregation["blocks"]
+    )
+    assert aggregation["epr_pairs"] <= aggregation["baseline_epr_pairs"]
+    assert entanglement["schedule"]["epr_pairs"] == aggregation["epr_pairs"]
 
 
 def test_sweep_writes_summary_csv(tmp_path: Path) -> None:

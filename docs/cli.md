@@ -55,7 +55,7 @@ Options:
 - `--n-logical`: logical qubit count;
 - `--depth`: random circuit depth;
 - `--seed`: random circuit and transpiler seed;
-- `--strategy`: `balanced`, `cluster`, `tpccap`, or `tpccap_sa`;
+- `--strategy`: `balanced`, `cluster`, `ebit`, `tpccap`, or `tpccap_sa`;
 - `--config`: optional JSON/YAML config path;
 - `--input-qasm`: optional OpenQASM 2/3 file to map instead of generating a random circuit;
 - `--out`: optional mapped OpenQASM 3 output.
@@ -114,6 +114,20 @@ but it is not the preferred distributed-compilation workflow. Prefer `compile-di
 when you want to avoid cross-QPU global routing and keep remote operations explicit
 from the compilation flow.
 
+## `quport ebits`
+
+```bash
+quport ebits --n-logical 16 --depth 20 --seed 0 --strategy ebit --out entanglement_plan.json
+```
+
+Reports EPR-pair demand after communication aggregation: cross-QPU gates, EPR pairs
+with and without aggregation, the saving, block count, port evictions, peak cat
+copies per QPU, the port-unconstrained e-bit count, and both the entanglement-aware
+and topology-aware makespans. `--out` writes the full plan, including each block's
+root qubit, host QPU, protocol, and served gate indices.
+
+See [Entanglement model](entanglement.md) for what these numbers mean.
+
 ## `quport compile-dist`
 
 ```bash
@@ -127,7 +141,8 @@ benchmark. Output artifacts:
 - `qpu_<id>_routed.qasm`: locally routed per-QPU programs;
 - `remote_ops.json`: ordered remote operation manifest;
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
-- `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds.
+- `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
+- `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary.
 
 The schedule JSON writers use `allow_nan=False` and the schedule serializers
 validate timings, counts, QPU pairs, and link-utilization pairs before export.
@@ -138,6 +153,7 @@ Recommended checks after running:
 python -m json.tool compile_out/remote_ops.json >/dev/null
 python -m json.tool compile_out/schedule.json >/dev/null
 python -m json.tool compile_out/schedule_trace.json >/dev/null
+python -m json.tool compile_out/entanglement_plan.json >/dev/null
 ```
 
 ## Choosing between CLI commands
@@ -149,5 +165,6 @@ python -m json.tool compile_out/schedule_trace.json >/dev/null
 | repeated global-routing comparisons | `quport bench` |
 | topology/port aggregate summaries | `quport sweep` |
 | quick makespan estimate | `quport schedule` |
+| EPR-pair budget and communication plan | `quport ebits` |
 | per-QPU split of a globally mapped circuit | `quport split` |
 | explicit distributed compile artifacts | `quport compile-dist` |

@@ -51,12 +51,19 @@ when graph/coupling-map builders are invoked.
 
 ```python
 LatencyModel(oneq=1.0, twoq=10.0, swap=30.0, epr_gen=200.0,
-             classical_rtt=20.0, remote_gate_overhead=50.0)
+             classical_rtt=20.0, remote_gate_overhead=50.0,
+             epr_success_prob=1.0)
 ```
 
 Cost model used by mapping costs and schedule estimators. `estimate_latency(...)`
 returns a finite non-negative scalar latency proxy. Coefficients are arbitrary units;
 use consistent units within a study.
+
+`epr_success_prob` is the heralded entanglement success probability per attempt, in
+`(0, 1]`. `expected_epr_time(hops)` returns `hops * epr_gen / epr_success_prob`, the
+expected time to distribute one pair across `hops` links. Only
+`estimate_entanglement_schedule` reads it; the default of `1.0` models a
+deterministic link, so `estimate_cost` and the older estimators are unaffected.
 
 ### `MultiQPUArchitecture`
 
@@ -112,7 +119,7 @@ End-to-end global mapping flow:
 5. run Qiskit transpilation on the global coupling map;
 6. compute metrics and cost.
 
-Supported strategies: `balanced`, `cluster`, `tpccap`, `tpccap_sa`.
+Supported strategies: `balanced`, `cluster`, `ebit`, `tpccap`, `tpccap_sa`.
 
 `temporal_decay` selects the interaction weighting for the topology-aware
 strategies and applies to `tpccap` and `tpccap_sa` alike, so a run isolates the
@@ -153,7 +160,7 @@ benchmark_random_circuits(cfg, n_logical, depth, trials, seed=0,
 ```
 
 Runs random-circuit benchmarks and optionally writes a numeric-friendly CSV.
-Strategies may include `baseline`, `balanced`, `cluster`, `tpccap`, and `tpccap_sa`.
+Strategies may include `baseline`, `balanced`, `cluster`, `ebit`, `tpccap`, and `tpccap_sa`.
 The returned rows include trial, seed, method id, strategy, SWAPs, remote-2Q count,
 depth, size, costs, and timing columns.
 
@@ -190,7 +197,7 @@ compile_distributed(qc, cfg, latency=None, seed=None,
 
 Distributed compilation flow that preserves cross-QPU operations as explicit remote
 events. The optional seed is validated as a non-negative integer before Qiskit calls.
-Supported strategies: `balanced`, `cluster`, `tpccap`, `tpccap_sa`.
+Supported strategies: `balanced`, `cluster`, `ebit`, `tpccap`, `tpccap_sa`.
 
 The `temporal_decay` argument is used for topology-aware strategies. It must be in
 `(0, 1]` when applicable. Values closer to `1` behave more like uniform interaction
@@ -206,13 +213,17 @@ weights; smaller values emphasize earlier two-qubit interactions more strongly.
 | `partition` | logical-qubit-to-QPU assignment |
 | `partition_cut` | weighted cut value |
 | `partition_diagnostics` | topology-aware partition diagnostics when available |
-| `anneal_diagnostics` | simulated annealing diagnostics for `tpccap_sa` |
+| `anneal_diagnostics` | simulated annealing diagnostics for `tpccap_sa` and `ebit` |
 | `program` | `DistributedProgram` containing local circuits and remote ops |
 | `local_routed` | per-QPU locally routed circuits |
 | `global_metrics` | metrics on the physical, not globally routed, circuit |
 | `local_metrics` | per-QPU operation counts after local routing |
 | `schedule` | topology-aware schedule summary |
 | `schedule_plan` | detailed layer/round schedule trace |
+| `packets` | distributable packets of the basis-translated circuit |
+| `ebits` | `EbitReport` for the chosen partition, with unlimited ports |
+| `aggregation` | `AggregationPlan` of EPR blocks under the real comm-port budget |
+| `entanglement_schedule` | `EntanglementScheduleSummary` for that plan |
 | `mapping_time_s` | partition/layout time |
 | `local_transpile_time_s` | local per-QPU transpilation time |
 
@@ -322,6 +333,58 @@ Each layer and each remote round carries absolute `start_time` and `end_time` of
 so callers can render timelines or feed simulators without recomputing cumulative
 durations. This is the most useful API when diagnosing why a makespan increased.
 
+### `estimate_entanglement_schedule`
+
+```python
+estimate_entanglement_schedule(mapped, arch, model, *, plan=None,
+                               ports_per_qpu=None) -> EntanglementScheduleSummary
+```
+
+Event-driven as-soon-as-possible schedule over aggregated EPR blocks, with one
+timeline per physical qubit, a pool of comm ports held for a whole block, per-link
+channels, and hop-scaled probabilistic entanglement distribution. Unlike the
+layer-based estimators it imposes no global barrier between layers and charges one
+transaction per block rather than per gate, so its makespan is not comparable with
+theirs.
+
+`plan` defaults to `aggregate_remote_operations(mapped, arch, ports_per_qpu=...)`.
+A supplied plan must have been built with the same port budget; a larger one raises
+`ValueError` rather than silently reporting the work as unschedulable.
+
+See [Entanglement model](entanglement.md).
+
+### Entanglement API
+
+```python
+diagonal_positions(operation) -> frozenset[int]
+build_distributable_packets(qc, *, symmetric_root="greedy") -> PacketDecomposition
+ebit_cost(decomposition, part, n_qpus) -> int
+ebit_objective(decomposition, part, n_qpus, dist=None) -> tuple[int, float]
+ebit_report(decomposition, part, n_qpus) -> EbitReport
+ebit_traffic_matrix(decomposition, part, n_qpus) -> list[list[float]]
+aggregate_remote_operations(mapped, arch, *, ports_per_qpu=None,
+                            max_block_gates=None) -> AggregationPlan
+```
+
+- `diagonal_positions` reports which operand positions commute with `Z`, the
+  condition under which a cat copy of that operand survives an operation.
+- `build_distributable_packets` extracts placement-independent packets; `ebit_cost`
+  scores any partition against them with the λ−1 metric, and `ebit_objective` adds
+  the hop-weighted variant used by the `ebit` strategy.
+- `ebit_report` returns `EbitReport(ebits, baseline_ebits, reduction, packets,
+  active_packets, packed_gates, cut_gates, unpackable_ebits, peak_cat_copies,
+  pair_ebits)`.
+- `aggregate_remote_operations` turns a mapped circuit into `RemoteBlock` objects
+  under a real comm-port budget, evicting the least recently used cat copy when a
+  port is needed. With unlimited ports its `epr_pairs` equals `ebit_cost`.
+
+`tpccap_partition` and `tpccap_sa_partition` accept `packets` and `w_ebit`;
+`w_ebit=0.0` (the default) leaves their historical objectives unchanged and only
+fills in the `ebits` and `weighted_ebit_distance` diagnostics.
+
+`compile_distributed` returns `packets`, `ebits`, `aggregation`, and
+`entanglement_schedule` alongside its existing fields.
+
 ### Schedule dataclasses
 
 - `ScheduleSummary(makespan, steps, remote_ops)`
@@ -329,6 +392,7 @@ durations. This is the most useful API when diagnosing why a makespan increased.
 - `RemoteRoundTrace(layer_index, round_index, qpu_pairs, duration, qpu_ports_used, link_utilization, unschedulable_ops=0, start_time=0.0, end_time=0.0)`
 - `LayerScheduleTrace(layer_index, local_duration, remote_ops, remote_rounds, duration, start_time=0.0, end_time=0.0)`
 - `TopologySchedulePlan(summary, layers)`
+- `EntanglementScheduleSummary(makespan, blocks, epr_pairs, remote_gates, unschedulable_gates, entanglement_time, peak_ports_in_use, port_busy_time, qpu_busy_time, link_busy_time)`
 
 `TopologyScheduleSummary`, `RemoteRoundTrace`, `LayerScheduleTrace`, and
 `TopologySchedulePlan` provide `to_dict()` methods that return stable JSON-ready
@@ -405,4 +469,6 @@ users may import from submodules directly:
 - `quport.config.load_config` and `quport.config.dump_config` for JSON/YAML configs;
 - `quport.metrics.compute_metrics` and `quport.metrics.count_ops` for direct analysis;
 - `quport.interaction.extract_twoq_weights` and `extract_temporal_twoq_weights` for partition diagnostics;
-- `quport.network.build_qpu_graph` for QPU-level topology inspection.
+- `quport.network.build_qpu_graph` for QPU-level topology inspection;
+- `quport.entanglement.acts_diagonally` and `breaks_cat_copy` for custom cat-copy analyses;
+- `quport.hypergraph.DistributablePacket` for inspecting individual packets.
