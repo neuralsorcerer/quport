@@ -45,6 +45,19 @@ console = Console()
 _QASM_VERSION_RE = re.compile(r"\AOPENQASM\s+([23])(?:\.0)?\s*;", re.ASCII)
 
 
+def _print_path(message: str) -> None:
+    """Print a message containing a filesystem path, keeping it on one line.
+
+    Rich wraps at the console width -- 80 columns when stdout is not a
+    terminal -- which splits long paths across lines and breaks copy/paste
+    and any downstream parsing. Deep temporary directories on macOS and
+    Windows cross that width routinely. Markup and highlighting are off so a
+    path containing square brackets is printed verbatim rather than being
+    read as markup.
+    """
+    console.print(message, soft_wrap=True, markup=False, highlight=False)
+
+
 def _qasm_version(source: str) -> int | None:
     """Return the declared OpenQASM major version, ignoring leading comments."""
     remaining = source.lstrip("\ufeff \t\r\n")
@@ -201,7 +214,7 @@ def gen_config(
     """Generate an example config file."""
     cfg = MultiQPUConfig()
     _dump_config_or_fail(cfg, out)
-    console.print(f"Wrote config to {out}")
+    _print_path(f"Wrote config to {out}")
     _pretty_config(cfg)
 
 
@@ -264,7 +277,7 @@ def map(
 
     if out:
         Path(out).write_text(qasm3.dumps(res.mapped_circuit), encoding="utf-8")
-        console.print(f"Wrote mapped circuit to {out}")
+        _print_path(f"Wrote mapped circuit to {out}")
 
 
 @app.command()
@@ -295,7 +308,7 @@ def bench(
         out_csv=out,
         strategies=strats,
     )
-    console.print(f"Wrote {len(rows)} rows to {out}")
+    _print_path(f"Wrote {len(rows)} rows to {out}")
     _pretty_config(cfg)
 
 
@@ -323,7 +336,7 @@ def sweep(
         out_csv=out,
         strategies=[s.strip() for s in strategies.split(",") if s.strip()],
     )
-    console.print(f"Wrote sweep summary to {out}")
+    _print_path(f"Wrote sweep summary to {out}")
 
     if plot:
         plt, pd = _load_plot_modules()
@@ -342,7 +355,7 @@ def sweep(
         plt.ylabel("mean estimated cost")
         plt.legend()
         fig.savefig(plot, dpi=180, bbox_inches="tight")
-        console.print(f"Wrote plot to {plot}")
+        _print_path(f"Wrote plot to {plot}")
 
 
 @app.command()
@@ -422,7 +435,7 @@ def split(
     # write remote ops
     write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
 
-    console.print(
+    _print_path(
         f"Wrote {len(prog.local_circuits)} local circuits and {len(prog.remote_ops)} remote ops to {out_dir}"
     )
 
@@ -499,4 +512,4 @@ def compile_dist(
     console.print(
         f"[bold]Times:[/bold] mapping={res.mapping_time_s:.4f}s  local_transpile={res.local_transpile_time_s:.4f}s"
     )
-    console.print(f"Wrote artifacts to {out_dir}")
+    _print_path(f"Wrote artifacts to {out_dir}")

@@ -221,6 +221,24 @@ def test_gen_config_writes_a_loadable_config(tmp_path: Path) -> None:
     assert load_config(str(out)) == MultiQPUConfig()
 
 
+def test_written_paths_are_reported_on_a_single_line(tmp_path: Path) -> None:
+    """Rich wraps at 80 columns when stdout is not a terminal, which used to
+    split long output paths across lines and break copy/paste.
+
+    Deep temporary directories cross that width on macOS and Windows CI but not
+    on Linux, so build a path that is long on every platform instead of
+    trusting `tmp_path` to be long enough.
+    """
+    nested = tmp_path / ("long_output_directory_" * 3)
+    nested.mkdir()
+    out = nested / "cfg.json"
+    assert len(str(out)) > 80  # guards the premise, not the behaviour
+
+    result = _run(["gen-config", "--out", str(out)])
+
+    assert f"Wrote config to {out}" in result.output  # type: ignore[attr-defined]
+
+
 def test_bench_writes_one_csv_row_per_trial_and_strategy(tmp_path: Path) -> None:
     import csv
 
