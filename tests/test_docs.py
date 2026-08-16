@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import re
 from pathlib import Path
@@ -217,3 +218,86 @@ def test_every_cli_command_is_documented() -> None:
         readme = _README.read_text(encoding="utf-8")
         missing = sorted(c for c in commands if f"quport {c}" not in readme)
         assert not missing, f"README.md omits: {missing}"
+
+
+_DOC_PARAM_ENTRY = re.compile(r"^([a-z_][a-z0-9_]*)\s*:\s*$", re.MULTILINE)
+_DOC_QUOTED_DEFAULT = re.compile(
+    r"``?([a-z_][a-z0-9_]*)``?\s*(?:=|\(default:?\s*)\s*``?(-?\d+(?:\.\d+)?)``?"
+)
+
+# Words that begin a numpydoc section body or name a returned value rather than a
+# parameter; they legitimately appear in the same "name:" shape.
+_NOT_PARAMETERS = frozenset(
+    {
+        "returns",
+        "raises",
+        "notes",
+        "examples",
+        "parameters",
+        "loads",
+        "weights",
+        "part",
+        "cut",
+        "objective",
+        "approach",
+        "rationale",
+    }
+)
+
+
+def _documented_functions() -> "list[tuple[str, Any]]":
+    """Every function in the package that carries a docstring."""
+    import pkgutil
+
+    found: list[tuple[str, Any]] = []
+    for info in pkgutil.walk_packages(quport.__path__, prefix="quport."):
+        try:
+            module = importlib.import_module(info.name)
+        except Exception:  # pragma: no cover - optional extras may be absent
+            continue
+        for name, obj in vars(module).items():
+            if not inspect.isfunction(obj) or obj.__module__ != module.__name__:
+                continue
+            if inspect.getdoc(obj):
+                found.append((f"{module.__name__}.{name}", obj))
+    return found
+
+
+def test_docstrings_do_not_contradict_their_signatures() -> None:
+    """A docstring that describes something the function does not do is a defect.
+
+    This review found exactly that in `tpccap_sa_partition`, present since the
+    initial commit: the docstring asserted an objective the code did not use. The
+    two mechanically checkable forms of that class are a documented parameter the
+    signature lacks, and a quoted default that disagrees with the real one.
+    """
+    documented = _documented_functions()
+    assert len(documented) >= 40, "expected many documented functions"
+
+    problems: list[str] = []
+    for qualname, function in documented:
+        doc = inspect.getdoc(function) or ""
+        signature = inspect.signature(function)
+        names = {p for p in signature.parameters if p not in ("self", "cls")}
+        defaults = {
+            name: parameter.default
+            for name, parameter in signature.parameters.items()
+            if isinstance(parameter.default, (int, float))
+            and not isinstance(parameter.default, bool)
+        }
+
+        for name in set(_DOC_PARAM_ENTRY.findall(doc)):
+            if name in names or name in _NOT_PARAMETERS:
+                continue
+            problems.append(f"{qualname} documents parameter {name!r} it does not take")
+
+        for name, literal in _DOC_QUOTED_DEFAULT.findall(doc):
+            if name not in defaults:
+                continue
+            if abs(float(literal) - float(defaults[name])) > 1e-12:
+                problems.append(
+                    f"{qualname} docstring says {name}={literal}, "
+                    f"signature says {defaults[name]!r}"
+                )
+
+    assert not problems, "\n".join(problems)
