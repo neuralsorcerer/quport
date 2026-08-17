@@ -95,6 +95,13 @@ def _translate_to_basis(
 @dataclass(frozen=True)
 class DistributedCompileResult:
     physical_circuit: QuantumCircuit
+
+    # The circuit after basis translation, before layout.  `partition` and
+    # `packets` are indexed by *its* qubits, not the input circuit's and not
+    # the physical circuit's, so anything that re-derives a partitioning input
+    # -- interaction weights, an exact-optimum reference -- has to start here.
+    basis_circuit: QuantumCircuit
+
     cfg: MultiQPUConfig
     strategy: str
     partition: list[int]
@@ -159,10 +166,16 @@ def compile_distributed(
     Notes
     -----
     The ``"ebit"`` objective replaces the weighted-cut-distance term with
-    hop-scaled e-bit demand and keeps the port and congestion terms. Congestion
-    is still estimated from gate-level traffic, which upper-bounds e-bit traffic
-    because aggregation only ever removes transactions; use
-    :func:`quport.hypergraph.ebit_traffic_matrix` for the exact EPR demand.
+    hop-scaled e-bit demand, and rescales the rest of the objective to match.
+    The boundary-qubit port penalty is dropped: it runs one to two orders of
+    magnitude larger than an e-bit count, and it measures the wrong resource,
+    because a cat-entanglement compiler needs a port for a live cat copy rather
+    than for every boundary qubit -- and a port shortage is already priced by
+    :func:`quport.aggregation.aggregate_remote_operations`, which pays for it
+    in evictions and fresh EPR pairs. Congestion is kept, but routed from EPR
+    demand rather than gate demand, so it describes the traffic the objective
+    prices; :func:`quport.hypergraph.ebit_traffic_matrix` reports that demand
+    directly.
     """
     latency = latency or LatencyModel()
     if seed is not None:
@@ -361,6 +374,7 @@ def compile_distributed(
 
     return DistributedCompileResult(
         physical_circuit=physical,
+        basis_circuit=qc_basis,
         cfg=cfg,
         strategy=strategy,
         partition=part,

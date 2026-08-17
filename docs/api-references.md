@@ -208,6 +208,7 @@ weights; smaller values emphasize earlier two-qubit interactions more strongly.
 | Field | Meaning |
 |---|---|
 | `physical_circuit` | basis-translated, physically laid-out circuit without global routing |
+| `basis_circuit` | the circuit after basis translation, before layout: what `partition` and `packets` are indexed by |
 | `cfg` | architecture config |
 | `strategy` | partitioning strategy |
 | `partition` | logical-qubit-to-QPU assignment |
@@ -397,12 +398,42 @@ aggregate_remote_operations(mapped, arch, *, ports_per_qpu=None,
   under a real comm-port budget, evicting the least recently used cat copy when a
   port is needed. With unlimited ports its `epr_pairs` equals `ebit_cost`.
 
-`tpccap_partition` and `tpccap_sa_partition` accept `packets` and `w_ebit`;
-`w_ebit=0.0` (the default) leaves their historical objectives unchanged and only
-fills in the `ebits` and `weighted_ebit_distance` diagnostics.
+`tpccap_partition` and `tpccap_sa_partition` accept `packets`, `w_ebit`, and
+`congestion_source`. `w_ebit=0.0` and `congestion_source="gates"` (the defaults)
+leave their historical objectives unchanged and only fill in the `ebits` and
+`weighted_ebit_distance` diagnostics. `congestion_source="ebits"` routes EPR demand
+rather than gate demand through the congestion term, and requires `packets`; gate
+demand upper-bounds EPR demand, because aggregation only ever removes transactions.
 
 `compile_distributed` returns `packets`, `ebits`, `aggregation`, and
 `entanglement_schedule` alongside its existing fields.
+
+### Exact partitioning
+
+```python
+optimal_partition(n, n_qpus, capacity, *, objective="cut", weights=None,
+                  packets=None, max_nodes=DEFAULT_MAX_NODES) -> ExactPartition
+partition_gap(part, n_qpus, capacity, *, objective="cut", weights=None,
+              packets=None, max_nodes=DEFAULT_MAX_NODES) -> PartitionGap
+```
+
+Branch and bound over set partitions of at most `n_qpus` blocks, for both
+objectives QuPort optimises: `"cut"` (needs `weights`) and `"ebits"` (needs
+`packets`). Symmetry is broken by restricted-growth canonical form, which is valid
+because both objectives are invariant under relabelling QPUs and the capacity is
+uniform.
+
+- `ExactPartition(part, objective, proved_optimal, nodes)`. `proved_optimal` is
+  false when `max_nodes` ran out first; `objective` is then an upper bound on the
+  optimum, and `part` is still feasible and still the best found.
+- `PartitionGap(heuristic, optimal, proved_optimal)` with `absolute` and `relative`
+  properties. `relative` is `0.0` when the heuristic is optimal and `math.inf` when
+  the optimum is zero and the heuristic is not. `partition_gap` raises if `part` is
+  infeasible, or if it scores below a proved optimum — which would mean one of the
+  two implementations is wrong.
+
+The tree is over set partitions, so this terminates on roughly a dozen qubits. It
+exists to calibrate the heuristics, not to compile.
 
 ### Reassembly and verification of a distributed program
 

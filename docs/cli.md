@@ -135,6 +135,26 @@ runnable, or when the circuit is too wide to simulate.
 
 See [Entanglement model](entanglement.md) for what these numbers mean.
 
+## `quport optimal`
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit --out gap.json
+```
+
+Scores a strategy's partition against the exact optimum, under both the classical
+cut objective and the e-bit objective, by solving the same instance with branch and
+bound. Reports the heuristic's cost, the optimum, the relative gap, and whether the
+optimum was proved.
+
+`--max-nodes` bounds the search. When the budget runs out the "optimal" column is
+only an upper bound on the true optimum, so the gap is rendered as `>= x%` and a
+warning is printed; `--out` records `proved_optimal` for each objective. The command
+exits non-zero if a heuristic scores *below* a proved optimum, since one of the two
+would then be wrong.
+
+The tree is over set partitions, so keep the instance small -- roughly a dozen
+qubits. This calibrates the heuristics; it is not a compile path.
+
 ## `quport compile-dist`
 
 ```bash
@@ -173,5 +193,6 @@ python -m json.tool compile_out/entanglement_plan.json >/dev/null
 | topology/port aggregate summaries | `quport sweep` |
 | quick makespan estimate | `quport schedule` |
 | EPR-pair budget and communication plan | `quport ebits` |
+| how far a partition is from optimal | `quport optimal` |
 | per-QPU split of a globally mapped circuit | `quport split` |
 | explicit distributed compile artifacts | `quport compile-dist` |

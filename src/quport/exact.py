@@ -48,6 +48,7 @@ unless ``max_nodes`` is exhausted, which the return value reports.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -120,9 +121,18 @@ class PartitionGap:
 
     @property
     def relative(self) -> float:
-        """Excess as a fraction of the optimum; zero when the optimum is zero."""
-        if self.optimal <= 0.0:
+        """Excess as a fraction of the optimum.
+
+        Zero when the heuristic is optimal, including when both costs are zero.
+        Infinite when the optimum is zero and the heuristic is not: a partition
+        that spends where nothing needed spending is not a small miss, and
+        reporting it as a 0% gap would hide exactly the case this module exists
+        to expose.
+        """
+        if self.absolute == 0.0:
             return 0.0
+        if self.optimal <= 0.0:
+            return math.inf
         return self.absolute / self.optimal
 
 

@@ -14,6 +14,7 @@ performs it and a proof that it does.
 | `quport.aggregation` | Which EPR blocks does this *mapped circuit* need, under a real port budget? | Compile time, on physical qubits |
 | `quport.schedule.estimate_entanglement_schedule` | How long does that plan take on this interconnect? | Schedule time |
 | `quport.protocol` | What circuit actually performs the plan, and is it right? | Emission and verification |
+| `quport.exact` | How close to optimal is the partition the heuristic found? | Offline, on small instances |
 
 ## Why cat-entanglement changes the objective
 
@@ -88,16 +89,71 @@ and an upper bound over all assignments. Gates with two diagonal operands (`cz`,
 weighted-cut-distance term replaced by hop-scaled e-bit demand: each e-bit is charged
 the QPU-graph distance it has to cross, since entanglement swapping consumes a link
 per hop. On an all-to-all fabric every distance is 1 and the term is exactly the λ−1
-count. Port and congestion terms are unchanged.
+count.
 
 `w_ebit` defaults to `0.0` on `tpccap_partition` and `tpccap_sa_partition`, so every
 pre-existing objective is untouched. Passing `packets` with `w_ebit=0` fills in the
 `ebits` and `weighted_ebit_distance` diagnostics without steering the search.
 
+### The other terms have to be rescaled with it
+
+Replacing the volume term is not a local change, because the remaining terms were
+tuned against the term that was removed:
+
+- **The port penalty is dropped** (`w_port=0.0`). `w_port` charges squared
+  boundary-qubit overflow, which on realistic instances runs one to two orders of
+  magnitude larger than an e-bit count — so with `w_dist=0` it is not a penalty on
+  the objective, it *is* the objective. It also measures the wrong resource: what a
+  cat-entanglement compiler needs a port for is a live cat copy, not every boundary
+  qubit. And port pressure is already priced downstream, since
+  `aggregate_remote_operations` converts a port shortage into evictions and fresh
+  EPR pairs. Penalising it again double-counts a constraint in the wrong units.
+- **Congestion is kept but re-sourced** (`congestion_source="ebits"`). Gate demand
+  upper-bounds EPR demand — aggregation is exactly the business of removing
+  transactions — so routing gate traffic reports congestion that never happens. The
+  e-bit traffic matrix comes from the same sweep that computes the e-bit cost, so
+  the congestion term and the volume term cannot describe different plans.
+- **Both annealing stages use the same weight.** The default 4× congestion asymmetry
+  between the TPCCAP seed and the annealer was tuned for the larger gate-traffic
+  scale and costs e-bits at this one.
+
+Measured over 36 configurations -- 9 to 20 logical qubits on 3 to 5 QPUs, across
+`ring`, `switch` and `mesh` interconnects, six random circuits each -- rescaling
+these terms moves the realised numbers as follows:
+
+| | Before | After |
+|---|---|---|
+| EPR pairs actually spent | 28.3 | **21.4** |
+| Port evictions | 2.72 | **2.06** |
+| Entanglement-aware makespan | 5073 | **4237** |
+| Peak link busy time | 2378 | 2406 |
+
+Fewer EPR pairs *and* fewer evictions, for no material change in peak link load.
+The evictions fall because minimising e-bits concentrates traffic into fewer,
+longer-lived cat copies, which need fewer simultaneous ports than the many short
+copies a boundary-minimising partition scatters around -- the e-bit objective was
+already the better proxy for port pressure than the penalty meant to model it.
+
+It also closes most of the distance to optimal. Over 24 instances -- 8 qubits on 2
+QPUs, 9 on 3, and 12 on 3 and on 4, six random circuits each, all-to-all:
+
+| Strategy | e-bit gap vs. proved optimum |
+|---|---|
+| `tpccap` | 55.8% |
+| `cluster` | 46.5% |
+| `tpccap_sa` | 44.3% |
+| `balanced` | 36.6% |
+| `ebit` | **7.7%** |
+
+The row that motivated the change is `balanced`: before the rescaling, `ebit` sat at
+43.5%, *behind plain balanced partitioning at the objective it is named for*. The
+search was never the problem — given the e-bit objective alone, the annealer lands
+within 0.2% of the proved optimum.
+
 ```{note}
-Congestion is still estimated from gate-level traffic, which upper-bounds e-bit
-traffic because aggregation only ever removes transactions. Use
-`ebit_traffic_matrix` when the exact EPR demand matters.
+`congestion_source` defaults to `"gates"` everywhere, so this affects the `ebit`
+strategy only. Pass `congestion_source="ebits"` (with `packets`) to opt in from
+your own call to `tpccap_partition` or `tpccap_sa_partition`.
 ```
 
 ## Communication aggregation
@@ -192,6 +248,57 @@ Because it compares state vectors it speaks about the state a circuit prepares.
 Terminating measurements are dropped -- they read that state out without changing
 it -- while a measurement or reset that later operations depend on changes what
 the circuit computes, and is refused rather than quietly ignored.
+
+## Calibrating against the optimum
+
+A heuristic without a reference is a number without a scale: "the e-bit strategy
+saved 30%" says nothing about how much was left behind. `quport.exact` solves the
+same two problems exactly, by branch and bound, on instances small enough for that
+to terminate:
+
+```python
+from quport.exact import optimal_partition, partition_gap
+
+best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
+gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
+
+print(best.objective, best.proved_optimal, best.nodes)
+print(f"{gap.relative:.1%} above optimal")
+```
+
+Three things keep the tree small, and none of them is a heuristic shortcut:
+
+- **Canonical form.** Both objectives are invariant under relabelling QPUs and the
+  capacity is uniform, so only restricted-growth assignments are explored — a qubit
+  joins a QPU already in use, or opens the lowest-numbered unused one. That collapses
+  `n_qpus**n` candidates to set partitions of at most `n_qpus` blocks.
+- **Monotone bounds.** Each incremental cost counts only what the new assignment
+  *settles*, so the running total is an admissible lower bound and a node that
+  already reaches the incumbent is cut.
+- **A seeded incumbent**, so pruning bites from the first node.
+
+`max_nodes` bounds the run. Exhausting it clears `proved_optimal`, and the returned
+partition is then the best one found rather than the optimum — `PartitionGap` reports
+that flag, and its `absolute` is a *lower* bound on the true gap in that case.
+
+```{warning}
+The tree is over set partitions, so this is for calibration on roughly a dozen
+qubits, not for compiling. Use it to measure what a heuristic leaves behind, then
+trust the heuristic at scale.
+```
+
+`partition_gap` raises rather than reporting a negative gap when a heuristic scores
+*below* a proved optimum, because one of the two implementations would then be
+wrong. That makes it a cross-check between two independent readings of both
+objectives, which is why `tests/test_exact.py` runs it over every shipped strategy.
+The branch and bound is itself checked against exhaustive enumeration over every
+feasible assignment — 286 cut instances and 125 e-bit instances — since that is the
+only real argument that the pruning and the canonical form do not silently lose an
+optimum.
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
+```
 
 ## Reading the numbers
 

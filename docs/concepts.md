@@ -91,6 +91,11 @@ that are likely to reduce cross-QPU traffic before routing/scheduling.
 `compile_distributed` accept `balanced`, `cluster`, `ebit`, `tpccap`, and
 `tpccap_sa`.
 
+All five are heuristics. `quport.exact.optimal_partition` solves the same two
+objectives exactly on small instances, so a strategy's result can be read against
+a proved optimum instead of only against the other strategies; see
+[Entanglement model](entanglement.md).
+
 `ebit` differs from the others in what it counts, not how it searches: one
 cat-entanglement can serve every gate in which its root stays diagonal, so a run of
 gates from one control into one QPU costs one EPR pair rather than one per gate. See

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -28,6 +29,8 @@ from quport.config import (
     optional_module_available,
 )
 from quport.distributed import write_remote_ops_json
+from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
+from quport.interaction import extract_twoq_weights
 from quport.network import build_qpu_graph, topology_metrics
 from quport.pipeline import (
     benchmark_method_labels,
@@ -555,6 +558,113 @@ def ebits(
         else:
             console.print("[bold red]Verification failed[/bold red]")
             raise typer.Exit(code=1)
+
+
+@app.command()
+def optimal(
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
+    depth: int = typer.Option(12, help="Random circuit depth"),
+    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    strategy: str = typer.Option(
+        "ebit",
+        help="Partition strategy to score: balanced, cluster, ebit, tpccap, tpccap_sa",
+    ),
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
+    max_nodes: int = typer.Option(
+        DEFAULT_MAX_NODES,
+        "--max-nodes",
+        help="Branch-and-bound node budget; exhausting it reports a bound, not a proof",
+    ),
+    out: str | None = typer.Option(None, help="Optional JSON path for the gap report"),
+) -> None:
+    """Score a strategy's partition against the exact optimum.
+
+    Solves the same instance exactly by branch and bound and reports how much
+    the heuristic leaves on the table, under both the classical cut objective
+    and the e-bit objective. The tree is over set partitions, so this is for
+    calibration on small instances -- roughly a dozen qubits -- not compiling.
+    """
+    cfg = _load_config_or_default(config)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
+
+    res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
+    weights = extract_twoq_weights(res.basis_circuit)
+    capacity = cfg.capacity_per_qpu()
+
+    table = Table(title=f"Optimality gap ({strategy}, {res.basis_circuit.num_qubits}q)")
+    table.add_column("objective")
+    table.add_column("heuristic", justify="right")
+    table.add_column("optimal", justify="right")
+    table.add_column("gap", justify="right")
+    table.add_column("proved", justify="right")
+
+    payload: dict[str, Any] = {"strategy": strategy, "n_qpus": cfg.n_qpus}
+    objectives: tuple[tuple[Objective, dict[str, Any]], ...] = (
+        ("cut", {"weights": weights}),
+        ("ebits", {"packets": res.packets}),
+    )
+    for objective, kwargs in objectives:
+        try:
+            gap = partition_gap(
+                res.partition,
+                cfg.n_qpus,
+                capacity,
+                objective=objective,
+                max_nodes=max_nodes,
+                **kwargs,
+            )
+        except ValueError as exc:
+            # A heuristic below a proved optimum is a bug in one of the two, not
+            # a bad command line, so say which comparison failed and stop.
+            console.print(f"[bold red]{objective}:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+        # Without a proof, `optimal` is only an upper bound on the true optimum,
+        # so the computed gap is a lower bound on the real one -- and can even
+        # come out negative. Render it as the bound it is rather than as a
+        # number that reads like a measurement.
+        if gap.proved_optimal:
+            rendered = f"{gap.relative * 100:.1f}%"
+        else:
+            rendered = f">= {max(gap.relative, 0.0) * 100:.1f}%"
+        table.add_row(
+            objective,
+            f"{gap.heuristic:g}",
+            f"{gap.optimal:g}",
+            rendered,
+            "yes" if gap.proved_optimal else "no",
+        )
+        payload[objective] = {
+            "heuristic": gap.heuristic,
+            "optimal": gap.optimal,
+            "absolute": gap.absolute,
+            # `relative` is infinite when the optimum is zero and the heuristic
+            # is not. JSON has no infinity, so that case is written as null
+            # rather than as a finite number that would misreport it.
+            "relative": gap.relative if math.isfinite(gap.relative) else None,
+            "proved_optimal": gap.proved_optimal,
+        }
+
+    console.print(table)
+    if not all(payload[key]["proved_optimal"] for key in ("cut", "ebits")):
+        console.print(
+            "[yellow]Node budget exhausted:[/yellow] the reported optimum is an "
+            "upper bound, so the true gap is at least as large as shown."
+        )
+
+    if out:
+        Path(out).write_text(
+            json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+        )
+        _print_path(f"Wrote gap report to {out}")
 
 
 @app.command()

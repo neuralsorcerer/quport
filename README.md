@@ -63,6 +63,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Logical interaction-graph extraction from arbitrary two-qubit circuit instructions.
 - Optional temporal interaction weights that emphasize earlier two-qubit gates.
 - Capacity-constrained partitioning baselines, topology-aware partitioning, and e-bit-aware partitioning.
+- Exact capacity-constrained partitioning by branch and bound, for both the cut and the e-bit objective, so a heuristic's result can be read against a proved optimum.
 - Computational-basis diagonality analysis that decides which gates one cat-entanglement can serve.
 - Distributable-packet extraction and the hypergraph $\lambda-1$ e-bit metric.
 - Communication aggregation of cross-QPU gates into cat-entanglement and teleport blocks under a comm-port budget.
@@ -74,7 +75,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Schedule estimation under QPU-port, link-capacity, network-hop, switch-pair, and switch-reconfiguration constraints.
 - Event-driven, resource-constrained entanglement scheduling with per-port hold times, per-link channels, hop-scaled EPR distribution, and a heralded-success retry model.
 - Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, EPR pairs, and makespan.
-- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, splitting, and distributed compilation.
+- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
 
 ---
@@ -500,16 +501,41 @@ w_{\mathrm{ebit}}\sum_{P\in\mathcal{P}}\;\sum_{q\in R(P,\pi)}d(\pi(\mathrm{root}
 $$
 
 where $R(P,\pi)$ is the set of distinct remote QPUs packet $P$ touches. On an
-all-to-all fabric every distance is $1$ and the first term is exactly $E(\pi)$. The
-port and congestion terms are unchanged from `tpccap`; congestion is still estimated
-from gate-level traffic, which upper-bounds e-bit traffic because aggregation only
-removes transactions. `quport.hypergraph.ebit_traffic_matrix` returns the exact EPR
-demand for callers who want it.
+all-to-all fabric every distance is $1$ and the first term is exactly $E(\pi)$.
 
 `w_ebit` defaults to $0$ on `tpccap_partition` and `tpccap_sa_partition`, so every
 pre-existing objective and every published number is unchanged. Passing `packets`
 with `w_ebit=0` populates the `ebits` and `weighted_ebit_distance` diagnostics
 without steering the search.
+
+#### Rescaling the rest of the objective
+
+Replacing the volume term is not a local change: $w_{\mathrm{port}}$ and
+$w_{\mathrm{cong}}$ were tuned against a term that counts *every cut gate*, and an
+e-bit count is smaller by the aggregation factor. Left as they were, the penalties
+stop biasing the objective and become it.
+
+The `ebit` strategy therefore sets $w_{\mathrm{port}}=0$. Beyond the scale, the
+penalty measures the wrong resource: what a cat-entanglement compiler needs a port
+for is a *live cat copy*, not every boundary qubit, and port pressure is already
+priced downstream, because `aggregate_remote_operations` converts a shortage into
+evictions and fresh EPR pairs. Congestion is kept but routed from EPR demand rather
+than gate demand, via `congestion_source="ebits"`, so it describes the same traffic
+the volume term prices; the e-bit traffic matrix is filled by the same sweep that
+computes the cost, so the two cannot disagree. Both stages use the same congestion
+weight, since the default $4\times$ annealing asymmetry was also tuned for the
+gate-traffic scale.
+
+Over 36 configurations -- 9 to 20 logical qubits on 3 to 5 QPUs, across `ring`,
+`switch` and `mesh` interconnects, six random circuits each -- this takes the EPR
+pairs actually spent from $28.3$ to $21.4$, port evictions from $2.72$ to $2.06$,
+and the entanglement-aware makespan from $5073$ to $4237$, with peak link busy time
+essentially unchanged ($2378$ to $2406$). Fewer pairs *and* fewer evictions:
+minimising e-bits concentrates traffic into fewer, longer-lived cat copies, which
+need fewer simultaneous ports than the many short copies a boundary-minimising
+partition scatters around — the e-bit objective was already a better proxy for port
+pressure than the penalty meant to model it. `congestion_source` defaults to
+`"gates"`, so no other strategy moves.
 
 ### Communication aggregation under a port budget
 
@@ -617,18 +643,79 @@ to emit — sends the fidelity to zero, not merely down a little
 
 Reproduce with `n_qpus=4`, `compute_qubits_per_qpu=4`, `comm_qubits_per_qpu=2`,
 `inter_topology="switch"`, `optimization_level=0`, comparing
-`aggregation.epr_pairs` against `aggregation.baseline_epr_pairs`:
+`aggregation.epr_pairs` against `aggregation.baseline_epr_pairs`. QFT here is the
+controlled-phase ladder without the terminating swaps, and GHZ is one `h` followed
+by a `cx` fan-out, as built in `tests/test_protocol.py`:
 
 | Circuit | Cross-QPU gates | EPR pairs, per gate | EPR pairs, aggregated | Saved |
 |---|---|---|---|---|
-| 16-qubit QFT, `strategy="ebit"`, `seed=0` | $190$ | $190$ | $88$ | $53.7\%$ |
-| 16-qubit GHZ fan-out, `strategy="ebit"`, `seed=0` | $10$ | $10$ | $3$ | $70.0\%$ |
+| 16-qubit QFT, `strategy="ebit"`, `seed=0` | $168$ | $168$ | $69$ | $58.9\%$ |
+| 16-qubit GHZ fan-out, `strategy="ebit"`, `seed=0` | $10$ | $10$ | $2$ | $80.0\%$ |
 | 16-qubit random depth-20, `strategy="tpccap_sa"`, seeds $0..9$ | $990$ | $990$ | $639$ | $35.5\%$ |
+
+The cross-QPU gate count moves with the partition, so the `ebit` rows also record
+the rescaling described above: under the previous penalty weights the same two
+circuits cut $190$ gates to $88$ pairs and $10$ to $3$.
 
 Structured circuits benefit most, because a control that only ever picks up $R_z$
 rotations keeps its packet open across the whole ladder. Random circuits benefit
 less: translating to the default basis puts `sx` and `x` gates on most qubits, and
 each of those closes a packet.
+
+### Calibrating the heuristics against the exact optimum
+
+Everything above is a heuristic, and a heuristic without a reference is a number
+without a scale. `quport.exact` solves the same two partitioning problems exactly,
+by branch and bound, on instances small enough for that to terminate:
+
+```python
+from quport.exact import optimal_partition, partition_gap
+
+best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
+gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
+print(best.objective, best.proved_optimal, best.nodes, f"{gap.relative:.1%}")
+```
+
+Three things keep the tree small, none of them a heuristic shortcut. **Canonical
+form**: both objectives are invariant under relabelling QPUs and the capacity is
+uniform, so only restricted-growth assignments are explored, collapsing $k^n$
+candidates to set partitions of at most $k$ blocks. **Monotone bounds**: each
+incremental cost counts only what an assignment *settles*, so the running total is
+an admissible lower bound and a node reaching the incumbent is cut. **A seeded
+incumbent**, so pruning bites from the first node. `max_nodes` bounds the run;
+exhausting it clears `proved_optimal` rather than passing a guess off as a proof.
+
+The branch and bound is checked against exhaustive enumeration over every feasible
+assignment — 286 cut instances and 125 e-bit instances — which is the only real
+argument that the pruning and the canonical form never silently lose an optimum.
+`partition_gap` then raises rather than reporting a negative gap when a heuristic
+scores *below* a proved optimum, since one of the two implementations would have to
+be wrong; that makes it a cross-check between two independent readings of both
+objectives, run over every shipped strategy in `tests/test_exact.py`.
+
+Over 24 instances — 8 qubits on 2 QPUs, 9 on 3, and 12 on 3 and on 4, six random
+circuits each, all-to-all:
+
+| Strategy | gap vs. optimal e-bits | gap vs. optimal cut |
+|---|---|---|
+| `tpccap` | $55.8\%$ | $40.9\%$ |
+| `cluster` | $46.5\%$ | $26.8\%$ |
+| `tpccap_sa` | $44.3\%$ | $27.4\%$ |
+| `balanced` | $36.6\%$ | $27.3\%$ |
+| `ebit` | $\mathbf{7.7\%}$ | $\mathbf{18.4\%}$ |
+
+This is what found the scaling defect described above. Before the rescaling `ebit`
+sat at $43.5\%$ — *behind plain balanced partitioning at the objective it is named
+for*. The search was never at fault: given the e-bit objective alone, the annealer
+lands within $0.2\%$ of the proved optimum.
+
+The tree is over set partitions, so this terminates on roughly a dozen qubits. It is
+for calibration, not for compiling — measure what a heuristic leaves behind, then
+trust it at scale. From the command line:
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
+```
 
 ---
 
@@ -1058,6 +1145,18 @@ pairs, mid-circuit measurement, and `if` feedforward. `--verify` simulates the
 unitary form and confirms it reproduces the mapped circuit; it exits non-zero if
 it does not, and reports a clear error when the architecture has too few comm
 ports for the plan to be runnable at all.
+
+### Score a partition against the exact optimum
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit --out gap.json
+```
+
+Solves the same instance exactly by branch and bound and prints the strategy's
+cost, the optimum, and the gap, under both the cut and the e-bit objective.
+`--max-nodes` bounds the search; when the budget runs out the gap is rendered as
+`>= x%` and flagged as unproved, because the reference is then only an upper bound.
+Keep the instance small — the tree is over set partitions.
 
 ### Split a mapped global circuit into local circuits and remote operations
 

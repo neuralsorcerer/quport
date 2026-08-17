@@ -120,6 +120,45 @@ summary = estimate_entanglement_schedule(
 print(summary.makespan, summary.peak_ports_in_use)
 ```
 
+## Scoring a partition against the exact optimum
+
+```python
+from quport import MultiQPUConfig, compile_distributed
+from quport.exact import optimal_partition, partition_gap
+from quport.interaction import extract_twoq_weights
+from quport.pipeline import random_benchmark_circuit
+
+cfg = MultiQPUConfig(
+    n_qpus=3, compute_qubits_per_qpu=3, comm_qubits_per_qpu=2, optimization_level=0
+)
+qc = random_benchmark_circuit(9, depth=10, seed=0)
+res = compile_distributed(qc, cfg, seed=0, strategy="ebit")
+capacity = cfg.capacity_per_qpu()
+
+# `partition` and `packets` are indexed by the basis-translated circuit, so any
+# re-derived partitioning input has to come from `res.basis_circuit`.
+weights = extract_twoq_weights(res.basis_circuit)
+
+best = optimal_partition(
+    res.basis_circuit.num_qubits,
+    cfg.n_qpus,
+    capacity,
+    objective="ebits",
+    packets=res.packets,
+)
+print(best.objective, "e-bits is optimal" if best.proved_optimal else "(unproved)")
+print(best.nodes, "nodes explored")
+
+for objective, kwargs in (("cut", {"weights": weights}), ("ebits", {"packets": res.packets})):
+    gap = partition_gap(res.partition, cfg.n_qpus, capacity, objective=objective, **kwargs)
+    print(f"{objective}: {gap.heuristic} vs {gap.optimal} optimal ({gap.relative:.1%})")
+```
+
+`partition_gap` raises if the partition is infeasible, or if it scores below a
+proved optimum — that would mean one of the two implementations is wrong, which is
+worth failing over rather than reporting as a negative gap. Keep instances small:
+the search enumerates set partitions.
+
 ## Detailed schedule trace
 
 ```python

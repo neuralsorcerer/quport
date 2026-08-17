@@ -806,3 +806,111 @@ def test_compile_dist_bundle_is_consumable_from_the_qasm_alone(tmp_path: Path) -
     # The markers genuinely disagree with positional pairing, so the assertions
     # above are not passing by accident.
     assert any(op["qpu0_marker"] != index for index, op in enumerate(remote_ops))
+
+
+def _write_three_qpu_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "n_qpus": 3,
+                "compute_qubits_per_qpu": 3,
+                "comm_qubits_per_qpu": 2,
+                "intra_topology": "clique",
+                "inter_topology": "ring",
+                "optimization_level": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_optimal_reports_a_gap_for_both_objectives(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    out = tmp_path / "gap.json"
+
+    result = _run(
+        [
+            "optimal",
+            "--n-logical",
+            "9",
+            "--depth",
+            "10",
+            "--seed",
+            "0",
+            "--config",
+            str(config),
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert "Optimality gap" in result.output  # type: ignore[attr-defined]
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["strategy"] == "ebit"
+    assert payload["n_qpus"] == 3
+    for objective in ("cut", "ebits"):
+        entry = payload[objective]
+        assert entry["proved_optimal"] is True
+        # A heuristic below the optimum would have raised inside partition_gap.
+        assert entry["heuristic"] >= entry["optimal"]
+        assert entry["absolute"] == entry["heuristic"] - entry["optimal"]
+
+
+def test_optimal_flags_an_exhausted_node_budget(tmp_path: Path) -> None:
+    """An unproved bound must not be presented as a measured gap."""
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+
+    result = _run(
+        [
+            "optimal",
+            "--n-logical",
+            "9",
+            "--depth",
+            "10",
+            "--config",
+            str(config),
+            "--max-nodes",
+            "3",
+        ]
+    )
+
+    output = result.output  # type: ignore[attr-defined]
+    assert "Node budget exhausted" in output
+    assert ">= " in output
+
+
+def test_optimal_scores_the_requested_strategy(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    ebit_out = tmp_path / "ebit.json"
+    sa_out = tmp_path / "sa.json"
+
+    for strategy, out in (("ebit", ebit_out), ("tpccap_sa", sa_out)):
+        _run(
+            [
+                "optimal",
+                "--n-logical",
+                "9",
+                "--depth",
+                "10",
+                "--seed",
+                "0",
+                "--config",
+                str(config),
+                "--strategy",
+                strategy,
+                "--out",
+                str(out),
+            ]
+        )
+
+    ebit = json.loads(ebit_out.read_text(encoding="utf-8"))
+    sa = json.loads(sa_out.read_text(encoding="utf-8"))
+
+    assert ebit["strategy"] == "ebit"
+    assert sa["strategy"] == "tpccap_sa"
+    # The e-bit strategy is the one aiming at this objective; if it stopped
+    # winning here the penalty weights have drifted out of scale again.
+    assert ebit["ebits"]["heuristic"] < sa["ebits"]["heuristic"]

@@ -16,6 +16,7 @@ silently.
 from __future__ import annotations
 
 import itertools
+import math
 import random
 
 import pytest
@@ -448,3 +449,14 @@ def test_weight_validation_matches_cut_weight():
         optimal_partition(2, 2, 2, objective="cut", weights={(0, 5): 1.0})
     with pytest.raises(ValueError, match="non-negative"):
         optimal_partition(2, 2, 2, objective="cut", weights={(0, 1): -1.0})
+
+
+def test_relative_gap_is_infinite_when_the_optimum_is_zero_and_the_heuristic_is_not():
+    """A wasted e-bit against a free optimum is not a 0% miss."""
+    weights = {(0, 1): 2.0}
+    gap = partition_gap([0, 1], 2, 2, objective="cut", weights=weights)
+
+    assert gap.optimal == 0.0
+    assert gap.heuristic == 2.0
+    assert gap.absolute == 2.0
+    assert gap.relative == math.inf
