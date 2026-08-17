@@ -445,14 +445,16 @@ def verify_telegate_equivalence(
             "state-vector verification limit"
         )
 
+    unitary_mapped = _unitary_part(mapped, label="the mapped circuit")
+    unitary_program = _unitary_part(program.circuit, label="the emitted protocol")
+
     preparation = _random_product_state(program.n_data, seed)
 
-    protocol = preparation.copy()
-    protocol = _widen(protocol, total)
-    protocol.compose(program.circuit, qubits=range(total), inplace=True)
+    protocol = _widen(preparation.copy(), total)
+    protocol.compose(unitary_program, qubits=range(total), inplace=True)
 
     reference = preparation.copy()
-    reference.compose(mapped, qubits=range(program.n_data), inplace=True)
+    reference.compose(unitary_mapped, qubits=range(program.n_data), inplace=True)
 
     ancillas = list(range(program.n_data, total))
     actual = Statevector(protocol)
@@ -504,6 +506,8 @@ def verify_distributed_program(
     merged = reassemble_distributed_program(
         mapped, local_routed, remote_ops, arch, restore_layout=True
     )
+    unitary_mapped = _unitary_part(mapped, label="the mapped circuit")
+    merged = _drop_measurements(merged)
 
     width = len(merged.qubits)
     if width > MAX_VERIFIABLE_QUBITS:
@@ -518,12 +522,43 @@ def verify_distributed_program(
     actual.compose(merged, qubits=range(width), inplace=True)
 
     expected = _widen(preparation.copy(), width)
-    expected.compose(mapped, qubits=range(len(mapped.qubits)), inplace=True)
+    expected.compose(
+        unitary_mapped, qubits=range(len(unitary_mapped.qubits)), inplace=True
+    )
 
     return bool(
         state_fidelity(Statevector(actual), Statevector(expected), validate=False)
         >= 1.0 - atol
     )
+
+
+_NON_UNITARY_OPS = frozenset({"measure", "reset", "initialize"})
+
+
+def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
+    """Return ``circuit`` without its terminating measurements.
+
+    Verification compares state vectors, so it can only speak about the state a
+    circuit prepares. Measurements that come last are dropped -- they read that
+    state out without changing it -- while a measurement or reset that other
+    operations depend on genuinely changes what the circuit computes, and is
+    refused rather than quietly ignored.
+    """
+    trimmed = circuit.remove_final_measurements(inplace=False)
+    if trimmed is None:  # pragma: no cover - defensive across Qiskit versions
+        trimmed = circuit
+    surviving = {
+        instruction.operation.name
+        for instruction in trimmed.data
+        if instruction.operation.name in _NON_UNITARY_OPS
+    }
+    if surviving:
+        raise ValueError(
+            f"cannot verify {label}: it contains mid-circuit "
+            f"{', '.join(sorted(surviving))}, which state-vector comparison "
+            "cannot represent"
+        )
+    return trimmed
 
 
 def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:
@@ -541,6 +576,24 @@ def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:
         circuit.ry(0.31 + step * math.pi / 11.0, qubit)
         circuit.rz(0.17 + step * math.pi / 13.0, qubit)
     return circuit
+
+
+def _drop_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
+    """Return ``circuit`` with read-out instructions removed.
+
+    The merged circuit ends with the swaps that undo routing, so its
+    measurements are no longer literally final and
+    :meth:`~qiskit.circuit.QuantumCircuit.remove_final_measurements` will not
+    touch them. They were final in the circuit that was split -- which
+    :func:`_unitary_part` checks on that circuit -- so dropping them here
+    compares the same pre-measurement state.
+    """
+    out = QuantumCircuit(*circuit.qregs)
+    for instruction in circuit.data:
+        if instruction.operation.name in _NON_UNITARY_OPS:
+            continue
+        out.append(instruction.operation, instruction.qubits, [])
+    return out
 
 
 def _widen(circuit: QuantumCircuit, total: int) -> QuantumCircuit:

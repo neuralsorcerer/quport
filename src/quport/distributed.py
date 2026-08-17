@@ -508,6 +508,13 @@ def reassemble_distributed_program(
 
     width = max(arch.n_phys, len(mapped.qubits))
     out = QuantumCircuit(QuantumRegister(width, "q"))
+    # Carry the classical side across, so measurements and conditioned
+    # operations land on the bits they named in the circuit that was split.
+    if mapped.clbits:
+        out.add_bits(mapped.clbits)
+    for creg in mapped.cregs:
+        out.add_register(creg)
+    clbit_at = {clbit: index for index, clbit in enumerate(mapped.clbits)}
 
     qpus = sorted(local_routed)
     data: dict[int, list[Any]] = {}
@@ -515,6 +522,18 @@ def reassemble_distributed_program(
     queues: dict[int, dict[int, deque[int]]] = {}
     retired: dict[int, list[bool]] = {}
     marker_at: dict[tuple[int, int], int] = {}
+
+    def carried_clbits(instruction: Any) -> list[Any]:
+        """Map an instruction's classical arguments onto the merged circuit."""
+        if not instruction.clbits:
+            return []
+        try:
+            return [out.clbits[clbit_at[clbit]] for clbit in instruction.clbits]
+        except KeyError:  # pragma: no cover - defensive
+            raise ValueError(
+                "a per-QPU program uses classical bits the mapped circuit "
+                "does not have"
+            ) from None
 
     for qpu in qpus:
         circuit = local_routed[qpu]
@@ -564,7 +583,7 @@ def reassemble_distributed_program(
                     out.append(
                         instruction.operation,
                         [out.qubits[index_of[qpu][q]] for q in instruction.qubits],
-                        [],
+                        carried_clbits(instruction),
                     )
                 retire(qpu, index)
                 remaining[qpu] -= 1
@@ -586,10 +605,11 @@ def reassemble_distributed_program(
                 sides.append((qpu, marker))
             if not sides:
                 continue
+            source = mapped.data[op.index]
             out.append(
-                mapped.data[op.index].operation,
+                source.operation,
                 [out.qubits[op.q0_phys], out.qubits[op.q1_phys]],
-                [],
+                carried_clbits(source),
             )
             for qpu, marker in sides:
                 retire(qpu, marker)

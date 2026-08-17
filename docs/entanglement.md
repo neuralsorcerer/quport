@@ -188,6 +188,11 @@ quport ebits --n-logical 4 --depth 4 --config small.json --verify --emit-qasm te
 
 Verification is a state-vector simulation and is refused above 24 qubits.
 
+Because it compares state vectors it speaks about the state a circuit prepares.
+Terminating measurements are dropped -- they read that state out without changing
+it -- while a measurement or reset that later operations depend on changes what
+the circuit computes, and is refused rather than quietly ignored.
+
 ## Reading the numbers
 
 | Field | Where | Meaning |

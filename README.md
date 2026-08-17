@@ -564,6 +564,12 @@ This is the inverse of `split_into_qpus`, and it is a verification tool rather
 than a runtime -- the point of distributed compilation is that these programs run
 on separate devices.
 
+Both verifiers compare state vectors, so they speak about the state a circuit
+prepares. Measurements that come last are dropped, since they read that state out
+without changing it; a measurement or reset that later operations depend on
+genuinely changes what the circuit computes and is refused rather than quietly
+ignored.
+
 ### From plan to circuit, and proving it
 
 A communication plan is only worth as much as the protocol it stands for, so
@@ -1442,7 +1448,7 @@ quport --help
 - Each gate is charged to exactly one packet root, so the e-bit count is exact for that assignment and an upper bound over all assignments of symmetric gates.
 - Teleport blocks are not merged: every non-diagonal cross-QPU gate pays its own round trip of two e-bits.
 - Emitted protocol circuits expand cat blocks in full; teleport blocks show the state movement as a `swap` in and out of the host ancilla rather than the Bell-measurement gadget, because the return trip needs a mid-circuit reset that would make the program non-unitary and so unverifiable by the same route.
-- State-vector verification is exponential in circuit width and is refused above 24 qubits.
+- State-vector verification is exponential in circuit width and is refused above 24 qubits, and it is refused outright for circuits with mid-circuit measurement or reset.
 - Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.

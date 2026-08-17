@@ -458,3 +458,150 @@ def test_reassembly_validates_its_arguments() -> None:
         reassemble_distributed_program(qc, {}, [], object())  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="must be a QuantumCircuit"):
         reassemble_distributed_program(qc, {0: object()}, [], arch)  # type: ignore[dict-item]
+
+
+# ---------------------------------------------------------------------------
+# Circuit shapes beyond the random benchmark
+# ---------------------------------------------------------------------------
+
+
+def _ghz(n_qubits: int) -> QuantumCircuit:
+    circuit = QuantumCircuit(n_qubits)
+    circuit.h(0)
+    for target in range(1, n_qubits):
+        circuit.cx(0, target)
+    return circuit
+
+
+def _qft(n_qubits: int) -> QuantumCircuit:
+    import math
+
+    circuit = QuantumCircuit(n_qubits)
+    for control in range(n_qubits):
+        circuit.h(control)
+        for target in range(control + 1, n_qubits):
+            circuit.cp(math.pi / 2 ** (target - control), target, control)
+    return circuit
+
+
+def _measured_ghz(n_qubits: int) -> QuantumCircuit:
+    circuit = _ghz(n_qubits)
+    measured = QuantumCircuit(n_qubits, n_qubits)
+    measured.compose(circuit, inplace=True)
+    measured.barrier()
+    for qubit in range(n_qubits):
+        measured.measure(qubit, qubit)
+    return measured
+
+
+def _cz_chain(n_qubits: int) -> QuantumCircuit:
+    circuit = QuantumCircuit(n_qubits)
+    for qubit in range(n_qubits):
+        circuit.h(qubit)
+    for qubit in range(n_qubits - 1):
+        circuit.cz(qubit, qubit + 1)
+    for qubit in range(n_qubits - 1):
+        circuit.cx(qubit, qubit + 1)
+    return circuit
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [_ghz, _qft, _measured_ghz, _cz_chain],
+    ids=["ghz", "qft", "measured", "cz"],
+)
+@pytest.mark.parametrize("intra", ["clique", "line"])
+@pytest.mark.parametrize(
+    "basis", [("rz", "sx", "x", "cx"), ("rz", "sx", "x", "cz")], ids=["cx", "cz"]
+)
+def test_structured_circuits_survive_the_whole_pipeline(
+    builder: object, intra: str, basis: tuple[str, ...]
+) -> None:
+    """Shapes the random benchmark never produces, end to end.
+
+    A shared control (`ghz`), a controlled-phase ladder (`qft`), terminating
+    measurement with a classical register, and symmetric two-qubit gates whose
+    root the aggregator has to choose (`cz`). A CZ basis matters because it is
+    the only way the symmetric-root path is reached at all.
+    """
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology=intra,  # type: ignore[arg-type]
+        basis_gates=basis,
+        optimization_level=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    result = compile_distributed(builder(5), cfg, seed=1, strategy="ebit")  # type: ignore[operator]
+
+    assert verify_distributed_program(
+        result.physical_circuit, result.local_routed, result.routed_remote_ops, arch
+    )
+    if result.aggregation.unschedulable_gates == 0:
+        assert verify_telegate_equivalence(
+            result.physical_circuit, arch, result.aggregation
+        )
+
+
+def test_terminating_measurements_and_classical_bits_round_trip() -> None:
+    """Reassembly has to carry classical arguments, or `measure` cannot be rebuilt."""
+    from quport.distributed import reassemble_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1, optimization_level=0
+    )
+    arch = MultiQPUArchitecture(cfg)
+    result = compile_distributed(_measured_ghz(5), cfg, seed=1)
+
+    merged = reassemble_distributed_program(
+        result.physical_circuit,
+        result.local_routed,
+        result.routed_remote_ops,
+        arch,
+        restore_layout=False,
+    )
+
+    assert merged.num_clbits == result.physical_circuit.num_clbits
+    assert merged.count_ops()["measure"] == 5
+
+
+def test_verification_refuses_mid_circuit_measurement() -> None:
+    """State-vector comparison cannot represent a measurement others depend on."""
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1, optimization_level=0
+    )
+    arch = MultiQPUArchitecture(cfg)
+    circuit = QuantumCircuit(4, 1)
+    circuit.h(0)
+    circuit.measure(0, 0)
+    circuit.cx(0, 2)
+    result = compile_distributed(circuit, cfg, seed=0)
+
+    with pytest.raises(ValueError, match="mid-circuit measure"):
+        verify_distributed_program(
+            result.physical_circuit, result.local_routed, result.routed_remote_ops, arch
+        )
+
+
+def test_symmetric_cz_across_qpus_is_served_and_correct() -> None:
+    """Both operands of a CZ are diagonal, so the aggregator picks a root."""
+    arch = _arch(compute=2)
+    qc = QuantumCircuit(arch.n_phys)
+    qc.h(0)
+    qc.h(3)
+    qc.cz(0, 3)
+    qc.cz(0, 3)
+
+    plan = aggregate_remote_operations(qc, arch)
+
+    # One cat copy serves both gates: a CZ leaves its root diagonal.
+    assert len(plan.blocks) == 1
+    assert plan.blocks[0].protocol == "cat"
+    assert plan.epr_pairs == 1
+    assert plan.baseline_epr_pairs == 2
+    assert verify_telegate_equivalence(qc, arch, plan)

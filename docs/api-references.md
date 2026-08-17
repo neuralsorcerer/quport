@@ -416,8 +416,11 @@ verify_distributed_program(mapped, local_routed, remote_ops, arch, *,
 `reassemble_distributed_program` is the inverse of `split_into_qpus`: it merges
 per-QPU programs and a remote-op manifest back into one circuit and, with
 `restore_layout=True`, undoes each QPU's routing permutation so the result is
-directly comparable with the mapped circuit. `verify_distributed_program` does
-that comparison by state-vector simulation.
+directly comparable with the mapped circuit. Classical bits and registers are
+carried across, so measurements and conditioned operations survive the round
+trip. `verify_distributed_program` does that comparison by state-vector
+simulation: terminating measurements are dropped, and a circuit with mid-circuit
+measurement or reset is refused.
 
 A distributed program is a **partial** order. Within a QPU the constraint is per
 qubit, so instructions on disjoint qubits may run in either order, and two QPUs
