@@ -63,6 +63,7 @@ Package releases <https://github.com/neuralsorcerer/quport/releases>
 | Sweep topology/port settings | `sweep_topologies` or `quport sweep` | Aggregates repeated benchmark rows by architecture setting |
 | Count EPR pairs and inspect the communication plan | `quport ebits` or `compile_distributed(...).aggregation` | Reports e-bit demand after cat-entanglement aggregation, not just cut gates |
 | Judge how good a partition actually is | `quport optimal` or `partition_gap` | Solves the same instance exactly, so a heuristic's result has a scale to be read against |
+| Check that a schedule manifest adds up | `audit_topology_schedule_plan` | Re-derives every figure in a plan independently, so a consumer can tell a sound manifest from a wrong one |
 | Inspect communication bottlenecks | `estimate_topology_schedule_plan` | Returns layer/round traces with absolute timing, port usage, link utilization, and a validated JSON-ready `to_dict()` manifest |
 
 ## Documentation accuracy policy

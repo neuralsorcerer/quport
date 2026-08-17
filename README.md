@@ -74,6 +74,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Distributed compilation into per-QPU OpenQASM 3 programs, remote-operation JSON, and schedule JSON.
 - Schedule estimation under QPU-port, link-capacity, network-hop, switch-pair, and switch-reconfiguration constraints.
 - Event-driven, resource-constrained entanglement scheduling with per-port hold times, per-link channels, hop-scaled EPR distribution, and a heralded-success retry model.
+- Independent auditing of a finished schedule plan, re-deriving its layer and round intervals, port and link usage, and summary aggregates from the outside, so a shipped manifest is a checked claim rather than a stated one.
 - Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, EPR pairs, and makespan.
 - CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
@@ -1449,6 +1450,22 @@ contradict each other rather than silently picking an order.
 
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
+
+`schedule_trace.json` is audited before it is written. The estimator produces the
+summary and the trace in one pass, so nothing inside it cross-checks the two, and a
+consumer of the manifest cannot tell a sound one from a self-consistent-looking
+wrong one. `quport.schedule.audit_topology_schedule_plan` rebuilds every figure
+from the outside — layer and round intervals chain and each `end_time` is its
+`start_time` plus its duration; a layer lasts $\max(\text{local}, \sum \text{round
+durations})$; each round's port and link usage is exactly what routing its pairs
+consumes, and neither exceeds `comm_qubits_per_qpu` or `link_capacity`; each round
+lasts as long as its slowest placed operation; and all six summary fields agree
+with the trace. Passing the mapped circuit adds the one check that needs it: that
+the plan accounts for exactly the operations spanning more than one QPU. What it
+deliberately does not re-derive is the cost model — per-hop EPR time, classical-RTT
+overlap, the round-packing policy — because those are modelling choices rather than
+claims; the audit checks the plan is a faithful, feasible account of them.
+`compile-dist` refuses to write a manifest that does not add up.
 
 `q0_phys` and `q1_phys` here are positions in the *routed* per-QPU programs, not
 in `physical_circuit`. Local routing permutes qubits inside a QPU whenever

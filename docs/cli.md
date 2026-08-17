@@ -174,6 +174,13 @@ benchmark. Output artifacts:
 The schedule JSON writers use `allow_nan=False` and the schedule serializers
 validate timings, counts, QPU pairs, and link-utilization pairs before export.
 
+Before `schedule_trace.json` is written, `audit_topology_schedule_plan` re-derives
+every figure in it independently — layer and round intervals, per-round port and
+link usage against the configured budgets, round durations, and all six summary
+aggregates — plus a check that the plan accounts for exactly the cross-QPU
+operations the circuit contains. A manifest that does not add up is reported and
+not written, and the command exits non-zero.
+
 Recommended checks after running:
 
 ```bash

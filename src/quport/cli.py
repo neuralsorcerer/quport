@@ -20,6 +20,7 @@ from qiskit.exceptions import MissingOptionalLibraryError
 from rich.console import Console
 from rich.table import Table
 
+from quport.architecture import MultiQPUArchitecture
 from quport.compiler import compile_distributed
 from quport.config import (
     LatencyModel,
@@ -39,6 +40,7 @@ from quport.pipeline import (
     random_benchmark_circuit,
     sweep_topologies,
 )
+from quport.schedule import audit_topology_schedule_plan
 
 app = typer.Typer(
     add_completion=False, help="QuPort: multi-QPU circuit mapping + benchmarks"
@@ -731,6 +733,21 @@ def compile_dist(
         json.dumps(res.schedule.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",
     )
+    # The trace is written for downstream consumers to schedule against, and a
+    # consumer cannot tell a sound manifest from a self-consistent-looking wrong
+    # one. Re-derive its numbers before shipping it, and refuse to ship a
+    # manifest that does not add up.
+    inconsistencies = audit_topology_schedule_plan(
+        res.schedule_plan, MultiQPUArchitecture(cfg), latency, res.physical_circuit
+    )
+    if inconsistencies:
+        console.print("[bold red]Schedule plan is inconsistent:[/bold red]")
+        for problem in inconsistencies[:10]:
+            console.print(f"  {problem}")
+        if len(inconsistencies) > 10:
+            console.print(f"  ... and {len(inconsistencies) - 10} more")
+        raise typer.Exit(code=1)
+
     (outp / "schedule_trace.json").write_text(
         json.dumps(res.schedule_plan.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",

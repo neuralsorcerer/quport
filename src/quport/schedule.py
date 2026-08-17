@@ -393,6 +393,19 @@ class RemoteRoundTrace:
     ``start_time`` and ``end_time`` are absolute offsets in the schedule plan.
     They make the trace directly consumable by simulators and visualization tools
     without re-integrating layer and round durations from the summary.
+
+    A round is one of two kinds, and ``unschedulable_ops`` tells them apart:
+
+    ``unschedulable_ops == 0``
+        A real round. ``qpu_pairs`` lists the operations placed in it, one entry
+        each, and ``qpu_ports_used`` and ``link_utilization`` are exactly what
+        those operations consume.
+    ``unschedulable_ops > 0``
+        A penalty round for operations no port, link, or route could serve.
+        ``qpu_pairs`` still names them, one entry each, so the count of
+        operations a round accounts for is ``unschedulable_ops or
+        len(qpu_pairs)`` -- never their sum, which would count a penalty
+        operation twice.
     """
 
     layer_index: int
@@ -932,6 +945,255 @@ def estimate_topology_schedule_plan(
     per-QPU port usage, per-link utilization, and unschedulable penalty rounds.
     """
     return _topology_schedule_plan(mapped, arch, model)
+
+
+def audit_topology_schedule_plan(
+    plan: TopologySchedulePlan,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+    mapped: QuantumCircuit | None = None,
+) -> tuple[str, ...]:
+    """Re-derive a schedule plan's numbers from the outside, and report mismatches.
+
+    The estimator computes the summary and the trace in one pass, which means
+    nothing in it cross-checks the two, or checks either against the resource
+    budgets the plan claims to respect. A downstream consumer of
+    ``schedule_trace.json`` has no way to tell a sound manifest from a
+    self-consistent-looking wrong one. This walks the finished plan and rebuilds
+    each figure independently:
+
+    - layer and round intervals chain, and every ``end_time`` is its
+      ``start_time`` plus its duration;
+    - a layer lasts ``max(local_duration, sum of its round durations)``;
+    - each round's ``qpu_ports_used`` and ``link_utilization`` are exactly what
+      routing its ``qpu_pairs`` over shortest paths consumes, and neither exceeds
+      ``comm_qubits_per_qpu`` or ``link_capacity``;
+    - each round lasts as long as its slowest placed operation;
+    - the six summary fields agree with the trace they summarise.
+
+    Passing ``mapped`` adds the one check that needs the circuit: that the plan
+    accounts for exactly the operations that actually span QPUs, counted the way
+    :func:`quport.distributed.split_into_qpus` counts them.
+
+    What this does *not* re-derive is the cost model itself -- per-hop EPR time,
+    classical-RTT overlap, and the round-packing policy are taken as given, since
+    they are modelling choices rather than claims. It checks that the plan is a
+    faithful, feasible account of those choices.
+
+    Returns
+    -------
+    tuple[str, ...]
+        One description per inconsistency, in the order found. Empty means every
+        figure was reproduced.
+    """
+    lat = _validate_schedule_inputs(arch, model)
+    cfg = arch.cfg
+    n_qpus = cfg.n_qpus
+    sp = arch.qpu_shortest_paths()
+    ports = _validated_nonnegative_int(
+        cfg.comm_qubits_per_qpu, label="comm_qubits_per_qpu"
+    )
+    link_cap = _validated_nonnegative_int(
+        getattr(cfg, "link_capacity", 1), label="link_capacity"
+    )
+    is_switch_like = cfg.inter_topology in ("switch", "mesh") or (
+        cfg.inter_topology == "clos" and cfg.comm_qubits_per_qpu >= 2
+    )
+    reconfig = (
+        _validated_nonnegative_finite(
+            getattr(cfg, "switch_reconfig_delay", 0.0), label="switch_reconfig_delay"
+        )
+        if is_switch_like
+        else 0.0
+    )
+    classical_eff = _effective_classical_rtt(cfg, lat)
+
+    problems: list[str] = []
+
+    def close(left: float, right: float) -> bool:
+        return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-9)
+
+    summary = plan.summary
+    elapsed = 0.0
+    seen_rounds = 0
+    seen_remote = 0
+    peak_link = 0
+    peak_ports = 0
+
+    for index, layer in enumerate(plan.layers):
+        where = f"layer {index}"
+        if layer.layer_index != index:
+            problems.append(f"{where}: layer_index is {layer.layer_index}")
+        if not close(layer.start_time, elapsed):
+            problems.append(
+                f"{where}: starts at {layer.start_time}, but the layers before it "
+                f"end at {elapsed}"
+            )
+        if not close(layer.end_time, layer.start_time + layer.duration):
+            problems.append(
+                f"{where}: ends at {layer.end_time}, not start + duration "
+                f"({layer.start_time + layer.duration})"
+            )
+
+        rounds_time = 0.0
+        for r_index, rnd in enumerate(layer.remote_rounds):
+            spot = f"{where} round {r_index}"
+            if rnd.layer_index != index:
+                problems.append(f"{spot}: layer_index is {rnd.layer_index}")
+            if rnd.round_index != r_index:
+                problems.append(f"{spot}: round_index is {rnd.round_index}")
+            if not close(rnd.start_time, layer.start_time + rounds_time):
+                problems.append(
+                    f"{spot}: starts at {rnd.start_time}, but the rounds before it "
+                    f"end at {layer.start_time + rounds_time}"
+                )
+            if not close(rnd.end_time, rnd.start_time + rnd.duration):
+                problems.append(
+                    f"{spot}: ends at {rnd.end_time}, not start + duration "
+                    f"({rnd.start_time + rnd.duration})"
+                )
+            rounds_time += rnd.duration
+
+            if len(rnd.qpu_ports_used) != n_qpus:
+                problems.append(
+                    f"{spot}: qpu_ports_used has {len(rnd.qpu_ports_used)} entries "
+                    f"for {n_qpus} QPUs"
+                )
+            for qpu, used in enumerate(rnd.qpu_ports_used):
+                if used > ports:
+                    problems.append(
+                        f"{spot}: QPU {qpu} holds {used} ports, budget is {ports}"
+                    )
+                peak_ports = max(peak_ports, used)
+            for edge, count in rnd.link_utilization:
+                if count > link_cap:
+                    problems.append(
+                        f"{spot}: link {edge} carries {count}, capacity is {link_cap}"
+                    )
+                peak_link = max(peak_link, count)
+
+            if rnd.unschedulable_ops:
+                # A penalty round stands for operations that could not be
+                # placed. It still lists the pair it was going to serve, for
+                # diagnostics, so its operands are named twice and count once.
+                if not close(rnd.duration, UNSCHEDULABLE_PENALTY):
+                    problems.append(
+                        f"{spot}: penalty round lasts {rnd.duration}, "
+                        f"not {UNSCHEDULABLE_PENALTY}"
+                    )
+                if len(rnd.qpu_pairs) != rnd.unschedulable_ops:
+                    problems.append(
+                        f"{spot}: names {len(rnd.qpu_pairs)} pairs for "
+                        f"{rnd.unschedulable_ops} unschedulable operations"
+                    )
+            else:
+                expected_ports = [0] * n_qpus
+                expected_link: dict[QpuEdge, int] = {}
+                worst = 0.0
+                for a, b in rnd.qpu_pairs:
+                    expected_ports[a] += 1
+                    expected_ports[b] += 1
+                    for edge in path_edges(sp, a, b):
+                        expected_link[edge] = expected_link.get(edge, 0) + 1
+                    worst = max(
+                        worst,
+                        sp.dist[a][b] * lat.epr_gen
+                        + classical_eff
+                        + lat.remote_gate_overhead,
+                    )
+                if tuple(expected_ports) != tuple(rnd.qpu_ports_used):
+                    problems.append(
+                        f"{spot}: reports ports {list(rnd.qpu_ports_used)}, but its "
+                        f"pairs consume {expected_ports}"
+                    )
+                if tuple(sorted(expected_link.items())) != tuple(rnd.link_utilization):
+                    problems.append(
+                        f"{spot}: reports links {list(rnd.link_utilization)}, but its "
+                        f"pairs consume {sorted(expected_link.items())}"
+                    )
+                if rnd.qpu_pairs and not close(rnd.duration, worst + reconfig):
+                    problems.append(
+                        f"{spot}: lasts {rnd.duration}, but its slowest operation "
+                        f"takes {worst + reconfig}"
+                    )
+
+            seen_rounds += 1
+            seen_remote += rnd.unschedulable_ops or len(rnd.qpu_pairs)
+
+        if not close(layer.duration, max(layer.local_duration, rounds_time)):
+            problems.append(
+                f"{where}: lasts {layer.duration}, not max(local {layer.local_duration},"
+                f" rounds {rounds_time})"
+            )
+        counted = sum(
+            rnd.unschedulable_ops or len(rnd.qpu_pairs) for rnd in layer.remote_rounds
+        )
+        if layer.remote_ops != counted:
+            problems.append(
+                f"{where}: claims {layer.remote_ops} remote ops, its rounds hold "
+                f"{counted}"
+            )
+        elapsed += layer.duration
+
+    if summary.layers != len(plan.layers):
+        problems.append(
+            f"summary: claims {summary.layers} layers, the trace has "
+            f"{len(plan.layers)}"
+        )
+    if not close(summary.makespan, elapsed):
+        problems.append(
+            f"summary: makespan {summary.makespan}, layer durations sum to {elapsed}"
+        )
+    if summary.remote_ops != seen_remote:
+        problems.append(
+            f"summary: claims {summary.remote_ops} remote ops, the trace holds "
+            f"{seen_remote}"
+        )
+    if summary.remote_rounds != seen_rounds:
+        problems.append(
+            f"summary: claims {summary.remote_rounds} rounds, the trace has "
+            f"{seen_rounds}"
+        )
+    if summary.peak_link_util != peak_link:
+        problems.append(
+            f"summary: peak_link_util {summary.peak_link_util}, the trace peaks at "
+            f"{peak_link}"
+        )
+    if summary.peak_qpu_ports_used != peak_ports:
+        problems.append(
+            f"summary: peak_qpu_ports_used {summary.peak_qpu_ports_used}, the trace "
+            f"peaks at {peak_ports}"
+        )
+
+    if mapped is not None:
+        actual = _count_cross_qpu_operations(mapped, arch)
+        if summary.remote_ops != actual:
+            problems.append(
+                f"summary: accounts for {summary.remote_ops} remote ops, the circuit "
+                f"has {actual} operations spanning more than one QPU"
+            )
+
+    return tuple(problems)
+
+
+def _count_cross_qpu_operations(
+    mapped: QuantumCircuit, arch: MultiQPUArchitecture
+) -> int:
+    """Count operations spanning more than one QPU, as one remote event each.
+
+    A wide operation is charged once, between its leading QPU and the first
+    operand elsewhere, matching :func:`quport.distributed.split_into_qpus` and
+    every schedule estimator.
+    """
+    qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
+    count = 0
+    for instruction in mapped.data:
+        if getattr(instruction.operation, "_directive", False):
+            continue
+        qpus = _instruction_qpus(instruction.qubits, qindex, phys_to_qpu)
+        if len(qpus) >= 2 and _first_remote_partner(qpus) is not None:
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

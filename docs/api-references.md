@@ -373,6 +373,34 @@ A supplied plan must have been built with the same port budget; a larger one rai
 
 See [Entanglement model](entanglement.md).
 
+### `audit_topology_schedule_plan`
+
+```python
+audit_topology_schedule_plan(plan, arch, model, mapped=None) -> tuple[str, ...]
+```
+
+Re-derives a `TopologySchedulePlan`'s numbers from the outside and returns one
+description per inconsistency; an empty tuple means every figure was reproduced.
+The estimator builds the summary and the trace in one pass, so nothing in it
+cross-checks the two or checks either against the budgets the plan claims to
+respect. This checks that:
+
+- layer and round intervals chain, and each `end_time` is `start_time + duration`;
+- a layer lasts `max(local_duration, sum of its round durations)`;
+- each round's `qpu_ports_used` and `link_utilization` are exactly what routing its
+  `qpu_pairs` consumes, within `comm_qubits_per_qpu` and `link_capacity`;
+- each round lasts as long as its slowest placed operation;
+- the six summary fields agree with the trace they summarise.
+
+Passing `mapped` adds the check that needs the circuit: that the plan accounts for
+exactly the operations spanning more than one QPU, counted as `split_into_qpus`
+counts them. The cost model itself — per-hop EPR time, classical-RTT overlap, the
+round-packing policy — is taken as given; those are modelling choices, and the
+audit checks the plan is a faithful, feasible account of them.
+
+`quport compile-dist` runs this before writing `schedule_trace.json` and refuses to
+write a manifest that does not add up.
+
 ### Entanglement API
 
 ```python
