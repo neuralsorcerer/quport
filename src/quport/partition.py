@@ -33,6 +33,11 @@ from quport.network import (
     route_prepared_link_loads,
 )
 
+#: Which demand the congestion term routes. ``"gates"`` counts one transaction
+#: per cut two-qubit gate; ``"ebits"`` counts one per EPR pair actually
+#: consumed after aggregation, which needs a packet decomposition.
+CongestionSource = Literal["gates", "ebits"]
+
 
 def _validate_and_normalize_partition_inputs(
     n: int,
@@ -221,6 +226,17 @@ def _validate_packets(
     if packets.n_qubits != n:
         raise ValueError("packets must describe the same number of logical qubits as n")
     return packets
+
+
+def _validate_congestion_source(
+    congestion_source: object, *, packets: PacketDecomposition | None
+) -> CongestionSource:
+    """Validate the congestion demand model against the inputs it needs."""
+    if congestion_source not in ("gates", "ebits"):
+        raise ValueError("congestion_source must be 'gates' or 'ebits'")
+    if congestion_source == "ebits" and packets is None:
+        raise ValueError("congestion_source 'ebits' requires packets")
+    return cast(CongestionSource, congestion_source)
 
 
 def _validate_alpha_balance(alpha_balance: float) -> float:
@@ -636,6 +652,7 @@ def _objective_tpccap(
     congestion_routing: Literal["single_path", "ecmp"],
     packets: PacketDecomposition | None = None,
     w_ebit: float = 0.0,
+    congestion_source: CongestionSource = "gates",
     prepared: _ObjectiveInputs | None = None,
 ) -> tuple[float, PartitionDiagnostics]:
     """Compute the TPCCAP objective and diagnostics.
@@ -654,6 +671,10 @@ def _objective_tpccap(
     - e-bit term counts the EPR pairs a cat-entanglement compiler actually
       consumes, which is what cut weight fails to capture: many gates sharing
       one root and one destination cost one e-bit, not one each.
+    - ``congestion_source="ebits"`` routes EPR-pair demand instead of gate
+      demand, so the congestion term describes the same traffic the e-bit term
+      is priced from. Gate demand upper-bounds it, sometimes by a large factor,
+      because aggregation is exactly the business of removing transactions.
     """
     # Weighted cut distance
     wcd = 0.0
@@ -675,11 +696,28 @@ def _objective_tpccap(
         overflow = max(0, boundary[q] - comm_ports_per_qpu)
         port_overflow_l2 += float(overflow * overflow)
 
+    # E-bit demand under cat-entanglement aggregation.  Evaluated whenever a
+    # packet decomposition is available so the diagnostic is populated even for
+    # a pure-diagnostic run with w_ebit == 0.  It runs before congestion because
+    # it can supply the traffic the congestion term routes.
+    ebits = 0
+    weighted_ebits = 0.0
+    ebit_traffic: list[list[float]] | None = None
+    if packets is not None:
+        if congestion_source == "ebits":
+            ebit_traffic = [[0.0] * n_qpus for _ in range(n_qpus)]
+        ebits, weighted_ebits = _ebit_objective_fast(
+            packets, part, n_qpus, sp.dist, ebit_traffic
+        )
+
     # Congestion (route traffic along shortest paths).  Disconnected topologies
     # can make some candidate cuts unroutable; remove that traffic before
     # invoking strict shortest-path routing and add virtual high-cost loads to
     # the diagnostics/objective instead.
-    if prepared is None:
+    traffic: list[list[float]]
+    if ebit_traffic is not None:
+        traffic = ebit_traffic
+    elif prepared is None:
         traffic = compute_traffic_matrix(weights, part, n_qpus)
     else:
         traffic = [[0.0] * n_qpus for _ in range(n_qpus)]
@@ -692,14 +730,6 @@ def _objective_tpccap(
     cong = congestion_metrics(loads)
     congestion_l2 = cong.l2_load + unreachable_l2
     congestion_max = max(cong.max_load, unreachable_max)
-
-    # E-bit demand under cat-entanglement aggregation.  Evaluated whenever a
-    # packet decomposition is available so the diagnostic is populated even for
-    # a pure-diagnostic run with w_ebit == 0.
-    ebits = 0
-    weighted_ebits = 0.0
-    if packets is not None:
-        ebits, weighted_ebits = _ebit_objective_fast(packets, part, n_qpus, sp.dist)
 
     obj = (
         w_dist * wcd
@@ -779,6 +809,7 @@ def _tpccap_partition_from_normalized(
     congestion_routing: Literal["single_path", "ecmp"],
     packets: PacketDecomposition | None = None,
     w_ebit: float = 0.0,
+    congestion_source: CongestionSource = "gates",
 ) -> tuple[PartitionResult, PartitionDiagnostics]:
     """TPCCAP search core operating on validated, normalized weights."""
     rng = random.Random(seed)
@@ -811,6 +842,7 @@ def _tpccap_partition_from_normalized(
         congestion_routing=congestion_routing,
         packets=packets,
         w_ebit=w_ebit,
+        congestion_source=congestion_source,
         prepared=prepared,
     )
 
@@ -863,6 +895,7 @@ def _tpccap_partition_from_normalized(
                     congestion_routing=congestion_routing,
                     packets=packets,
                     w_ebit=w_ebit,
+                    congestion_source=congestion_source,
                     prepared=prepared,
                 )
 
@@ -911,6 +944,7 @@ def tpccap_partition(
     # Entanglement-aware objective (optional)
     packets: PacketDecomposition | None = None,
     w_ebit: float = 0.0,
+    congestion_source: CongestionSource = "gates",
 ) -> tuple[PartitionResult, PartitionDiagnostics]:
     """Topology- and Port-Constrained Congestion-Aware Partitioning (TPCCAP).
 
@@ -954,6 +988,12 @@ def tpccap_partition(
         minimise the EPR pairs a cat-entanglement compiler would consume rather
         than the raw number of cut gates -- the two differ whenever several
         gates share a root and a destination QPU.
+    congestion_source:
+        Which demand the congestion term routes. ``"gates"`` (the default, and
+        the historical behaviour) charges one transaction per cut two-qubit
+        gate; ``"ebits"`` charges one per EPR pair that survives aggregation,
+        and requires ``packets``. Gate demand upper-bounds e-bit demand, so on
+        an aggregating machine it reports congestion that never happens.
 
     Returns
     -------
@@ -985,6 +1025,9 @@ def tpccap_partition(
         capacity=capacity,
     )
     packets_value = _validate_packets(packets, n=n)
+    congestion_source = _validate_congestion_source(
+        congestion_source, packets=packets_value
+    )
     if n == 0:
         return _empty_partition_result(n_qpus), _zero_partition_diagnostics()
 
@@ -1004,6 +1047,7 @@ def tpccap_partition(
         congestion_routing=congestion_routing,
         packets=packets_value,
         w_ebit=w_ebit_value,
+        congestion_source=congestion_source,
     )
 
 
@@ -1039,6 +1083,7 @@ def tpccap_sa_partition(
     # Entanglement-aware objective (optional)
     packets: PacketDecomposition | None = None,
     w_ebit: float = 0.0,
+    congestion_source: CongestionSource = "gates",
 ) -> tuple[PartitionResult, PartitionDiagnostics, AnnealDiagnostics]:
     """TPCCAP + simulated annealing refinement (TPCCAP-SA).
 
@@ -1072,6 +1117,19 @@ def tpccap_sa_partition(
 
     The defaults reproduce the historical behaviour exactly, so existing benchmark
     numbers are unaffected by exposing these as parameters.
+
+    ``congestion_source`` selects which demand the congestion term routes, and
+    ``w_ebit`` which communication volume the objective prices; see
+    :func:`tpccap_partition`. Both default to the historical behaviour.
+
+    Scaling the terms
+    -----------------
+    ``w_port`` and ``w_cong`` were tuned against a ``w_dist`` term that counts
+    every cut gate. Switching the volume term to e-bits shrinks it by the
+    aggregation factor -- often an order of magnitude -- and a penalty left at
+    its old scale then dominates the objective it was meant to bias. Whichever
+    terms are combined, they have to be commensurate; QuPort's ``"ebit"``
+    compile strategy sets the penalties accordingly.
 
     Notes
     -----
@@ -1110,6 +1168,7 @@ def tpccap_sa_partition(
         capacity=capacity,
     )
     packets = _validate_packets(packets, n=n)
+    congestion_source = _validate_congestion_source(congestion_source, packets=packets)
     if n == 0:
         return (
             _empty_partition_result(n_qpus),
@@ -1133,6 +1192,7 @@ def tpccap_sa_partition(
         congestion_routing="ecmp",
         packets=packets,
         w_ebit=w_ebit,
+        congestion_source=congestion_source,
     )
 
     part = list(pres.part)
@@ -1154,6 +1214,7 @@ def tpccap_sa_partition(
             congestion_routing="ecmp",
             packets=packets,
             w_ebit=w_ebit,
+            congestion_source=congestion_source,
             prepared=prepared,
         )
 

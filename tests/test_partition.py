@@ -1594,3 +1594,121 @@ def test_tpccap_sa_rejects_negative_objective_weights(field: str, value: float) 
         tpccap_sa_partition(
             2, {(0, 1): 1.0}, 2, 2, 1, sp, seed=0, steps=1, **{field: value}
         )
+
+
+# ---------------------------------------------------------------------------
+# Congestion demand model
+# ---------------------------------------------------------------------------
+
+
+def _star_packets(n: int) -> Any:
+    """A control fanning out to every other qubit: many gates, few e-bits."""
+    from qiskit import QuantumCircuit
+
+    from quport.hypergraph import build_distributable_packets
+
+    qc = QuantumCircuit(n)
+    for target in range(1, n):
+        for _ in range(4):
+            qc.cz(0, target)
+    return build_distributable_packets(qc)
+
+
+def test_ebit_congestion_routes_less_traffic_than_gate_congestion() -> None:
+    """Aggregation removes transactions, so gate demand overstates congestion.
+
+    Four repeated ``cz`` gates from one root into one QPU are four cut gates but
+    one EPR pair, so the two demand models disagree by a factor of four on the
+    same partition -- which is exactly the discrepancy that let a congestion
+    term tuned for gate traffic dominate an e-bit objective.
+    """
+    from quport.hypergraph import ebit_traffic_matrix
+    from quport.network import compute_traffic_matrix
+
+    packets = _star_packets(5)
+    weights = {(0, target): 4.0 for target in range(1, 5)}
+    part = [0, 1, 1, 1, 1]
+
+    gate_traffic = compute_traffic_matrix(weights, part, 2)
+    epr_traffic = ebit_traffic_matrix(packets, part, 2)
+
+    assert gate_traffic[0][1] == 16.0
+    assert epr_traffic[0][1] == 1.0
+
+
+def test_congestion_source_ebits_requires_packets() -> None:
+    sp = all_pairs_shortest_paths([[1], [0]])
+
+    with pytest.raises(ValueError, match="congestion_source 'ebits' requires packets"):
+        tpccap_partition(
+            2, {(0, 1): 1.0}, 2, 2, 1, sp, seed=0, congestion_source="ebits"
+        )
+    with pytest.raises(ValueError, match="congestion_source 'ebits' requires packets"):
+        tpccap_sa_partition(
+            2,
+            {(0, 1): 1.0},
+            2,
+            2,
+            1,
+            sp,
+            seed=0,
+            steps=1,
+            congestion_source="ebits",
+        )
+
+
+def test_congestion_source_is_validated() -> None:
+    sp = all_pairs_shortest_paths([[1], [0]])
+
+    with pytest.raises(ValueError, match="congestion_source must be"):
+        tpccap_partition(
+            2, {(0, 1): 1.0}, 2, 2, 1, sp, seed=0, congestion_source="links"
+        )
+
+
+def test_congestion_source_defaults_to_the_historical_behaviour() -> None:
+    """Existing callers must not move, whether or not packets are supplied."""
+    sp = all_pairs_shortest_paths([[1, 2], [0, 2], [0, 1]])
+    weights = {(0, 1): 3.0, (1, 2): 2.0, (0, 2): 1.0, (2, 3): 4.0}
+    packets = _star_packets(4)
+
+    baseline = tpccap_partition(4, weights, 3, 2, 2, sp, seed=0)[0].part
+    explicit = tpccap_partition(
+        4, weights, 3, 2, 2, sp, seed=0, congestion_source="gates"
+    )[0].part
+    with_packets = tpccap_partition(4, weights, 3, 2, 2, sp, seed=0, packets=packets)[
+        0
+    ].part
+
+    assert baseline == explicit == with_packets
+
+
+def test_ebit_congestion_diagnostics_come_from_epr_demand() -> None:
+    """The reported congestion must describe the traffic that was routed."""
+    from quport.hypergraph import ebit_traffic_matrix
+    from quport.network import congestion_metrics, route_link_loads
+
+    sp = all_pairs_shortest_paths([[1], [0]])
+    packets = _star_packets(4)
+    weights = {(0, target): 4.0 for target in range(1, 4)}
+
+    _res, diag = tpccap_partition(
+        4,
+        weights,
+        2,
+        2,
+        2,
+        sp,
+        seed=0,
+        w_dist=0.0,
+        w_port=0.0,
+        w_cong=1.0,
+        packets=packets,
+        w_ebit=1.0,
+        congestion_source="ebits",
+    )
+
+    expected = congestion_metrics(
+        route_link_loads(ebit_traffic_matrix(packets, _res.part, 2), sp, mode="ecmp")
+    )
+    assert diag.congestion_l2 == pytest.approx(expected.l2_load)

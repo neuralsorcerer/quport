@@ -280,6 +280,21 @@ def compile_distributed(
             w_dist=0.0,
             packets=packets,
             w_ebit=1.0,
+            # The remaining terms have to be rescaled to match. `w_port`'s
+            # squared boundary-qubit overflow is one to two orders of magnitude
+            # larger than an e-bit count, and it measures the wrong resource
+            # anyway: what a cat-entanglement compiler needs a port for is a
+            # live cat copy, not every boundary qubit. Under aggregation a port
+            # shortage is already priced -- it costs an eviction and a fresh EPR
+            # pair -- so the penalty is dropped rather than double-counted.
+            w_port=0.0,
+            # Congestion is kept, but routed from EPR demand rather than gate
+            # demand, so it describes the same traffic the e-bit term prices,
+            # and at the same weight in both stages because the 4x annealing
+            # asymmetry was tuned against the larger gate-traffic scale.
+            w_cong=0.05,
+            anneal_w_cong=0.05,
+            congestion_source="ebits",
         )
         part = pres.part
         cut = pres.cut

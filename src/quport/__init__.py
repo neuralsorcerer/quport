@@ -23,6 +23,12 @@ from quport.distributed import (
     write_remote_ops_json,
 )
 from quport.entanglement import diagonal_positions
+from quport.exact import (
+    ExactPartition,
+    PartitionGap,
+    optimal_partition,
+    partition_gap,
+)
 from quport.hypergraph import (
     DistributablePacket,
     EbitReport,
@@ -66,11 +72,13 @@ __all__ = [
     "DistributedProgram",
     "EbitReport",
     "EntanglementScheduleSummary",
+    "ExactPartition",
     "LatencyModel",
     "MultiQPUArchitecture",
     "MultiQPUConfig",
     "LayerScheduleTrace",
     "PacketDecomposition",
+    "PartitionGap",
     "RemoteBlock",
     "RemoteOp",
     "RemoteRoundTrace",
@@ -95,6 +103,8 @@ __all__ = [
     "estimate_parallel_makespan_topology",
     "estimate_topology_schedule_plan",
     "map_and_transpile",
+    "optimal_partition",
+    "partition_gap",
     "reassemble_distributed_program",
     "split_into_qpus",
     "write_distributed_program",

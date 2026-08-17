@@ -276,6 +276,51 @@ def test_compile_distributed_rejects_unknown_strategy() -> None:
         )
 
 
+def test_ebit_strategy_beats_cut_minimisation_at_its_own_objective() -> None:
+    """The e-bit strategy has to actually spend fewer EPR pairs.
+
+    It did not, before the penalty weights were rescaled: ``w_port`` measures
+    squared boundary-qubit overflow, which on these instances is one to two
+    orders of magnitude larger than an e-bit count, so removing the cut-distance
+    term left the port penalty steering the entire search and the strategy lost
+    to plain cut minimisation at the objective it was named for.
+    """
+    cfg = _cfg(n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2)
+    qc = random_benchmark_circuit(n_logical=16, depth=12, seed=0)
+
+    baseline = compile_distributed(qc, cfg, seed=0, strategy="tpccap_sa")
+    entangled = compile_distributed(qc, cfg, seed=0, strategy="ebit")
+
+    assert entangled.ebits.ebits < baseline.ebits.ebits
+    assert entangled.aggregation.epr_pairs < baseline.aggregation.epr_pairs
+
+
+def test_ebit_strategy_lands_near_the_proved_optimum() -> None:
+    """Calibrated against exhaustive-search-verified branch and bound.
+
+    A generous ceiling: the point is to catch a regression that puts the search
+    back into the wrong basin, not to pin a tuning result. `partition_gap` also
+    raises outright if the heuristic scores below the optimum.
+    """
+    from quport.exact import partition_gap
+
+    cfg = _cfg(n_qpus=3, compute_qubits_per_qpu=3, comm_qubits_per_qpu=2)
+    capacity = cfg.capacity_per_qpu()
+
+    for seed in range(3):
+        qc = random_benchmark_circuit(n_logical=9, depth=10, seed=seed)
+        result = compile_distributed(qc, cfg, seed=seed, strategy="ebit")
+        gap = partition_gap(
+            result.partition,
+            cfg.n_qpus,
+            capacity,
+            objective="ebits",
+            packets=result.packets,
+        )
+        assert gap.proved_optimal
+        assert gap.relative <= 0.35
+
+
 def test_aggregation_saves_pairs_on_a_shared_control_circuit() -> None:
     cfg = _cfg(n_qpus=2, compute_qubits_per_qpu=4, comm_qubits_per_qpu=1)
 

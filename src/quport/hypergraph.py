@@ -429,8 +429,16 @@ def _ebit_objective_fast(
     part: Sequence[int],
     n_qpus: int,
     dist: Sequence[Sequence[float]] | None,
+    traffic: list[list[float]] | None = None,
 ) -> tuple[int, float]:
-    """Unvalidated e-bit count and hop-weighted cost for hot loops."""
+    """Unvalidated e-bit count and hop-weighted cost for hot loops.
+
+    When ``traffic`` is given -- a pre-zeroed ``n_qpus`` square matrix -- the
+    same sweep also accumulates the symmetric per-pair EPR demand into it. The
+    cost and the traffic therefore come from one traversal and one set of
+    decisions, so a congestion term built from the matrix cannot describe a
+    different plan from the one the cost prices.
+    """
     seen_stamp = [-1] * n_qpus
     stamp = 0
     count = 0
@@ -446,6 +454,9 @@ def _ebit_objective_fast(
                 seen_stamp[qpu] = stamp
                 count += 1
                 weighted += 1.0 if row is None else row[qpu]
+                if traffic is not None:
+                    traffic[root_qpu][qpu] += 1.0
+                    traffic[qpu][root_qpu] += 1.0
 
     for gate in decomposition.unpackable_gates:
         host = part[gate.qubits[0]]
@@ -458,6 +469,9 @@ def _ebit_objective_fast(
                 seen_stamp[qpu] = stamp
                 count += 2
                 weighted += 2.0 * (1.0 if row is None else row[qpu])
+                if traffic is not None:
+                    traffic[host][qpu] += 2.0
+                    traffic[qpu][host] += 2.0
 
     return count, weighted
 
@@ -493,6 +507,9 @@ def ebit_traffic_matrix(
     Unlike :func:`quport.network.compute_traffic_matrix`, which counts one unit
     per cut gate, this counts one unit per e-bit -- the quantity that actually
     crosses the interconnect once gates are aggregated onto shared cat copies.
+
+    The matrix is filled by the same sweep that computes :func:`ebit_cost`, so
+    its entries always sum to twice that count.
     """
     n_qpus_value = _validate_n_qpus(n_qpus)
     assignments = _validate_part(
@@ -500,25 +517,7 @@ def ebit_traffic_matrix(
     )
 
     traffic = [[0.0] * n_qpus_value for _ in range(n_qpus_value)]
-    seen_stamp = [-1] * n_qpus_value
-    stamp = 0
-
-    for packet in decomposition.packets:
-        stamp += 1
-        root_qpu = assignments[packet.root]
-        for partner in packet.partners:
-            qpu = assignments[partner]
-            if qpu != root_qpu and seen_stamp[qpu] != stamp:
-                seen_stamp[qpu] = stamp
-                traffic[root_qpu][qpu] += 1.0
-                traffic[qpu][root_qpu] += 1.0
-
-    for gate in decomposition.unpackable_gates:
-        host, foreign = _teleport_host_and_foreign(gate, assignments)
-        for qpu in foreign:
-            traffic[host][qpu] += 2.0
-            traffic[qpu][host] += 2.0
-
+    _ebit_objective_fast(decomposition, assignments, n_qpus_value, None, traffic)
     return traffic
 
 
