@@ -10,6 +10,7 @@ import base64
 import json
 import math
 import os
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
 from numbers import Integral
@@ -440,6 +441,204 @@ def _routed_marker(
         )
     qubits, position = entry
     return qubits[0], position
+
+
+def reassemble_distributed_program(
+    mapped: QuantumCircuit,
+    local_routed: Mapping[int, QuantumCircuit],
+    remote_ops: Sequence[RemoteOp],
+    arch: MultiQPUArchitecture,
+    *,
+    restore_layout: bool = True,
+) -> QuantumCircuit:
+    """Merge per-QPU programs and a remote-op manifest back into one circuit.
+
+    This is the inverse of :func:`split_into_qpus` and the check that the pieces
+    a distributed compile emits still describe the circuit they came from. The
+    reassembled circuit is not meant to be executed -- the whole point of
+    distributed compilation is that these programs run on separate devices --
+    but it is directly comparable with the mapped circuit, which is what
+    :func:`quport.protocol.verify_distributed_program` does with it.
+
+    Ordering
+    --------
+    A distributed program is a **partial** order, not a linear one. Within a QPU
+    the constraint is per *qubit*: two instructions touching disjoint qubits may
+    run in either order, and routing routinely emits them in an order that
+    differs from the manifest's. Merging therefore follows qubit dataflow --
+    an instruction runs once it is first in line on every qubit it touches --
+    and a remote operation runs once its marker leads on both sides.
+
+    That is also the contract a consumer of the artifacts has to honour: reading
+    each program strictly linearly can deadlock, because two QPUs can list the
+    same pair of remote operations in opposite orders when they sit on disjoint
+    qubits.
+
+    Parameters
+    ----------
+    mapped:
+        The circuit the programs were split from. Only its width and the
+        operations named by ``remote_ops[k].index`` are used, which is how
+        parameters and custom gates survive the round trip exactly.
+    local_routed:
+        Per-QPU programs, routed or not. Both are accepted; an unrouted program
+        simply has an identity layout.
+    remote_ops:
+        The manifest matching ``local_routed``. Pass
+        :attr:`~quport.compiler.DistributedCompileResult.routed_remote_ops` for
+        routed programs and ``program.remote_ops`` for unrouted ones.
+    restore_layout:
+        Append the swaps that undo each QPU's routing permutation, so the result
+        ends in the mapped circuit's qubit labelling. Without this the output is
+        correct only up to that permutation.
+
+    Raises
+    ------
+    ValueError
+        If a marker is missing, or if the programs impose contradictory orders
+        on the remote operations -- a genuine inconsistency rather than a
+        scheduling choice.
+    """
+    if not isinstance(mapped, QuantumCircuit):
+        raise ValueError("mapped must be a QuantumCircuit")
+    if not isinstance(local_routed, Mapping):
+        raise ValueError("local_routed must be a mapping of QPU id to circuit")
+    if not isinstance(arch, MultiQPUArchitecture):
+        raise ValueError("arch must be a MultiQPUArchitecture")
+
+    width = max(arch.n_phys, len(mapped.qubits))
+    out = QuantumCircuit(QuantumRegister(width, "q"))
+
+    qpus = sorted(local_routed)
+    data: dict[int, list[Any]] = {}
+    index_of: dict[int, dict[Any, int]] = {}
+    queues: dict[int, dict[int, deque[int]]] = {}
+    retired: dict[int, list[bool]] = {}
+    marker_at: dict[tuple[int, int], int] = {}
+
+    for qpu in qpus:
+        circuit = local_routed[qpu]
+        if not isinstance(circuit, QuantumCircuit):
+            raise ValueError(f"local_routed[{qpu!r}] must be a QuantumCircuit")
+        instructions = list(circuit.data)
+        positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
+        per_qubit: dict[int, deque[int]] = {}
+        for index, instruction in enumerate(instructions):
+            ordinal = _remote_barrier_ordinal(instruction.operation)
+            if ordinal is not None:
+                marker_at[(ordinal, qpu)] = index
+            for qubit in instruction.qubits:
+                per_qubit.setdefault(positions[qubit], deque()).append(index)
+        data[qpu] = instructions
+        index_of[qpu] = positions
+        queues[qpu] = per_qubit
+        retired[qpu] = [False] * len(instructions)
+
+    def leads(qpu: int, index: int) -> bool:
+        """True when this instruction is first in line on every qubit it uses."""
+        return all(
+            queues[qpu][index_of[qpu][qubit]][0] == index
+            for qubit in data[qpu][index].qubits
+        )
+
+    def retire(qpu: int, index: int) -> None:
+        retired[qpu][index] = True
+        for qubit in data[qpu][index].qubits:
+            queues[qpu][index_of[qpu][qubit]].popleft()
+
+    remaining = {qpu: sum(1 for inst in data[qpu] if inst.qubits) for qpu in qpus}
+    pending = set(range(len(remote_ops)))
+
+    while any(remaining.values()) or pending:
+        progressed = False
+
+        for qpu in qpus:
+            for index, instruction in enumerate(data[qpu]):
+                if retired[qpu][index] or not instruction.qubits:
+                    continue
+                if _remote_barrier_ordinal(instruction.operation) is not None:
+                    continue
+                if not leads(qpu, index):
+                    continue
+                if not getattr(instruction.operation, "_directive", False):
+                    out.append(
+                        instruction.operation,
+                        [out.qubits[index_of[qpu][q]] for q in instruction.qubits],
+                        [],
+                    )
+                retire(qpu, index)
+                remaining[qpu] -= 1
+                progressed = True
+
+        for ordinal in sorted(pending):
+            op = remote_ops[ordinal]
+            sides: list[tuple[int, int]] = []
+            for qpu in (op.qpu0, op.qpu1):
+                marker = marker_at.get((ordinal, qpu))
+                if marker is None:
+                    raise ValueError(
+                        f"program for QPU {qpu} has no marker for remote "
+                        f"operation {ordinal}"
+                    )
+                if retired[qpu][marker] or not leads(qpu, marker):
+                    sides = []
+                    break
+                sides.append((qpu, marker))
+            if not sides:
+                continue
+            out.append(
+                mapped.data[op.index].operation,
+                [out.qubits[op.q0_phys], out.qubits[op.q1_phys]],
+                [],
+            )
+            for qpu, marker in sides:
+                retire(qpu, marker)
+                remaining[qpu] -= 1
+            pending.discard(ordinal)
+            progressed = True
+
+        if not progressed:
+            raise ValueError(
+                "per-QPU programs impose contradictory orders on their remote "
+                "operations; the programs and the manifest are out of step"
+            )
+
+    if restore_layout:
+        _append_layout_restoration(out, local_routed, arch, width)
+    return out
+
+
+def _append_layout_restoration(
+    circuit: QuantumCircuit,
+    local_routed: Mapping[int, QuantumCircuit],
+    arch: MultiQPUArchitecture,
+    width: int,
+) -> None:
+    """Append swaps undoing each QPU's routing permutation.
+
+    ``final_index_layout()`` reads "input qubit ``i`` ended at position
+    ``final[i]``". Undoing it needs the inverse, so the mapping is turned around
+    before selection-sorting the qubits back into place.
+    """
+    final = list(range(width))
+    for qpu, routed in local_routed.items():
+        layout = getattr(routed, "layout", None)
+        if layout is None:
+            continue
+        positions = layout.final_index_layout(filter_ancillas=False)
+        block = arch.block_of_qpu(qpu)
+        for phys in block.compute + block.comm:
+            if phys < width and phys < len(positions):
+                final[phys] = positions[phys]
+
+    holder = [0] * width
+    for source, destination in enumerate(final):
+        holder[destination] = source
+    for target in range(width):
+        source = holder.index(target)
+        if source != target:
+            circuit.swap(target, source)
+            holder[target], holder[source] = holder[source], holder[target]
 
 
 def _group_qubits_by_qpu_in_operand_order(

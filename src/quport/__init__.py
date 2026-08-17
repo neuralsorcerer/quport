@@ -17,6 +17,7 @@ from quport.config import LatencyModel, MultiQPUConfig
 from quport.distributed import (
     DistributedProgram,
     RemoteOp,
+    reassemble_distributed_program,
     split_into_qpus,
     write_distributed_program,
     write_remote_ops_json,
@@ -41,6 +42,7 @@ from quport.pipeline import (
 from quport.protocol import (
     TelegateProgram,
     build_telegate_circuit,
+    verify_distributed_program,
     verify_telegate_equivalence,
 )
 from quport.schedule import (
@@ -93,10 +95,12 @@ __all__ = [
     "estimate_parallel_makespan_topology",
     "estimate_topology_schedule_plan",
     "map_and_transpile",
+    "reassemble_distributed_program",
     "split_into_qpus",
     "write_distributed_program",
     "write_remote_ops_json",
     "sweep_topologies",
     "topology_metrics",
+    "verify_distributed_program",
     "verify_telegate_equivalence",
 ]

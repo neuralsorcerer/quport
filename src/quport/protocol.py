@@ -60,7 +60,7 @@ program non-unitary and therefore unverifiable by the same route.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,11 +69,13 @@ from qiskit.circuit import ClassicalRegister
 
 from quport.aggregation import AggregationPlan, RemoteBlock, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
+from quport.distributed import RemoteOp, reassemble_distributed_program
 from quport.entanglement import is_directive
 
 __all__ = [
     "TelegateProgram",
     "build_telegate_circuit",
+    "verify_distributed_program",
     "verify_telegate_equivalence",
 ]
 
@@ -459,6 +461,69 @@ def verify_telegate_equivalence(
         actual = partial_trace(actual, ancillas)  # type: ignore[assignment]
 
     return bool(state_fidelity(actual, expected, validate=False) >= 1.0 - atol)
+
+
+def verify_distributed_program(
+    mapped: QuantumCircuit,
+    local_routed: Mapping[int, QuantumCircuit],
+    remote_ops: Sequence[RemoteOp],
+    arch: MultiQPUArchitecture,
+    *,
+    seed: int = 0,
+    atol: float = 1e-9,
+) -> bool:
+    """Check that a distributed compile's artifacts still compute their circuit.
+
+    This is the central claim of distributed compilation: the per-QPU programs
+    plus the remote-operation manifest, taken together, are the circuit they
+    were split from. It is checked by
+    :func:`quport.distributed.reassemble_distributed_program` -- which merges
+    them back under qubit dataflow and undoes each QPU's routing permutation --
+    and comparing the result against the mapped circuit on a pseudo-random
+    product input.
+
+    Unlike :func:`verify_telegate_equivalence`, this says nothing about how
+    remote gates are physically realised; it checks the splitting, the local
+    routing, and the manifest that ties them together.
+
+    Parameters
+    ----------
+    remote_ops:
+        The manifest matching ``local_routed``: ``routed_remote_ops`` for routed
+        programs, ``program.remote_ops`` for unrouted ones.
+
+    Raises
+    ------
+    ValueError
+        If the circuit is too wide to simulate
+        (:data:`MAX_VERIFIABLE_QUBITS`), or if the artifacts are inconsistent
+        enough that they cannot be merged at all.
+    """
+    from qiskit.quantum_info import Statevector, state_fidelity
+
+    merged = reassemble_distributed_program(
+        mapped, local_routed, remote_ops, arch, restore_layout=True
+    )
+
+    width = len(merged.qubits)
+    if width > MAX_VERIFIABLE_QUBITS:
+        raise ValueError(
+            f"circuit has {width} qubits, above the {MAX_VERIFIABLE_QUBITS}-qubit "
+            "state-vector verification limit"
+        )
+
+    preparation = _random_product_state(width, seed)
+
+    actual = preparation.copy()
+    actual.compose(merged, qubits=range(width), inplace=True)
+
+    expected = _widen(preparation.copy(), width)
+    expected.compose(mapped, qubits=range(len(mapped.qubits)), inplace=True)
+
+    return bool(
+        state_fidelity(Statevector(actual), Statevector(expected), validate=False)
+        >= 1.0 - atol
+    )
 
 
 def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:

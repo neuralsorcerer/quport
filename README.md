@@ -547,6 +547,23 @@ to establish and $\tau_{\mathrm{RTT}}^{\mathrm{eff}}$ to disentangle; a teleport
 pays a second distribution for the return trip. Gates inside a block cost ordinary
 local two-qubit time.
 
+### Proving the split itself
+
+Aggregation and the protocol expansion answer "is the entanglement right?". The
+question underneath them is whether distributed compilation preserves the
+circuit at all: the per-QPU programs and the remote-operation manifest, taken
+together, have to *be* the circuit they were split from.
+
+`reassemble_distributed_program` merges them back under the dataflow rule above
+and undoes each QPU's routing permutation, and `verify_distributed_program`
+compares the result against the mapped circuit on a pseudo-random product input.
+The suite runs this across every intra-QPU topology and optimization level, so it
+covers the routing permutation and the manifest remapping as well as the split.
+
+This is the inverse of `split_into_qpus`, and it is a verification tool rather
+than a runtime -- the point of distributed compilation is that these programs run
+on separate devices.
+
 ### From plan to circuit, and proving it
 
 A communication plan is only worth as much as the protocol it stands for, so
@@ -1313,6 +1330,17 @@ pairing by position is not safe: barriers on disjoint qubits commute, so
 rebuilding a circuit from its DAG during routing can list them in an order that
 differs from the manifest's, and an emitted QASM file carries no labels to
 distinguish them.
+
+For the same reason, **a distributed program is a partial order, not a linear
+one**. Two QPUs can list the same pair of remote operations in opposite orders
+when those operations sit on disjoint qubits, and both listings are correct. A
+consumer must therefore advance each program by qubit dataflow -- an instruction
+is ready once it is first in line on every qubit it touches, and a remote
+operation once its marker leads on both sides -- rather than reading the files
+strictly top to bottom, which can deadlock.
+`quport.distributed.reassemble_distributed_program` is the reference
+implementation of that rule, and it raises when two programs genuinely
+contradict each other rather than silently picking an order.
 
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.

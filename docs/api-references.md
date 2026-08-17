@@ -404,6 +404,32 @@ fills in the `ebits` and `weighted_ebit_distance` diagnostics.
 `compile_distributed` returns `packets`, `ebits`, `aggregation`, and
 `entanglement_schedule` alongside its existing fields.
 
+### Reassembly and verification of a distributed program
+
+```python
+reassemble_distributed_program(mapped, local_routed, remote_ops, arch, *,
+                               restore_layout=True) -> QuantumCircuit
+verify_distributed_program(mapped, local_routed, remote_ops, arch, *,
+                           seed=0, atol=1e-9) -> bool
+```
+
+`reassemble_distributed_program` is the inverse of `split_into_qpus`: it merges
+per-QPU programs and a remote-op manifest back into one circuit and, with
+`restore_layout=True`, undoes each QPU's routing permutation so the result is
+directly comparable with the mapped circuit. `verify_distributed_program` does
+that comparison by state-vector simulation.
+
+A distributed program is a **partial** order. Within a QPU the constraint is per
+qubit, so instructions on disjoint qubits may run in either order, and two QPUs
+can list the same remote operations in opposite orders. Merging follows qubit
+dataflow: an instruction runs once it leads on every qubit it touches, and a
+remote operation once its marker leads on both sides. Reading each program
+strictly linearly can deadlock; `reassemble_distributed_program` raises when the
+programs genuinely contradict each other.
+
+Pass `routed_remote_ops` with `local_routed`, or `program.remote_ops` with
+`program.local_circuits`.
+
 ### Protocol emission and verification
 
 ```python

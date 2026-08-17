@@ -310,3 +310,151 @@ def test_verification_seed_must_be_an_integer() -> None:
 
     with pytest.raises(ValueError, match="seed must be an integer"):
         verify_telegate_equivalence(qc, arch, seed=True)
+
+
+# ---------------------------------------------------------------------------
+# Distributed-program reassembly
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("intra", ["clique", "line", "ring", "grid2d"])
+@pytest.mark.parametrize("optimization_level", [0, 3])
+def test_compiled_artifacts_still_compute_their_circuit(
+    intra: str, optimization_level: int
+) -> None:
+    """The central claim of distributed compilation, checked by simulation.
+
+    The per-QPU programs and the remote-operation manifest are merged back into
+    one circuit and compared against the mapped circuit they were split from.
+    Every non-clique intra topology makes routing permute qubits inside a QPU,
+    so this exercises the manifest remapping as well as the split itself.
+    """
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology=intra,  # type: ignore[arg-type]
+        optimization_level=optimization_level,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    result = compile_distributed(random_benchmark_circuit(5, 6, 2), cfg, seed=2)
+
+    assert result.routed_remote_ops, "the fixture must produce remote operations"
+    assert verify_distributed_program(
+        result.physical_circuit, result.local_routed, result.routed_remote_ops, arch
+    )
+
+
+def test_reassembly_recovers_the_unrouted_split_too() -> None:
+    """`split_into_qpus` alone must also be reversible, with its own manifest."""
+    from quport.distributed import reassemble_distributed_program, split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.cx(3, 6)
+    mapped.cx(0, 1)
+    mapped.cx(6, 0)
+
+    program = split_into_qpus(mapped, arch)
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, restore_layout=False
+    )
+
+    assert merged.size() == mapped.size()
+    assert verify_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+
+
+def test_reassembly_follows_qubit_dataflow_not_program_order() -> None:
+    """Two QPUs may list the same remote operations in opposite orders.
+
+    Barriers on disjoint qubits commute, so a routed program can order its
+    markers however its DAG rebuild happened to. Reading each program strictly
+    linearly would deadlock here; merging by qubit dataflow does not.
+    """
+    from quport.distributed import reassemble_distributed_program, split_into_qpus
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)  # remote op 0, on qubits 0 and 3
+    mapped.cx(1, 4)  # remote op 1, on qubits 1 and 4 -- disjoint from op 0
+
+    program = split_into_qpus(mapped, arch)
+
+    # Hand QPU 1 its markers in the opposite order. Both orders are legal: the
+    # two operations touch disjoint qubits, so nothing constrains them.
+    swapped = QuantumCircuit(arch.n_phys)
+    order = [1, 0]
+    for index in order:
+        for instruction in program.local_circuits[1].data:
+            label = getattr(instruction.operation, "label", None)
+            if label == f"quport_remote_{index}":
+                swapped.append(instruction.operation, instruction.qubits, [])
+
+    merged = reassemble_distributed_program(
+        mapped,
+        {0: program.local_circuits[0], 1: swapped},
+        program.remote_ops,
+        arch,
+        restore_layout=False,
+    )
+
+    assert [instruction.operation.name for instruction in merged.data] == ["cx", "cx"]
+
+
+def test_reassembly_reports_contradictory_orderings() -> None:
+    """A genuine ordering conflict must be reported, not silently reordered."""
+    from quport.distributed import reassemble_distributed_program, split_into_qpus
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)  # remote op 0
+    mapped.cx(0, 3)  # remote op 1, on the *same* qubits, so the order is fixed
+
+    program = split_into_qpus(mapped, arch)
+
+    # Reverse QPU 1's markers. Now QPU 0 insists on 0 then 1 and QPU 1 insists
+    # on 1 then 0, on the same qubits: no execution order satisfies both.
+    reversed_qpu1 = QuantumCircuit(arch.n_phys)
+    markers = [
+        instruction
+        for instruction in program.local_circuits[1].data
+        if instruction.operation.name == "barrier"
+    ]
+    for instruction in reversed(markers):
+        reversed_qpu1.append(instruction.operation, instruction.qubits, [])
+
+    with pytest.raises(ValueError, match="contradictory orders"):
+        reassemble_distributed_program(
+            mapped,
+            {0: program.local_circuits[0], 1: reversed_qpu1},
+            program.remote_ops,
+            arch,
+            restore_layout=False,
+        )
+
+
+def test_reassembly_validates_its_arguments() -> None:
+    from quport.distributed import reassemble_distributed_program
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    qc = QuantumCircuit(arch.n_phys)
+
+    with pytest.raises(ValueError, match="mapped must be a QuantumCircuit"):
+        reassemble_distributed_program(object(), {}, [], arch)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="local_routed must be a mapping"):
+        reassemble_distributed_program(qc, [], [], arch)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="arch must be a MultiQPUArchitecture"):
+        reassemble_distributed_program(qc, {}, [], object())  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a QuantumCircuit"):
+        reassemble_distributed_program(qc, {0: object()}, [], arch)  # type: ignore[dict-item]
