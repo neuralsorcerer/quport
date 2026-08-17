@@ -42,7 +42,12 @@ from quport._validation import validate_nonnegative_integral
 from quport.aggregation import AggregationPlan, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig
-from quport.distributed import DistributedProgram, split_into_qpus
+from quport.distributed import (
+    DistributedProgram,
+    RemoteOp,
+    remap_remote_ops_to_routed,
+    split_into_qpus,
+)
 from quport.hypergraph import (
     EbitReport,
     PacketDecomposition,
@@ -102,6 +107,12 @@ class DistributedCompileResult:
 
     # Routed local programs (one per QPU)
     local_routed: dict[int, QuantumCircuit]
+
+    # `program.remote_ops` names physical qubits as they stand *before* local
+    # routing.  Routing permutes qubits inside a QPU whenever the intra-QPU
+    # topology is not a clique, so this is the manifest that matches
+    # `local_routed`, and the one to ship alongside those programs.
+    routed_remote_ops: list[RemoteOp]
 
     # Metrics
     global_metrics: CircuitMetrics
@@ -318,6 +329,9 @@ def compile_distributed(
 
     local_time = time.perf_counter() - t1
 
+    # Re-express the remote-op manifest in the routed programs' labelling.
+    routed_remote_ops = remap_remote_ops_to_routed(program.remote_ops, local_routed)
+
     # 6) Global metrics + topology-aware schedule estimate (remote rounds)
     global_metrics = compute_metrics(physical, arch)
     sched_plan = estimate_topology_schedule_plan(physical, arch, latency)
@@ -340,6 +354,7 @@ def compile_distributed(
         anneal_diagnostics=anneal_diag,
         program=program,
         local_routed=local_routed,
+        routed_remote_ops=routed_remote_ops,
         global_metrics=global_metrics,
         local_metrics=local_counts,
         schedule=sched_plan.summary,

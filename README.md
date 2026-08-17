@@ -1285,7 +1285,7 @@ Produces:
 | File | Description |
 |---|---|
 | `qpu_<id>_routed.qasm` | Locally routed OpenQASM 3 circuit for QPU `<id>`. |
-| `remote_ops.json` | Ordered remote-operation trace. |
+| `remote_ops.json` | Ordered remote-operation trace, in the **routed** programs' physical-qubit labelling. |
 | `schedule.json` | Strict JSON topology-aware schedule summary produced from `TopologyScheduleSummary.to_dict()`. |
 | `schedule_trace.json` | Strict JSON per-layer/per-round communication plan produced from `TopologySchedulePlan.to_dict()`, with absolute timing, QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
 | `entanglement_plan.json` | Strict JSON bundle with the aggregated EPR blocks (`aggregation`), the $\lambda-1$ e-bit report for the chosen partition (`ebits`), and the entanglement-aware schedule summary (`schedule`). |
@@ -1301,12 +1301,29 @@ Remote operation entries have the shape:
   "qpu0": 0,
   "qpu1": 9,
   "params": [],
-  "clbits": []
+  "clbits": [],
+  "qpu0_marker": 3,
+  "qpu1_marker": 5
 }
 ```
 
+`qpu0_marker` and `qpu1_marker` say which barrier in each QPU's emitted program
+marks this operation, counting all barriers from zero. They exist because
+pairing by position is not safe: barriers on disjoint qubits commute, so
+rebuilding a circuit from its DAG during routing can list them in an order that
+differs from the manifest's, and an emitted QASM file carries no labels to
+distinguish them.
+
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
+
+`q0_phys` and `q1_phys` here are positions in the *routed* per-QPU programs, not
+in `physical_circuit`. Local routing permutes qubits inside a QPU whenever
+`intra_topology` is not `clique`, so the two labellings differ and only the
+routed one matches the `qpu_<id>_routed.qasm` files shipped beside it.
+`compile_distributed` exposes both: `program.remote_ops` in the pre-routing
+labelling, and `routed_remote_ops` in the shipped one. `quport split`, which
+writes unrouted programs, correctly ships the pre-routing manifest.
 
 ---
 
@@ -1398,6 +1415,7 @@ quport --help
 - Teleport blocks are not merged: every non-diagonal cross-QPU gate pays its own round trip of two e-bits.
 - Emitted protocol circuits expand cat blocks in full; teleport blocks show the state movement as a `swap` in and out of the host ancilla rather than the Bell-measurement gadget, because the return trip needs a mid-circuit reset that would make the program non-unitary and so unverifiable by the same route.
 - State-vector verification is exponential in circuit width and is refused above 24 qubits.
+- Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.
 

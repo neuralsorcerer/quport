@@ -349,6 +349,11 @@ def test_compile_dist_writes_routed_programs_and_schedule_manifests(
         layer["remote_ops"] for layer in trace["layers"]
     )
 
+    remote_ops = json.loads((out_dir / "remote_ops.json").read_text(encoding="utf-8"))
+    for op in remote_ops:
+        assert op["qpu0_marker"] is not None
+        assert op["qpu1_marker"] is not None
+
     entanglement = json.loads(
         (out_dir / "entanglement_plan.json").read_text(encoding="utf-8")
     )
@@ -735,3 +740,69 @@ def test_headerless_input_reports_both_parser_failures(
                 depth=1,
                 seed=0,
             )
+
+
+def test_compile_dist_bundle_is_consumable_from_the_qasm_alone(tmp_path: Path) -> None:
+    """The shipped manifest and QASM files must agree qubit for qubit.
+
+    A consumer only has the emitted text: barriers carry no labels there, so the
+    manifest's marker index is the only thing that says which barrier belongs to
+    which remote operation. A ``line`` intra-topology makes both hazards real --
+    routing permutes qubits inside a QPU, and it reorders barriers that sit on
+    disjoint qubits -- so pairing by position or trusting pre-routing indices
+    would both fail here.
+    """
+    import re
+
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        json.dumps(
+            {
+                "n_qpus": 2,
+                "compute_qubits_per_qpu": 4,
+                "comm_qubits_per_qpu": 1,
+                "intra_topology": "line",
+                "optimization_level": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "bundle"
+
+    _run(
+        [
+            "compile-dist",
+            "--n-logical",
+            "9",
+            "--depth",
+            "14",
+            "--seed",
+            "4",
+            "--config",
+            str(config),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    remote_ops = json.loads((out_dir / "remote_ops.json").read_text(encoding="utf-8"))
+    assert remote_ops, "the fixture must produce remote operations"
+
+    barriers = {
+        qpu: [
+            int(match)
+            for match in re.findall(
+                r"barrier \$(\d+);",
+                (out_dir / f"qpu_{qpu}_routed.qasm").read_text(encoding="utf-8"),
+            )
+        ]
+        for qpu in (0, 1)
+    }
+
+    for op in remote_ops:
+        assert barriers[op["qpu0"]][op["qpu0_marker"]] == op["q0_phys"]
+        assert barriers[op["qpu1"]][op["qpu1_marker"]] == op["q1_phys"]
+
+    # The markers genuinely disagree with positional pairing, so the assertions
+    # above are not passing by accident.
+    assert any(op["qpu0_marker"] != index for index, op in enumerate(remote_ops))

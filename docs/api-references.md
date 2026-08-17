@@ -216,6 +216,7 @@ weights; smaller values emphasize earlier two-qubit interactions more strongly.
 | `anneal_diagnostics` | simulated annealing diagnostics for `tpccap_sa` and `ebit` |
 | `program` | `DistributedProgram` containing local circuits and remote ops |
 | `local_routed` | per-QPU locally routed circuits |
+| `routed_remote_ops` | remote-op manifest re-expressed in `local_routed`'s labelling |
 | `global_metrics` | metrics on the physical, not globally routed, circuit |
 | `local_metrics` | per-QPU operation counts after local routing |
 | `schedule` | topology-aware schedule summary |
@@ -232,6 +233,24 @@ weights; smaller values emphasize earlier two-qubit interactions more strongly.
 ```python
 split_into_qpus(mapped, arch) -> DistributedProgram
 ```
+
+```python
+remap_remote_ops_to_routed(remote_ops, local_routed) -> list[RemoteOp]
+```
+
+Each `RemoteOp` also carries `qpu0_marker` and `qpu1_marker`: the position of
+its synchronization barrier among all barriers of that QPU's program, counting
+from zero. Emitted QASM carries no labels, and routing can reorder barriers that
+sit on disjoint qubits, so these are what let a consumer pair a manifest entry
+with the right barrier.
+
+Re-expresses a manifest in the labelling of routed local programs. Routing
+permutes qubits inside a QPU unless the intra-QPU topology is a clique, so a
+manifest recorded before routing points at the wrong qubits afterwards. The
+routed circuits carry the answer: `split_into_qpus` labels each synchronization
+barrier with the operation it marks, and the transpiler remaps those barriers
+along with everything else. `compile_distributed` applies this automatically and
+returns the result as `routed_remote_ops`.
 
 Splits a mapped physical circuit into per-QPU local circuits and ordered remote
 operation metadata. Local one-qubit and intra-QPU two-qubit operations are appended

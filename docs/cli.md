@@ -146,7 +146,7 @@ to compile an application circuit from OpenQASM 2/3 instead of generating a rand
 benchmark. Output artifacts:
 
 - `qpu_<id>_routed.qasm`: locally routed per-QPU programs;
-- `remote_ops.json`: ordered remote operation manifest;
+- `remote_ops.json`: ordered remote operation manifest, in the routed programs' physical-qubit labelling (local routing permutes qubits inside a QPU unless the intra-QPU topology is a clique, so the pre-routing indices would point elsewhere);
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
 - `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
 - `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary.

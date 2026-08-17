@@ -585,7 +585,8 @@ def compile_dist(
 
     Outputs:
       - qpu_<id>_routed.qasm : routed per-QPU local programs
-      - remote_ops.json     : ordered remote-op trace
+      - remote_ops.json     : ordered remote-op trace, in the routed programs'
+        physical-qubit labelling
       - schedule.json       : topology-aware schedule summary
       - schedule_trace.json : detailed per-layer/per-round communication plan with absolute timing
       - entanglement_plan.json : aggregated EPR blocks, e-bit report, and the
@@ -612,7 +613,10 @@ def compile_dist(
     for qpu, c in res.local_routed.items():
         (outp / f"qpu_{qpu}_routed.qasm").write_text(qasm3.dumps(c), encoding="utf-8")
 
-    write_remote_ops_json(res.program.remote_ops, outp / "remote_ops.json")
+    # The bundle ships routed programs, so it ships the manifest that matches
+    # them: local routing permutes qubits inside a QPU unless the intra-QPU
+    # topology is a clique, and the pre-routing indices would point elsewhere.
+    write_remote_ops_json(res.routed_remote_ops, outp / "remote_ops.json")
     (outp / "schedule.json").write_text(
         json.dumps(res.schedule.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",

@@ -1395,3 +1395,203 @@ def test_local_circuits_only_ever_touch_their_own_qpus_qubits(
         assert remote.qpu0 != remote.qpu1
         assert remote.q0_phys in owned[remote.qpu0]
         assert remote.q1_phys in owned[remote.qpu1]
+
+
+def test_remote_barriers_carry_a_label_naming_their_operation() -> None:
+    """The marker label is what lets a routed program be matched to a manifest."""
+    from quport.distributed import remote_barrier_label
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)
+    mapped.cx(1, 4)
+
+    program = split_into_qpus(mapped, arch)
+
+    labels = [
+        instruction.operation.label
+        for instruction in program.local_circuits[0].data
+        if instruction.operation.name == "barrier"
+    ]
+    assert labels == [remote_barrier_label(0), remote_barrier_label(1)]
+
+
+def test_labels_do_not_leak_into_emitted_qasm() -> None:
+    """Marker labels are transpiler metadata, not part of the program text."""
+    from qiskit import qasm3
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)
+
+    program = split_into_qpus(mapped, arch)
+    source = qasm3.dumps(program.local_circuits[0])
+
+    assert "barrier" in source
+    assert "quport_remote" not in source
+
+
+def test_routed_manifest_follows_qubits_that_local_routing_moved() -> None:
+    """Regression: the manifest must match the programs it is shipped with.
+
+    ``split_into_qpus`` records physical qubits as they stand *before* local
+    routing. Routing permutes qubits inside a QPU whenever the intra-QPU
+    topology is not a clique, so pairing the original manifest with routed
+    programs would point a consumer at the wrong qubit. Here routing moves the
+    remote operation's operand from physical qubit 0 to 2, and the shipped
+    manifest has to say 2.
+    """
+    from qiskit import transpile
+
+    from quport.distributed import remap_remote_ops_to_routed
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        basis_gates=("rz", "sx", "x", "cx", "swap"),
+    )
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 2)
+    mapped.cx(0, 3)
+    mapped.cx(1, 3)
+    mapped.cx(0, 2)
+    mapped.cx(0, 4)  # the remote operation, on physical qubit 0 before routing
+
+    program = split_into_qpus(mapped, arch)
+    assert [(op.q0_phys, op.q1_phys) for op in program.remote_ops] == [(0, 4)]
+
+    local_routed = {
+        qpu: transpile(
+            circuit,
+            coupling_map=arch.build_intra_coupling_map(qpu),
+            initial_layout=list(range(arch.n_phys)),
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=1,
+            layout_method="trivial",
+            routing_method="sabre",
+            seed_transpiler=0,
+        )
+        for qpu, circuit in program.local_circuits.items()
+    }
+
+    routed_ops = remap_remote_ops_to_routed(program.remote_ops, local_routed)
+
+    # The barrier the transpiler carried along names the truth.
+    marker = next(
+        instruction
+        for instruction in local_routed[0].data
+        if instruction.operation.name == "barrier"
+    )
+    moved_to = local_routed[0].find_bit(marker.qubits[0]).index
+    assert moved_to == 2
+    assert [(op.q0_phys, op.q1_phys) for op in routed_ops] == [(moved_to, 4)]
+
+    # Everything else about the operation is untouched.
+    assert routed_ops[0].index == program.remote_ops[0].index
+    assert routed_ops[0].qpu0 == 0
+    assert routed_ops[0].qpu1 == 1
+    assert routed_ops[0].name == program.remote_ops[0].name
+
+
+def test_clique_topologies_need_no_remapping() -> None:
+    """The default intra topology never permutes, which is why this went unseen."""
+    from qiskit import transpile
+
+    from quport.distributed import remap_remote_ops_to_routed
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+    )
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 2)
+    mapped.cx(0, 4)
+
+    program = split_into_qpus(mapped, arch)
+    local_routed = {
+        qpu: transpile(
+            circuit,
+            coupling_map=arch.build_intra_coupling_map(qpu),
+            initial_layout=list(range(arch.n_phys)),
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=3,
+            layout_method="trivial",
+            routing_method="sabre",
+            seed_transpiler=0,
+        )
+        for qpu, circuit in program.local_circuits.items()
+    }
+
+    assert remap_remote_ops_to_routed(program.remote_ops, local_routed) == list(
+        program.remote_ops
+    )
+
+
+def test_remap_reports_a_manifest_that_lost_its_markers() -> None:
+    from quport.distributed import remap_remote_ops_to_routed
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)
+
+    program = split_into_qpus(mapped, arch)
+    stripped = {qpu: QuantumCircuit(arch.n_phys) for qpu in program.local_circuits}
+
+    with pytest.raises(ValueError, match="no marker for remote operation"):
+        remap_remote_ops_to_routed(program.remote_ops, stripped)
+
+
+def test_remap_validates_its_inputs() -> None:
+    from quport.distributed import remap_remote_ops_to_routed
+
+    with pytest.raises(ValueError, match="local_routed must be a mapping"):
+        remap_remote_ops_to_routed([], [])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a QuantumCircuit"):
+        remap_remote_ops_to_routed([], {0: object()})  # type: ignore[dict-item]
+
+
+def test_compile_distributed_ships_a_manifest_matching_its_routed_programs() -> None:
+    """End to end: the bundle `compile-dist` writes must be self-consistent."""
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=4,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=1,
+    )
+    result = compile_distributed(random_benchmark_circuit(9, 14, 4), cfg, seed=4)
+
+    assert result.program.remote_ops, "the fixture must produce remote operations"
+    assert len(result.routed_remote_ops) == len(result.program.remote_ops)
+    # A line intra-topology forces routing to permute, so the two manifests
+    # must actually differ -- otherwise this test would pass vacuously.
+    assert result.routed_remote_ops != result.program.remote_ops
+
+    markers: dict[tuple[int, int], int] = {}
+    for qpu, circuit in result.local_routed.items():
+        ordinal = 0
+        for instruction in circuit.data:
+            label = getattr(instruction.operation, "label", None)
+            if isinstance(label, str) and label.startswith("quport_remote_"):
+                ordinal = int(label.removeprefix("quport_remote_"))
+                markers[(ordinal, qpu)] = circuit.find_bit(instruction.qubits[0]).index
+
+    for ordinal, op in enumerate(result.routed_remote_ops):
+        assert op.q0_phys == markers[(ordinal, op.qpu0)]
+        assert op.q1_phys == markers[(ordinal, op.qpu1)]
+        # Both operands still belong to the QPU the operation names.
+        arch = MultiQPUArchitecture(cfg)
+        assert arch.qpu_of_phys(op.q0_phys) == op.qpu0
+        assert arch.qpu_of_phys(op.q1_phys) == op.qpu1
