@@ -117,3 +117,18 @@ A strong QuPort PR should include:
 3. tests/checks run;
 4. docs updates for user-visible behavior;
 5. notes about limitations or modeling assumptions when applicable.
+
+## Validation in hot paths
+
+Public functions validate their arguments on every call. Search loops must not
+pay for that repeatedly, so several modules pair a validating entry point with a
+prepared or unvalidated core: `quport.network.prepare_routing_tables` with
+`route_prepared_link_loads`, `accumulate_traffic` and
+`accumulate_boundary_counts`, and `quport.hypergraph._ebit_objective_fast`.
+
+When changing either half, keep two properties:
+
+- the prepared path performs the same arithmetic in the same order, so results
+  stay bit-identical rather than merely close;
+- the validating path keeps its checks and its error messages, since those are
+  what the tests pin.

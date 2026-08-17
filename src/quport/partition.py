@@ -22,10 +22,15 @@ from quport.interaction import cut_weight, degree
 from quport.network import (
     UNREACHABLE_DISTANCE,
     QpuShortestPaths,
+    RoutingTables,
+    accumulate_boundary_counts,
+    accumulate_traffic,
     compute_boundary_counts,
     compute_traffic_matrix,
     congestion_metrics,
+    prepare_routing_tables,
     route_link_loads,
+    route_prepared_link_loads,
 )
 
 
@@ -579,6 +584,46 @@ def _remove_unroutable_traffic(
     return max_penalty_load, l2_penalty_load
 
 
+@dataclass(frozen=True)
+class _ObjectiveInputs:
+    """Everything the TPCCAP objective needs that does not depend on the partition.
+
+    The search re-scores one fixed instance thousands of times. Edge weights and
+    shortest-path tables are validated once here, so each evaluation does only
+    the arithmetic that actually changes -- which is roughly half the cost of
+    re-validating them per call.
+    """
+
+    edges: tuple[tuple[int, int, float], ...]
+    n_logical: int
+    tables: RoutingTables
+
+
+def _prepare_objective_inputs(
+    normalized_weights: Mapping[tuple[int, int], float],
+    n: int,
+    n_qpus: int,
+    sp: QpuShortestPaths,
+    congestion_routing: Literal["single_path", "ecmp"],
+) -> _ObjectiveInputs:
+    """Validate the partition-independent objective inputs exactly once.
+
+    Edges are materialised in the mapping's own iteration order, which is the
+    order the streaming validator would have yielded them in, so accumulation
+    rounds identically.
+    """
+    edges = tuple(
+        (i, j, float(w))
+        for (i, j), w in normalized_weights.items()
+        if i != j and w != 0.0
+    )
+    return _ObjectiveInputs(
+        edges=edges,
+        n_logical=n,
+        tables=prepare_routing_tables(sp, n_qpus, congestion_routing),
+    )
+
+
 def _objective_tpccap(
     weights: Mapping[tuple[int, int], float],
     part: list[int],
@@ -591,6 +636,7 @@ def _objective_tpccap(
     congestion_routing: Literal["single_path", "ecmp"],
     packets: PacketDecomposition | None = None,
     w_ebit: float = 0.0,
+    prepared: _ObjectiveInputs | None = None,
 ) -> tuple[float, PartitionDiagnostics]:
     """Compute the TPCCAP objective and diagnostics.
 
@@ -618,7 +664,12 @@ def _objective_tpccap(
             wcd += float(w) * float(d)
 
     # Port pressure (boundary unique counts)
-    boundary = compute_boundary_counts(weights, part, n_qpus)
+    if prepared is None:
+        boundary = compute_boundary_counts(weights, part, n_qpus)
+    else:
+        boundary = accumulate_boundary_counts(
+            prepared.edges, part, n_qpus, prepared.n_logical
+        )
     port_overflow_l2 = 0.0
     for q in range(n_qpus):
         overflow = max(0, boundary[q] - comm_ports_per_qpu)
@@ -628,9 +679,16 @@ def _objective_tpccap(
     # can make some candidate cuts unroutable; remove that traffic before
     # invoking strict shortest-path routing and add virtual high-cost loads to
     # the diagnostics/objective instead.
-    traffic = compute_traffic_matrix(weights, part, n_qpus)
+    if prepared is None:
+        traffic = compute_traffic_matrix(weights, part, n_qpus)
+    else:
+        traffic = [[0.0] * n_qpus for _ in range(n_qpus)]
+        accumulate_traffic(prepared.edges, part, traffic)
     unreachable_max, unreachable_l2 = _remove_unroutable_traffic(traffic, sp)
-    loads = route_link_loads(traffic, sp, mode=congestion_routing)
+    if prepared is None:
+        loads = route_link_loads(traffic, sp, mode=congestion_routing)
+    else:
+        loads = route_prepared_link_loads(traffic, prepared.tables)
     cong = congestion_metrics(loads)
     congestion_l2 = cong.l2_load + unreachable_l2
     congestion_max = max(cong.max_load, unreachable_max)
@@ -737,6 +795,9 @@ def _tpccap_partition_from_normalized(
     loads = base.loads[:]
 
     nbrs = _build_weighted_adjacency(n, normalized_weights)
+    prepared = _prepare_objective_inputs(
+        normalized_weights, n, n_qpus, sp, congestion_routing
+    )
 
     best_obj, best_diag = _objective_tpccap(
         weights=normalized_weights,
@@ -750,6 +811,7 @@ def _tpccap_partition_from_normalized(
         congestion_routing=congestion_routing,
         packets=packets,
         w_ebit=w_ebit,
+        prepared=prepared,
     )
 
     topk = min(max_candidate_qpus, n_qpus)
@@ -801,6 +863,7 @@ def _tpccap_partition_from_normalized(
                     congestion_routing=congestion_routing,
                     packets=packets,
                     w_ebit=w_ebit,
+                    prepared=prepared,
                 )
 
                 loads[q] -= 1
@@ -1076,6 +1139,7 @@ def tpccap_sa_partition(
     loads = list(pres.loads)
 
     anneal_cong = w_cong if anneal_w_cong is None else anneal_w_cong
+    prepared = _prepare_objective_inputs(normalized_weights, n, n_qpus, sp, "ecmp")
 
     def objective(part_: list[int]) -> tuple[float, PartitionDiagnostics]:
         return _objective_tpccap(
@@ -1090,6 +1154,7 @@ def tpccap_sa_partition(
             congestion_routing="ecmp",
             packets=packets,
             w_ebit=w_ebit,
+            prepared=prepared,
         )
 
     cur_obj, best_diag = objective(part)

@@ -1275,3 +1275,100 @@ def test_ecmp_rejects_a_distance_matrix_no_path_can_satisfy() -> None:
 
     with pytest.raises(ValueError, match="no path between QPU 0 and 2"):
         route_link_loads(traffic, paths, mode="ecmp")
+
+
+# ---------------------------------------------------------------------------
+# Prepared (hoisted-validation) routing helpers
+# ---------------------------------------------------------------------------
+
+
+def _random_symmetric_traffic(n: int, seed: int) -> list[list[float]]:
+    import random
+
+    rng = random.Random(seed)
+    traffic = [[0.0] * n for _ in range(n)]
+    for a in range(n):
+        for b in range(a + 1, n):
+            weight = rng.choice([0.0, 1.0, 2.5, 7.25])
+            traffic[a][b] = weight
+            traffic[b][a] = weight
+    return traffic
+
+
+@pytest.mark.parametrize("mode", ["single_path", "ecmp"])
+@pytest.mark.parametrize("topology", ["switch", "ring", "degree_d", "fat_tree"])
+def test_prepared_routing_matches_the_validating_path_exactly(
+    mode: str, topology: str
+) -> None:
+    """Hoisting validation out of the loop must not change a single load.
+
+    The partition search routes thousands of candidate matrices over one fixed
+    interconnect, so the tables are prepared once. That is only sound if the
+    prepared path reproduces the validating one bit for bit, including the
+    order loads accumulate in.
+    """
+    from quport.network import prepare_routing_tables, route_prepared_link_loads
+
+    cfg = MultiQPUConfig(
+        n_qpus=6,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology=topology,  # type: ignore[arg-type]
+        inter_degree=3,
+    )
+    sp = all_pairs_shortest_paths(build_qpu_graph(cfg))
+    tables = prepare_routing_tables(sp, cfg.n_qpus, mode)  # type: ignore[arg-type]
+
+    for seed in range(4):
+        traffic = _random_symmetric_traffic(cfg.n_qpus, seed)
+        expected = route_link_loads(traffic, sp, mode=mode)  # type: ignore[arg-type]
+        actual = route_prepared_link_loads(traffic, tables)
+        assert actual == expected
+        # Insertion order matters downstream: congestion_metrics folds the dict.
+        assert list(actual) == list(expected)
+
+
+def test_prepare_routing_tables_rejects_what_routing_rejects() -> None:
+    from quport.network import QpuShortestPaths, prepare_routing_tables
+
+    with pytest.raises(ValueError, match="routing mode must be"):
+        prepare_routing_tables(
+            all_pairs_shortest_paths([[1], [0]]), 2, "nonsense"  # type: ignore[arg-type]
+        )
+
+    broken = QpuShortestPaths(dist=[[0, 1], [1, 0]], next_hop=[[0, 9], [1, 1]])
+    with pytest.raises(ValueError, match="next_hop contains invalid indices"):
+        prepare_routing_tables(broken, 2, "single_path")
+
+    mismatched = QpuShortestPaths(
+        dist=[[0, 1], [1, 0]], next_hop=[[0, 1], [0, 1]], adj=[[], []]
+    )
+    with pytest.raises(ValueError, match="adjacency must align with unit distances"):
+        prepare_routing_tables(mismatched, 2, "ecmp")
+
+
+def test_accumulate_helpers_match_their_validating_wrappers() -> None:
+    from quport.network import accumulate_boundary_counts, accumulate_traffic
+
+    weights = {(0, 1): 2.0, (1, 2): 3.5, (0, 3): 1.25, (2, 3): 0.75}
+    part = [0, 1, 1, 2]
+    n_qpus = 3
+
+    edges = tuple((i, j, float(w)) for (i, j), w in weights.items())
+    traffic = [[0.0] * n_qpus for _ in range(n_qpus)]
+    accumulate_traffic(edges, part, traffic)
+
+    assert traffic == compute_traffic_matrix(weights, part, n_qpus)
+    assert accumulate_boundary_counts(
+        edges, part, n_qpus, len(part)
+    ) == compute_boundary_counts(weights, part, n_qpus)
+
+
+def test_accumulate_traffic_is_additive_into_an_existing_matrix() -> None:
+    from quport.network import accumulate_traffic
+
+    traffic = [[0.0] * 2 for _ in range(2)]
+    accumulate_traffic([(0, 1, 1.5)], [0, 1], traffic)
+    accumulate_traffic([(0, 1, 2.5)], [0, 1], traffic)
+
+    assert traffic == [[0.0, 4.0], [4.0, 0.0]]

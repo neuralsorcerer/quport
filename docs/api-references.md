@@ -544,5 +544,6 @@ users may import from submodules directly:
 - `quport.metrics.compute_metrics` and `quport.metrics.count_ops` for direct analysis;
 - `quport.interaction.extract_twoq_weights` and `extract_temporal_twoq_weights` for partition diagnostics;
 - `quport.network.build_qpu_graph` for QPU-level topology inspection;
+- `quport.network.prepare_routing_tables` and `route_prepared_link_loads` to route many traffic matrices over one interconnect without re-validating the shortest-path tables each time, and `accumulate_traffic` / `accumulate_boundary_counts` for the same reason on edge weights. These reproduce their validating counterparts exactly; the caller takes on the input contract;
 - `quport.entanglement.acts_diagonally` and `breaks_cat_copy` for custom cat-copy analyses;
 - `quport.hypergraph.DistributablePacket` for inspecting individual packets.

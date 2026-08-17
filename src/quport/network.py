@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Callable, Literal, SupportsFloat, SupportsIndex, cast, get_args
@@ -405,17 +405,33 @@ def compute_traffic_matrix(
     # Stream validated edges directly into the matrix. Mirrored logical edges
     # ((i, j) and (j, i)) naturally accumulate to the same QPU pair, so an
     # intermediate normalized map is unnecessary.
-    part_len = len(part)
-    part_assignments = part
-    for i, j, w in _iter_validated_positive_weight_edges(weights, part_len=part_len):
-        a, b = part_assignments[i], part_assignments[j]
+    accumulate_traffic(
+        _iter_validated_positive_weight_edges(weights, part_len=len(part)),
+        part,
+        traffic,
+    )
+    return traffic
+
+
+def accumulate_traffic(
+    edges: Iterable[tuple[int, int, float]],
+    part: Sequence[int],
+    traffic: list[list[float]],
+) -> None:
+    """Add already-validated weighted edges into a QPU traffic matrix.
+
+    Split out so a caller that has validated its edges once -- the partition
+    search evaluates thousands of candidates against one fixed edge set -- can
+    reuse them instead of re-validating every edge on every evaluation. The
+    accumulation order is the caller's iteration order, so a pre-extracted list
+    reproduces the streaming version exactly, floating-point rounding included.
+    """
+    for i, j, w in edges:
+        a, b = part[i], part[j]
         if a == b:
             continue
-        traffic_a = traffic[a]
-        traffic_b = traffic[b]
-        traffic_a[b] += w
-        traffic_b[a] += w
-    return traffic
+        traffic[a][b] += w
+        traffic[b][a] += w
 
 
 def compute_boundary_counts(
@@ -431,12 +447,30 @@ def compute_boundary_counts(
         return [0] * n_qpus
 
     part_len = len(part)
+    return accumulate_boundary_counts(
+        _iter_validated_positive_weight_edges(weights, part_len=part_len),
+        part,
+        n_qpus,
+        part_len,
+    )
 
+
+def accumulate_boundary_counts(
+    edges: Iterable[tuple[int, int, float]],
+    part: Sequence[int],
+    n_qpus: int,
+    part_len: int,
+) -> list[int]:
+    """Count boundary qubits per QPU from already-validated weighted edges.
+
+    The counterpart of :func:`accumulate_traffic`, split out for the same
+    reason: the partition search re-scores one fixed edge set many times.
+    """
     # Track boundary membership per logical qubit with O(1) checks and compact
     # storage (0/1 byte markers).
     is_boundary = bytearray(part_len)
     counts = [0] * n_qpus
-    for i, j, _w in _iter_validated_positive_weight_edges(weights, part_len=part_len):
+    for i, j, _w in edges:
         a, b = part[i], part[j]
         if a == b:
             continue
@@ -544,24 +578,14 @@ def route_link_loads(
                     continue
                 yield a, b, w
 
+    tables = prepare_routing_tables(sp, n, mode)
+
     if mode == "ecmp":
-        dist_matrix = _validate_ecmp_distance_matrix(sp.dist, n=n)
-        neighbors = _neighbors_from_distance_matrix(dist_matrix)
+        dist_matrix = tables.dist
+        neighbors = tables.neighbors
         # Lazily cache dist[:, dst] columns to avoid repeated O(n) rebuilds for
         # each pair that shares the same destination.
         dist_to_dst_cache: list[list[int] | None] = [None] * n
-        if sp.adj is not None:
-            if len(sp.adj) != n:
-                raise ValueError(
-                    "shortest-path adjacency dimensions do not match traffic matrix"
-                )
-            normalized_adj = _normalize_undirected_adjacency(
-                sp.adj, label="shortest-path adjacency"
-            )
-            if normalized_adj != neighbors:
-                raise ValueError(
-                    "shortest-path adjacency must align with unit distances"
-                )
 
         for a, b, w in iter_routed_pairs():
             dist_to_dst = dist_to_dst_cache[b]
@@ -571,19 +595,7 @@ def route_link_loads(
             _route_ecmp_pair(a, b, w, dist_matrix, dist_to_dst, neighbors, add_load)
         return loads
 
-    hop_rows = _as_nonstring_sequence(sp.next_hop, label="shortest-path")
-    hop_matrix = _validate_square_rows(
-        hop_rows,
-        n,
-        label="shortest-path",
-        dimensions_error="shortest-path dimensions do not match traffic matrix",
-    )
-    for hop_row in hop_matrix:
-        for hop in hop_row:
-            if type(hop) is not int:
-                raise ValueError("shortest-path next_hop must contain integer indices")
-            if hop < -1 or hop >= n:
-                raise ValueError("shortest-path next_hop contains invalid indices")
+    hop_matrix = tables.next_hop
 
     for a, b, w in iter_routed_pairs():
         cur = a
@@ -600,6 +612,132 @@ def route_link_loads(
             if steps > n:
                 raise ValueError("shortest-path routing contains a cycle")
 
+    return loads
+
+
+@dataclass(frozen=True)
+class RoutingTables:
+    """Validated shortest-path tables, prepared once for repeated routing.
+
+    :func:`route_link_loads` validates its shortest-path input on every call,
+    which is the right default for a public entry point but pure overhead for a
+    partition search that routes thousands of candidate traffic matrices over
+    one fixed interconnect. Preparing the tables once hoists that work out of
+    the loop without weakening any check.
+    """
+
+    n: int
+    mode: Literal["single_path", "ecmp"]
+    dist: list[list[int]]
+    neighbors: list[tuple[int, ...]]
+    next_hop: list[Sequence[object]]
+
+
+def prepare_routing_tables(
+    sp: QpuShortestPaths,
+    n: int,
+    mode: Literal["single_path", "ecmp"] = "single_path",
+) -> RoutingTables:
+    """Validate shortest-path tables once for reuse across many routings.
+
+    Performs exactly the checks :func:`route_link_loads` performs inline, in the
+    same order, so preparing tables and routing with them reports the same
+    errors as routing directly.
+    """
+    if mode not in ("single_path", "ecmp"):
+        raise ValueError("routing mode must be 'single_path' or 'ecmp'")
+
+    if mode == "ecmp":
+        dist_matrix = _validate_ecmp_distance_matrix(sp.dist, n=n)
+        neighbors = _neighbors_from_distance_matrix(dist_matrix)
+        if sp.adj is not None:
+            if len(sp.adj) != n:
+                raise ValueError(
+                    "shortest-path adjacency dimensions do not match traffic matrix"
+                )
+            normalized_adj = _normalize_undirected_adjacency(
+                sp.adj, label="shortest-path adjacency"
+            )
+            if normalized_adj != neighbors:
+                raise ValueError(
+                    "shortest-path adjacency must align with unit distances"
+                )
+        return RoutingTables(
+            n=n, mode=mode, dist=dist_matrix, neighbors=neighbors, next_hop=[]
+        )
+
+    hop_rows = _as_nonstring_sequence(sp.next_hop, label="shortest-path")
+    hop_matrix = _validate_square_rows(
+        hop_rows,
+        n,
+        label="shortest-path",
+        dimensions_error="shortest-path dimensions do not match traffic matrix",
+    )
+    for hop_row in hop_matrix:
+        for hop in hop_row:
+            if type(hop) is not int:
+                raise ValueError("shortest-path next_hop must contain integer indices")
+            if hop < -1 or hop >= n:
+                raise ValueError("shortest-path next_hop contains invalid indices")
+    return RoutingTables(n=n, mode=mode, dist=[], neighbors=[], next_hop=hop_matrix)
+
+
+def route_prepared_link_loads(
+    traffic: list[list[float]],
+    tables: RoutingTables,
+) -> dict[QpuEdge, float]:
+    """Route an already-valid traffic matrix over prepared shortest-path tables.
+
+    Skips the per-call validation of :func:`route_link_loads`, so the caller
+    owns the guarantee that ``traffic`` is square, symmetric, non-negative and
+    zero on the diagonal -- which holds by construction for a matrix built by
+    :func:`accumulate_traffic`. Pair selection and load accumulation happen in
+    the same order as the validating path, so the two agree exactly.
+    """
+    n = tables.n
+    loads: dict[QpuEdge, float] = {}
+    zero_tol = 1e-12
+
+    def add_load(u: int, v: int, w: float) -> None:
+        e = (u, v) if u < v else (v, u)
+        loads[e] = loads.get(e, 0.0) + w
+
+    def iter_routed_pairs() -> Iterator[tuple[int, int, float]]:
+        for a in range(n):
+            row_a = traffic[a]
+            for b in range(a + 1, n):
+                w = row_a[b]
+                if math.isclose(w, 0.0, rel_tol=0.0, abs_tol=zero_tol):
+                    continue
+                yield a, b, w
+
+    if tables.mode == "ecmp":
+        dist_matrix = tables.dist
+        neighbors = tables.neighbors
+        dist_to_dst_cache: list[list[int] | None] = [None] * n
+        for a, b, w in iter_routed_pairs():
+            dist_to_dst = dist_to_dst_cache[b]
+            if dist_to_dst is None:
+                dist_to_dst = [dist_row[b] for dist_row in dist_matrix]
+                dist_to_dst_cache[b] = dist_to_dst
+            _route_ecmp_pair(a, b, w, dist_matrix, dist_to_dst, neighbors, add_load)
+        return loads
+
+    hop_matrix = tables.next_hop
+    for a, b, w in iter_routed_pairs():
+        cur = a
+        steps = 0
+        while cur != b:
+            nxt = cast(int, hop_matrix[cur][b])
+            if nxt < 0:
+                raise ValueError(
+                    f"no path between QPU {a} and {b} for traffic load {w}"
+                )
+            add_load(cur, nxt, w)
+            cur = nxt
+            steps += 1
+            if steps > n:
+                raise ValueError("shortest-path routing contains a cycle")
     return loads
 
 

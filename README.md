@@ -1452,6 +1452,7 @@ quport --help
 - Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.
+- Public helpers validate their inputs on every call, which is right for an entry point and wasteful inside a search loop. The partitioners therefore validate once and reuse the result: `quport.network.prepare_routing_tables` hoists shortest-path validation, and `accumulate_traffic` / `accumulate_boundary_counts` take pre-validated edges. The prepared path accumulates in the same order as the validating one, so results are bit-identical -- `tests/test_network.py` pins that, and the partitioner's own outputs were checked unchanged across topologies, strategies and seeds.
 
 ---
 
