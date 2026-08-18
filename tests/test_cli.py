@@ -914,3 +914,125 @@ def test_optimal_scores_the_requested_strategy(tmp_path: Path) -> None:
     # The e-bit strategy is the one aiming at this objective; if it stopped
     # winning here the penalty weights have drifted out of scale again.
     assert ebit["ebits"]["heuristic"] < sa["ebits"]["heuristic"]
+
+
+def test_migrate_reports_a_saving_and_writes_a_plan(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    out = tmp_path / "plan.json"
+
+    result = _run(
+        [
+            "migrate",
+            "--n-logical",
+            "9",
+            "--depth",
+            "16",
+            "--seed",
+            "0",
+            "--config",
+            str(config),
+            "--windows",
+            "3",
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert "Time-varying placement" in result.output  # type: ignore[attr-defined]
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["temporal_ebits"] <= payload["best_static_ebits"]
+    assert payload["best_static_ebits"] <= payload["seed_ebits"]
+    assert payload["reduction_vs_seed"] >= 0.0
+    assert payload["reduction_by_migration"] >= 0.0
+    assert (
+        payload["packet_ebits"]
+        + payload["unpackable_ebits"]
+        + payload["migration_ebits"]
+        == payload["temporal_ebits"]
+    )
+
+    plan = payload["plan"]
+    assert len(plan["assignments"]) == len(plan["windows"])
+    assert plan["windows"][0]["start"] == 0
+    for before, after in zip(plan["windows"], plan["windows"][1:]):
+        assert before["stop"] == after["start"]
+    assert len(plan["migrations"]) * payload["migration_cost"] == (
+        payload["migration_ebits"]
+    )
+
+
+def test_migrate_with_one_window_cannot_migrate(tmp_path: Path) -> None:
+    """One window is the static model: the search may still re-place, never move.
+
+    It is not a no-op -- the neighbourhood includes whole-circuit moves, so a
+    single window still improves the static placement. What it cannot do is
+    migrate, which is exactly why it is the control the report compares against.
+    """
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    out = tmp_path / "plan.json"
+
+    _run(
+        [
+            "migrate",
+            "--n-logical",
+            "9",
+            "--depth",
+            "12",
+            "--config",
+            str(config),
+            "--windows",
+            "1",
+            "--out",
+            str(out),
+        ]
+    )
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["moves"] == 0
+    assert payload["migration_ebits"] == 0
+    assert payload["plan"]["migrations"] == []
+    assert len(payload["plan"]["windows"]) == 1
+    assert payload["temporal_ebits"] == payload["best_static_ebits"]
+    assert payload["temporal_ebits"] <= payload["seed_ebits"]
+
+
+def test_migrate_honours_an_expensive_teleport(tmp_path: Path) -> None:
+    """Price migration high enough and no qubit is worth moving."""
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    cheap = tmp_path / "cheap.json"
+    dear = tmp_path / "dear.json"
+
+    for cost, out in (("1", cheap), ("1000", dear)):
+        _run(
+            [
+                "migrate",
+                "--n-logical",
+                "9",
+                "--depth",
+                "16",
+                "--seed",
+                "0",
+                "--config",
+                str(config),
+                "--windows",
+                "3",
+                "--migration-cost",
+                cost,
+                "--out",
+                str(out),
+            ]
+        )
+
+    cheap_payload = json.loads(cheap.read_text(encoding="utf-8"))
+    dear_payload = json.loads(dear.read_text(encoding="utf-8"))
+
+    assert dear_payload["moves"] == 0
+    assert dear_payload["migration_ebits"] == 0
+    # Without migration the best it can do is the static control.
+    assert dear_payload["temporal_ebits"] == dear_payload["best_static_ebits"]
+    # Cheap teleports do get used, and beat the control.
+    assert cheap_payload["moves"] > 0
+    assert cheap_payload["temporal_ebits"] < cheap_payload["best_static_ebits"]

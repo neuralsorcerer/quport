@@ -64,6 +64,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Optional temporal interaction weights that emphasize earlier two-qubit gates.
 - Capacity-constrained partitioning baselines, topology-aware partitioning, and e-bit-aware partitioning.
 - Exact capacity-constrained partitioning by branch and bound, for both the cut and the e-bit objective, so a heuristic's result can be read against a proved optimum.
+- Time-varying qubit placement: per-window assignments with teleport-priced migration, costed in the same e-bit model and reducing exactly to static placement when nothing moves.
 - Computational-basis diagonality analysis that decides which gates one cat-entanglement can serve.
 - Distributable-packet extraction and the hypergraph $\lambda-1$ e-bit metric.
 - Communication aggregation of cross-QPU gates into cat-entanglement and teleport blocks under a comm-port budget.
@@ -76,7 +77,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Event-driven, resource-constrained entanglement scheduling with per-port hold times, per-link channels, hop-scaled EPR distribution, and a heralded-success retry model.
 - Independent auditing of both finished schedules -- re-deriving the topology plan's layer and round intervals, port and link usage, and summary aggregates from the outside, and checking the entanglement schedule against the resource and monotonicity theorems its outputs must satisfy -- so a shipped manifest is a checked claim rather than a stated one.
 - Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, EPR pairs, and makespan.
-- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, splitting, and distributed compilation.
+- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, migration analysis, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
 
 ---
@@ -663,6 +664,78 @@ rotations keeps its packet open across the whole ladder. Random circuits benefit
 less: translating to the default basis puts `sx` and `x` gates on most qubits, and
 each of those closes a packet.
 
+### Letting qubits move between QPUs
+
+Every partitioner above places a logical qubit on one QPU for the whole circuit,
+and that is a real restriction rather than an implementation detail. A qubit that
+interacts with one neighbourhood early and a different one late pays for the
+mismatch on every gate of whichever half it is stranded in. A machine that can
+teleport a qubit between QPUs can move it once instead, for a single EPR pair.
+
+`quport.temporal` prices that trade-off in the same accounting: cut the
+instruction stream into contiguous **windows**, give each window its own
+assignment, and charge a teleport for every qubit whose QPU changes between
+neighbouring windows.
+
+$$
+J_{\mathrm{temporal}}(\pi_1,\dots,\pi_W)=
+\underbrace{\sum_{P\in\mathcal{P}}\;\sum_{e\in\mathrm{epochs}(P)}
+\bigl|\{\pi_{w(g)}(\mathrm{partner}(g)) : g\in e\}
+\setminus\{\pi(\mathrm{root}(P))|_e\}\bigr|}_{\text{cat copies}}
+\;+\;\sum_{q}\sum_{w<W}\;m\cdot[\pi_w(q)\neq\pi_{w+1}(q)]
+$$
+
+A window boundary is not a barrier. A cat copy stays valid as long as its root
+stays put, so the count runs over **root epochs** — maximal runs of a packet's
+gates during which the root's QPU does not change — and within an epoch one e-bit
+is charged per distinct remote QPU the partners occupy *at the time their own
+gates run*. A partner that migrates mid-packet therefore costs a second copy, and
+teleporting the root correctly kills every copy of it.
+
+That makes the generalisation faithful in the strong sense: with one window, or
+with the same assignment in every window, the cost is *identically* $E(\pi)$. A
+saving can only be reported when there is one.
+
+#### The neighbourhood is a run of windows, not one window
+
+A qubit relocated for a single window pays two migrations, in and out, and can
+only earn them back from that one window's traffic. The change that pays is
+usually to move a qubit *once* and leave it for several windows: two migrations
+against the traffic of the whole run. A single-window neighbourhood can only
+reach that through individually worse states, so it never does — on 16-qubit
+instances it found a $6.4\%$ saving where interval moves find $14.7\%$.
+
+Because the neighbourhood includes the *whole-circuit* run, the search also
+improves the static placement, and two different effects then contribute to the
+result. They are reported separately, and the temporal phase is seeded from the
+stationary optimum so that
+$\text{cost} \le \text{stationary} \le \text{seed}$ holds by construction — a
+plan that moved qubits can never lose to one that did not.
+
+Against the `ebit` strategy's partition, on random circuits with 6 seeds each:
+
+| Instance | Better static placement | Migration, on top | Migrations used |
+|---|---|---|---|
+| 9q / 3 QPUs | $7.8\%$ | $12.9\%$ – $15.4\%$ | 1–2 |
+| 12q / 3 QPUs | $6.3\%$ | $7.5\%$ – $11.1\%$ | 1–3 |
+| 16q / 4 QPUs | $4.7\%$ | $3.6\%$ – $10.5\%$ | 2–3 |
+| 20q / 5 QPUs | $3.8\%$ | $5.5\%$ – $9.2\%$ | 3–6 |
+
+The static column is a useful cross-check on its own: it says the `ebit`
+strategy's partition is still $4$–$8\%$ improvable by local search, consistent
+with the $7.7\%$ gap to the proved optimum measured above.
+
+This is an analysis of what time-varying placement is worth. `compile_distributed`
+still emits a single static placement; the windows and their assignments are a
+plan a scheduler could act on, and a number a designer can use to decide whether
+teleport-based migration is worth building.
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json
+```
+
+---
+
 ### Calibrating the heuristics against the exact optimum
 
 Everything above is a heuristic, and a heuristic without a reference is a number
@@ -1158,6 +1231,18 @@ cost, the optimum, and the gap, under both the cut and the e-bit objective.
 `--max-nodes` bounds the search; when the budget runs out the gap is rendered as
 `>= x%` and flagged as unproved, because the reference is then only an upper bound.
 Keep the instance small — the tree is over set partitions.
+
+### See what moving qubits between QPUs would save
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json --out plan.json
+```
+
+Prints the seed placement's EPR cost, the best cost with migration forbidden, and
+the best with it allowed, plus every migration as `qubit q: QPU a -> b after
+window w`. The middle column is the control: "saved by migration" compares
+against it, holding the placement search constant. `--migration-cost` prices a
+teleport; set it high enough and the plan collapses to pure re-placement.
 
 ### Split a mapped global circuit into local circuits and remote operations
 

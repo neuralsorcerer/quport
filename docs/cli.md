@@ -158,6 +158,30 @@ would then be wrong.
 The tree is over set partitions, so keep the instance small -- roughly a dozen
 qubits. This calibrates the heuristics; it is not a compile path.
 
+## `quport migrate`
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json --out plan.json
+```
+
+Reports what letting qubits move between QPUs mid-circuit would save. Cuts the
+instruction stream into `--windows` windows, gives each its own placement, and
+charges `--migration-cost` EPR pairs (one by default) for every qubit whose QPU
+changes between neighbouring windows.
+
+Three costs are printed, because two different effects contribute: the seed
+placement's cost, the best placement the search reaches with migration forbidden,
+and the best with migration allowed. "saved by migration" compares the last two,
+holding the placement search constant, and is the number that answers whether
+teleport-based migration is worth having. Each migration is listed as
+`qubit q: QPU a -> b after window w`.
+
+`--out` writes the plan: windows, per-window assignments, migrations, and the
+cost breakdown.
+
+The plan is an analysis, not a compile artifact — `compile-dist` still emits a
+single static placement.
+
 ## `quport compile-dist`
 
 ```bash
@@ -203,6 +227,7 @@ python -m json.tool compile_out/entanglement_plan.json >/dev/null
 | topology/port aggregate summaries | `quport sweep` |
 | quick makespan estimate | `quport schedule` |
 | EPR-pair budget and communication plan | `quport ebits` |
+| value of moving qubits between QPUs mid-circuit | `quport migrate` |
 | how far a partition is from optimal | `quport optimal` |
 | per-QPU split of a globally mapped circuit | `quport split` |
 | explicit distributed compile artifacts | `quport compile-dist` |

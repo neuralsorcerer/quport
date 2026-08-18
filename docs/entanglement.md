@@ -15,6 +15,7 @@ performs it and a proof that it does.
 | `quport.schedule.estimate_entanglement_schedule` | How long does that plan take on this interconnect? | Schedule time |
 | `quport.protocol` | What circuit actually performs the plan, and is it right? | Emission and verification |
 | `quport.exact` | How close to optimal is the partition the heuristic found? | Offline, on small instances |
+| `quport.temporal` | Would letting qubits move between QPUs mid-circuit be worth it? | Offline, as an analysis |
 
 ## Why cat-entanglement changes the objective
 
@@ -248,6 +249,90 @@ Because it compares state vectors it speaks about the state a circuit prepares.
 Terminating measurements are dropped -- they read that state out without changing
 it -- while a measurement or reset that later operations depend on changes what
 the circuit computes, and is refused rather than quietly ignored.
+
+## Letting qubits move
+
+Every partitioner places a logical qubit on one QPU for the whole circuit. That
+is a real restriction: a qubit that interacts with one neighbourhood early and a
+different one late pays for the mismatch on every gate of whichever half it is
+stranded in. A machine that can teleport a qubit between QPUs can move it once
+instead, for one EPR pair.
+
+`quport.temporal` models that trade-off under the same accounting: cut the
+instruction stream into contiguous **windows**, give each its own assignment, and
+charge a teleport for each qubit whose QPU changes between neighbouring windows.
+
+```python
+from quport.temporal import optimize_temporal_partition, split_windows
+
+windows = split_windows(result.packets, 3)
+plan = optimize_temporal_partition(
+    result.packets, result.partition, cfg.n_qpus, cfg.capacity_per_qpu(), windows
+)
+print(plan.static_cost, plan.stationary_cost, plan.cost.total)
+print(f"{plan.migration_reduction:.1%} saved by letting qubits move")
+```
+
+### Cat copies are not cut at a boundary
+
+A window boundary is not a barrier. A cat copy stays valid as long as its root
+stays put, so cost is counted over **root epochs** — maximal runs of a packet's
+gates during which the root's QPU does not change. Within an epoch, one e-bit is
+charged per distinct remote QPU the partners occupy *at the time their own gates
+run*, so a partner that migrates mid-packet correctly costs a second copy, and
+teleporting the root correctly invalidates every copy of it.
+
+That is what makes the generalisation faithful: with one window, or with the same
+assignment in every window, the cost is *identically* `ebit_cost`. A saving can
+therefore only be reported when it is one.
+
+### Two effects, reported separately
+
+The search's neighbourhood is built on contiguous **runs** of windows, not single
+windows — a qubit relocated for one window pays two migrations against one
+window's traffic and rarely earns them back, while moving it once and leaving it
+for several windows pays two migrations against the whole run. A single-window
+neighbourhood can only reach that through individually worse states, so it never
+does.
+
+Because that neighbourhood includes the *whole-circuit* run, the search also
+improves the static placement. Two different things then contribute to the
+result, and the report keeps them apart:
+
+| Field | Meaning |
+|---|---|
+| `static_cost` | the seed placement's cost |
+| `stationary_cost` | best placement the same search reaches with migration forbidden |
+| `cost.total` | best placement with migration allowed |
+
+The temporal phase starts from the stationary optimum, so
+`cost.total <= stationary_cost <= static_cost` holds by construction — a plan
+that moved qubits can never lose to one that did not. `migration_reduction` is
+the honest headline: it holds the placement search constant and varies only
+whether qubits may move.
+
+Measured against the `ebit` strategy's partition on random circuits, 9 to 20
+logical qubits across 3 to 5 QPUs:
+
+| Instance | Better static placement | Migration, on top |
+|---|---|---|
+| 9q / 3 QPUs | 7.8% | 12.9% – 15.4% |
+| 12q / 3 QPUs | 6.3% | 7.5% – 11.1% |
+| 16q / 4 QPUs | 4.7% | 3.6% – 10.5% |
+| 20q / 5 QPUs | 3.8% | 5.5% – 9.2% |
+
+Typically one to five qubit migrations do the work.
+
+```{note}
+This is an analysis of what time-varying placement is worth. `compile_distributed`
+still emits a single static placement; the windows and their assignments are a
+plan a scheduler could act on, and a number a designer can use to decide whether
+teleport-based migration is worth building.
+```
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json
+```
 
 ## Calibrating against the optimum
 

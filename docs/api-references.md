@@ -492,6 +492,38 @@ uniform.
 The tree is over set partitions, so this terminates on roughly a dozen qubits. It
 exists to calibrate the heuristics, not to compile.
 
+### Time-varying placement
+
+```python
+split_windows(decomposition, count) -> tuple[TemporalWindow, ...]
+static_temporal_partition(part, windows) -> TemporalPartition
+temporal_ebit_cost(decomposition, partition, n_qpus, *,
+                   migration_cost=1) -> TemporalCost
+optimize_temporal_partition(decomposition, part, n_qpus, capacity, windows, *,
+                            migration_cost=1, max_passes=8,
+                            seed=None) -> TemporalResult
+```
+
+Prices letting qubits move between QPUs mid-circuit, in the same e-bit model.
+
+- `TemporalWindow(start, stop)` is a half-open instruction range; windows must be
+  contiguous and the first must start at 0. `split_windows` cuts the stream into
+  windows of similar communication content, returning fewer than asked for when
+  the circuit has too few relevant gates.
+- `TemporalPartition(windows, assignments)` holds one assignment per window, with
+  `migrations()` and `to_dict()`.
+- `TemporalCost(packet_ebits, unpackable_ebits, migration_ebits, moves)` and its
+  `total`. Cat copies are counted over *root epochs*, so a copy survives a window
+  boundary when its root does not move.
+- `TemporalResult(partition, cost, static_cost, stationary_cost, passes)` with
+  `saved` / `reduction` against the seed, and `migration_saved` /
+  `migration_reduction` against the best placement the same search reaches with
+  migration forbidden. `cost.total <= stationary_cost <= static_cost` holds by
+  construction.
+
+With one window, or the same assignment in every window, `temporal_ebit_cost`
+returns exactly `ebit_cost` for that assignment.
+
 ### Reassembly and verification of a distributed program
 
 ```python

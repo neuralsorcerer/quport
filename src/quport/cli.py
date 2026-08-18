@@ -44,6 +44,7 @@ from quport.schedule import (
     audit_entanglement_schedule,
     audit_topology_schedule_plan,
 )
+from quport.temporal import optimize_temporal_partition, split_windows
 
 app = typer.Typer(
     add_completion=False, help="QuPort: multi-QPU circuit mapping + benchmarks"
@@ -678,6 +679,106 @@ def optimal(
             json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
         )
         _print_path(f"Wrote gap report to {out}")
+
+
+@app.command()
+def migrate(
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
+    depth: int = typer.Option(20, help="Random circuit depth"),
+    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    strategy: str = typer.Option(
+        "ebit",
+        help="Partition strategy for the static placement to improve on",
+    ),
+    windows: int = typer.Option(
+        3, help="Number of time windows to cut the instruction stream into"
+    ),
+    migration_cost: int = typer.Option(
+        1, "--migration-cost", help="EPR pairs to teleport one qubit between QPUs"
+    ),
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
+    out: str | None = typer.Option(
+        None, help="Optional JSON path for the placement plan"
+    ),
+) -> None:
+    """Report what letting qubits move between QPUs mid-circuit would save.
+
+    Cuts the instruction stream into windows, gives each its own placement, and
+    charges a teleport for every qubit whose QPU changes between neighbouring
+    windows. The search starts from the static placement, so the reported plan
+    never costs more than holding one assignment for the whole circuit.
+    """
+    cfg = _load_config_or_default(config)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
+
+    res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
+    capacity = cfg.capacity_per_qpu()
+
+    window_ranges = split_windows(res.packets, windows)
+    result = optimize_temporal_partition(
+        res.packets,
+        res.partition,
+        cfg.n_qpus,
+        capacity,
+        window_ranges,
+        migration_cost=migration_cost,
+        seed=seed,
+    )
+
+    table = Table(title=f"Time-varying placement ({len(window_ranges)} windows)")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    table.add_row("EPR pairs, seed placement", str(result.static_cost))
+    table.add_row("EPR pairs, best static", str(result.stationary_cost))
+    table.add_row("EPR pairs, time-varying", str(result.cost.total))
+    table.add_row("  of which cat copies", str(result.cost.packet_ebits))
+    table.add_row("  of which teleported gates", str(result.cost.unpackable_ebits))
+    table.add_row("  of which migrations", str(result.cost.migration_ebits))
+    table.add_row("qubit migrations", str(result.cost.moves))
+    table.add_row("saved vs seed", f"{result.reduction * 100:.1f}%")
+    table.add_row("saved by migration", f"{result.migration_reduction * 100:.1f}%")
+    table.add_row("search passes", str(result.passes))
+    console.print(table)
+
+    for qubit, boundary, source, target in result.partition.migrations():
+        console.print(
+            f"  qubit {qubit}: QPU {source} -> {target} after window {boundary}"
+        )
+
+    if out:
+        Path(out).write_text(
+            json.dumps(
+                {
+                    "strategy": strategy,
+                    "n_qpus": cfg.n_qpus,
+                    "migration_cost": migration_cost,
+                    "seed_ebits": result.static_cost,
+                    "best_static_ebits": result.stationary_cost,
+                    "temporal_ebits": result.cost.total,
+                    "packet_ebits": result.cost.packet_ebits,
+                    "unpackable_ebits": result.cost.unpackable_ebits,
+                    "migration_ebits": result.cost.migration_ebits,
+                    "moves": result.cost.moves,
+                    "reduction_vs_seed": result.reduction,
+                    "reduction_by_migration": result.migration_reduction,
+                    "passes": result.passes,
+                    "plan": result.partition.to_dict(),
+                },
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        _print_path(f"Wrote placement plan to {out}")
 
 
 @app.command()

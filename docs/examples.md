@@ -120,6 +120,52 @@ summary = estimate_entanglement_schedule(
 print(summary.makespan, summary.peak_ports_in_use)
 ```
 
+## What moving qubits between QPUs would save
+
+```python
+from quport import MultiQPUConfig, compile_distributed
+from quport.pipeline import random_benchmark_circuit
+from quport.temporal import optimize_temporal_partition, split_windows
+
+cfg = MultiQPUConfig(
+    n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2, optimization_level=0
+)
+res = compile_distributed(
+    random_benchmark_circuit(16, depth=20, seed=0), cfg, seed=0, strategy="ebit"
+)
+
+windows = split_windows(res.packets, 4)
+plan = optimize_temporal_partition(
+    res.packets,
+    res.partition,
+    cfg.n_qpus,
+    cfg.capacity_per_qpu(),
+    windows,
+    seed=0,
+)
+
+# Three costs, because two effects contribute: the seed placement, the best the
+# search reaches without moving anything, and the best with migration allowed.
+print(plan.static_cost, plan.stationary_cost, plan.cost.total)
+print(f"{plan.migration_reduction:.1%} of that came from moving qubits")
+
+for qubit, boundary, source, target in plan.partition.migrations():
+    print(f"qubit {qubit}: QPU {source} -> {target} after window {boundary}")
+```
+
+`cost.total <= stationary_cost <= static_cost` holds by construction, so a plan
+that moved qubits never loses to one that did not. Price a teleport out of reach
+with `migration_cost=` and the plan collapses to pure re-placement:
+
+```python
+held = optimize_temporal_partition(
+    res.packets, res.partition, cfg.n_qpus, cfg.capacity_per_qpu(), windows,
+    migration_cost=10_000, seed=0,
+)
+assert held.cost.moves == 0
+assert held.cost.total == held.stationary_cost
+```
+
 ## Scoring a partition against the exact optimum
 
 ```python

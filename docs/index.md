@@ -62,6 +62,7 @@ Package releases <https://github.com/neuralsorcerer/quport/releases>
 | Run repeated random-circuit comparisons | `benchmark_random_circuits` or `quport bench` | Writes row-oriented benchmark metrics suitable for CSV analysis |
 | Sweep topology/port settings | `sweep_topologies` or `quport sweep` | Aggregates repeated benchmark rows by architecture setting |
 | Count EPR pairs and inspect the communication plan | `quport ebits` or `compile_distributed(...).aggregation` | Reports e-bit demand after cat-entanglement aggregation, not just cut gates |
+| See what letting qubits move mid-circuit would save | `quport migrate` or `optimize_temporal_partition` | Prices time-varying placement against static placement in the same e-bit model |
 | Judge how good a partition actually is | `quport optimal` or `partition_gap` | Solves the same instance exactly, so a heuristic's result has a scale to be read against |
 | Check that a schedule manifest adds up | `audit_topology_schedule_plan` / `audit_entanglement_schedule` | Re-derives every figure in a plan independently, so a consumer can tell a sound manifest from a wrong one |
 | Inspect communication bottlenecks | `estimate_topology_schedule_plan` | Returns layer/round traces with absolute timing, port usage, link utilization, and a validated JSON-ready `to_dict()` manifest |
