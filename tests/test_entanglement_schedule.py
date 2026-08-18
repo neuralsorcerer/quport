@@ -307,3 +307,190 @@ def test_schedule_rejects_invalid_arguments() -> None:
         estimate_entanglement_schedule(qc, arch, LatencyModel(), ports_per_qpu="2")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="length must match n_qpus"):
         estimate_entanglement_schedule(qc, arch, LatencyModel(), ports_per_qpu=[1])
+
+
+# ---------------------------------------------------------------------------
+# Auditing a finished entanglement schedule
+# ---------------------------------------------------------------------------
+
+
+def _scheduled_case(**overrides):
+    """A compiled schedule with real EPR traffic, plus its inputs."""
+    from quport.aggregation import aggregate_remote_operations
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    settings = dict(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=2,
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    settings.update(overrides)
+    cfg = MultiQPUConfig(**settings)
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+    qc = random_benchmark_circuit(n_logical=9, depth=10, seed=0)
+    res = compile_distributed(qc, cfg, model, seed=0, strategy="tpccap_sa")
+    plan = aggregate_remote_operations(
+        res.physical_circuit, arch, ports_per_qpu=cfg.comm_qubits_per_qpu
+    )
+    summary = estimate_entanglement_schedule(
+        res.physical_circuit, arch, model, plan=plan
+    )
+    assert summary.link_busy_time, "the fixture must generate EPR traffic"
+    return summary, res.physical_circuit, arch, model, plan
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"inter_topology": "switch", "comm_qubits_per_qpu": 1},
+        {"inter_topology": "mesh", "n_qpus": 4, "link_capacity": 2},
+        {"n_qpus": 4, "compute_qubits_per_qpu": 4, "comm_qubits_per_qpu": 1},
+    ],
+    ids=["ring", "switch-1port", "mesh-2channels", "wide"],
+)
+def test_schedule_satisfies_the_properties_it_must(overrides):
+    from quport.schedule import audit_entanglement_schedule
+
+    summary, mapped, arch, model, plan = _scheduled_case(**overrides)
+
+    assert audit_entanglement_schedule(summary, mapped, arch, model, plan=plan) == ()
+
+
+def test_audit_catches_a_schedule_that_cannot_be_true():
+    """Each corruption breaks a property that holds by theorem, not convention."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    summary, mapped, arch, model, plan = _scheduled_case()
+    edge, _busy = summary.link_busy_time[0]
+
+    cases = {
+        "cat copies at once": dataclasses.replace(
+            summary, peak_ports_in_use=tuple(99 for _ in summary.peak_ports_in_use)
+        ),
+        "port-busy time": dataclasses.replace(
+            summary,
+            port_busy_time=tuple(
+                summary.makespan * 1000.0 for _ in summary.port_busy_time
+            ),
+        ),
+        "channels": dataclasses.replace(
+            summary,
+            link_busy_time=((edge, summary.makespan * 1000.0),)
+            + summary.link_busy_time[1:],
+        ),
+        "per-link busy times sum": dataclasses.replace(
+            summary, entanglement_time=summary.entanglement_time + 1.0
+        ),
+        "serialised on the busiest": dataclasses.replace(summary, makespan=1.0),
+        "operations spanning more than one QPU": dataclasses.replace(
+            summary, remote_gates=summary.remote_gates + 1
+        ),
+        "only": dataclasses.replace(
+            summary, unschedulable_gates=summary.remote_gates + 1
+        ),
+        "the plan has": dataclasses.replace(summary, blocks=summary.blocks + 1),
+        "the plan spends": dataclasses.replace(
+            summary, epr_pairs=summary.epr_pairs + 1
+        ),
+        "entries for": dataclasses.replace(
+            summary, qpu_busy_time=summary.qpu_busy_time[:-1]
+        ),
+    }
+
+    for expected, broken in cases.items():
+        problems = audit_entanglement_schedule(broken, mapped, arch, model, plan=plan)
+        assert problems, f"audit missed: {expected}"
+        assert any(
+            expected in problem for problem in problems
+        ), f"audit reported {problems} for {expected!r}"
+
+
+def test_widening_a_resource_never_lengthens_one_fixed_plan():
+    """Monotonicity is a property of the estimator, so it is checked directly.
+
+    More ports and more link channels can only let an acquire return earlier, so
+    every event time can only move earlier. A schedule that got *longer* when a
+    resource was widened would mean the pools are not doing what they claim.
+    """
+    import dataclasses as dc
+
+    from quport.aggregation import aggregate_remote_operations
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+    qc = random_benchmark_circuit(n_logical=9, depth=10, seed=0)
+    res = compile_distributed(qc, cfg, model, seed=0, strategy="tpccap_sa")
+    mapped = res.physical_circuit
+    plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=1)
+
+    previous = None
+    for budget in (1, 2, 4, 8):
+        makespan = estimate_entanglement_schedule(
+            mapped, arch, model, plan=plan, ports_per_qpu=budget
+        ).makespan
+        if previous is not None:
+            assert makespan <= previous + 1e-9
+        previous = makespan
+
+    previous = None
+    for link_capacity in (1, 2, 4):
+        wider = MultiQPUArchitecture(dc.replace(cfg, link_capacity=link_capacity))
+        makespan = estimate_entanglement_schedule(
+            mapped, wider, model, plan=plan, ports_per_qpu=1
+        ).makespan
+        if previous is not None:
+            assert makespan <= previous + 1e-9
+        previous = makespan
+
+
+def test_slower_or_less_reliable_entanglement_never_shortens_a_schedule():
+    from quport.aggregation import aggregate_remote_operations
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=2,
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    qc = random_benchmark_circuit(n_logical=9, depth=10, seed=0)
+    res = compile_distributed(qc, cfg, LatencyModel(), seed=0, strategy="tpccap_sa")
+    mapped = res.physical_circuit
+    plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=2)
+
+    previous = None
+    for epr_gen in (50.0, 200.0, 800.0):
+        makespan = estimate_entanglement_schedule(
+            mapped, arch, LatencyModel(epr_gen=epr_gen), plan=plan
+        ).makespan
+        if previous is not None:
+            assert makespan >= previous - 1e-9
+        previous = makespan
+
+    previous = None
+    for prob in (1.0, 0.5, 0.25):
+        makespan = estimate_entanglement_schedule(
+            mapped, arch, LatencyModel(epr_success_prob=prob), plan=plan
+        ).makespan
+        if previous is not None:
+            assert makespan >= previous - 1e-9
+        previous = makespan

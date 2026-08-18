@@ -124,7 +124,10 @@ Reports EPR-pair demand after communication aggregation: cross-QPU gates, EPR pa
 with and without aggregation, the saving, block count, port evictions, peak cat
 copies per QPU, the port-unconstrained e-bit count, and both the entanglement-aware
 and topology-aware makespans. `--out` writes the full plan, including each block's
-root qubit, host QPU, protocol, and served gate indices.
+root qubit, host QPU, protocol, and served gate indices — after
+`audit_entanglement_schedule` has checked it against the port and link budgets it
+claims to respect, the circuit's own cross-QPU operation count, and the plan it
+came from. An inconsistent schedule is reported and not written.
 
 `--emit-qasm PATH` additionally writes the executable protocol circuit as
 OpenQASM 3, with explicit EPR pairs, mid-circuit measurement, and `if`
@@ -169,7 +172,7 @@ benchmark. Output artifacts:
 - `remote_ops.json`: ordered remote operation manifest, in the routed programs' physical-qubit labelling (local routing permutes qubits inside a QPU unless the intra-QPU topology is a clique, so the pre-routing indices would point elsewhere);
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
 - `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
-- `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary.
+- `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary (audited before writing, like the schedule trace).
 
 The schedule JSON writers use `allow_nan=False` and the schedule serializers
 validate timings, counts, QPU pairs, and link-utilization pairs before export.

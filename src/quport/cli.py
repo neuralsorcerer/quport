@@ -40,7 +40,10 @@ from quport.pipeline import (
     random_benchmark_circuit,
     sweep_topologies,
 )
-from quport.schedule import audit_topology_schedule_plan
+from quport.schedule import (
+    audit_entanglement_schedule,
+    audit_topology_schedule_plan,
+)
 
 app = typer.Typer(
     add_completion=False, help="QuPort: multi-QPU circuit mapping + benchmarks"
@@ -383,7 +386,6 @@ def schedule(
     ),
 ) -> None:
     """Estimate parallel multi-QPU makespan for a mapped random circuit."""
-    from .architecture import MultiQPUArchitecture
     from .schedule import estimate_parallel_makespan_layered
 
     cfg = _load_config_or_default(config)
@@ -421,7 +423,6 @@ def split(
     ),
 ) -> None:
     """Split a mapped circuit into per-QPU local circuits + remote-op list (JSON)."""
-    from .architecture import MultiQPUArchitecture
     from .distributed import split_into_qpus
 
     cfg = _load_config_or_default(config)
@@ -520,6 +521,17 @@ def ebits(
     console.print(table)
 
     if out:
+        # The same rule as `compile-dist`: a manifest written for someone else to
+        # act on is checked before it ships, not after they trust it.
+        problems = audit_entanglement_schedule(
+            sched, res.physical_circuit, MultiQPUArchitecture(cfg), latency, plan=plan
+        )
+        if problems:
+            console.print("[bold red]Entanglement schedule is inconsistent:[/bold red]")
+            for problem in problems[:10]:
+                console.print(f"  {problem}")
+            raise typer.Exit(code=1)
+
         Path(out).write_text(
             json.dumps(
                 {
@@ -535,7 +547,6 @@ def ebits(
         _print_path(f"Wrote entanglement plan to {out}")
 
     if emit_qasm or verify:
-        from .architecture import MultiQPUArchitecture
         from .protocol import build_telegate_circuit, verify_telegate_equivalence
 
         arch = MultiQPUArchitecture(cfg)
@@ -752,6 +763,19 @@ def compile_dist(
         json.dumps(res.schedule_plan.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",
     )
+    entanglement_problems = audit_entanglement_schedule(
+        res.entanglement_schedule,
+        res.physical_circuit,
+        MultiQPUArchitecture(cfg),
+        latency,
+        plan=res.aggregation,
+    )
+    if entanglement_problems:
+        console.print("[bold red]Entanglement schedule is inconsistent:[/bold red]")
+        for problem in entanglement_problems[:10]:
+            console.print(f"  {problem}")
+        raise typer.Exit(code=1)
+
     (outp / "entanglement_plan.json").write_text(
         json.dumps(
             {

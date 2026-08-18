@@ -401,6 +401,35 @@ audit checks the plan is a faithful, feasible account of them.
 `quport compile-dist` runs this before writing `schedule_trace.json` and refuses to
 write a manifest that does not add up.
 
+### `audit_entanglement_schedule`
+
+```python
+audit_entanglement_schedule(summary, mapped, arch, model, *,
+                            plan=None, ports_per_qpu=None) -> tuple[str, ...]
+```
+
+The counterpart for `estimate_entanglement_schedule`, which returns aggregates and
+no trace — so instead of replaying events, this checks everything the aggregates
+are related by *theorem*:
+
+- a QPU with `P` ports cannot hold more than `P` cat copies at once, nor accrue
+  more than `P * makespan` of port-busy time; a link with `C` channels likewise;
+- `entanglement_time` equals the sum of `link_busy_time`, by definition;
+- every gate on a qubit occupies that qubit's timeline, so the busiest qubit's own
+  work is a lower bound on the makespan;
+- `remote_gates` is the circuit's own count of operations spanning more than one
+  QPU, and no more gates can be unschedulable than there are remote ones;
+- with `plan`, the summary describes that plan's blocks and EPR pairs.
+
+`ports_per_qpu` must be whatever the schedule was produced with. Monotonicity —
+that widening a resource never lengthens a schedule — is a property of the
+estimator rather than of one result, so it is obtained by scheduling one fixed
+`plan` twice and comparing; `tests/test_entanglement_schedule.py` does exactly
+that for ports, link channels, `epr_gen`, and `epr_success_prob`.
+
+`quport compile-dist` and `quport ebits --out` both run this before writing
+`entanglement_plan.json`.
+
 ### Entanglement API
 
 ```python

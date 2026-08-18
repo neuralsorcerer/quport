@@ -382,6 +382,41 @@ def test_ebits_command_reports_and_writes_a_plan(tmp_path: Path) -> None:
     )
 
 
+def test_ebits_command_writes_and_verifies_in_one_run(tmp_path: Path) -> None:
+    """`--out` and `--verify` together, which is where a scoping bug hid.
+
+    `--out` audits the schedule before writing it, and `--verify` simulates the
+    protocol. Each worked alone; the combination did not, because a
+    function-local import shadowed a module-level name for the whole function
+    and left it unbound on the earlier path. Only exercising both flags at once
+    reaches it.
+    """
+    config = tmp_path / "cfg.json"
+    _write_config(config)
+    out = tmp_path / "plan.json"
+    qasm = tmp_path / "telegate.qasm"
+
+    _run(
+        [
+            "ebits",
+            "--n-logical",
+            "4",
+            "--depth",
+            "3",
+            "--config",
+            str(config),
+            "--out",
+            str(out),
+            "--emit-qasm",
+            str(qasm),
+            "--verify",
+        ]
+    )
+
+    assert json.loads(out.read_text(encoding="utf-8"))["schedule"]
+    assert qasm.read_text(encoding="utf-8").startswith("OPENQASM 3")
+
+
 def test_ebits_command_emits_and_verifies_the_protocol(tmp_path: Path) -> None:
     config = tmp_path / "cfg.json"
     _write_config(config)

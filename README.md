@@ -74,7 +74,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Distributed compilation into per-QPU OpenQASM 3 programs, remote-operation JSON, and schedule JSON.
 - Schedule estimation under QPU-port, link-capacity, network-hop, switch-pair, and switch-reconfiguration constraints.
 - Event-driven, resource-constrained entanglement scheduling with per-port hold times, per-link channels, hop-scaled EPR distribution, and a heralded-success retry model.
-- Independent auditing of a finished schedule plan, re-deriving its layer and round intervals, port and link usage, and summary aggregates from the outside, so a shipped manifest is a checked claim rather than a stated one.
+- Independent auditing of both finished schedules -- re-deriving the topology plan's layer and round intervals, port and link usage, and summary aggregates from the outside, and checking the entanglement schedule against the resource and monotonicity theorems its outputs must satisfy -- so a shipped manifest is a checked claim rather than a stated one.
 - Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, EPR pairs, and makespan.
 - CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
@@ -1466,6 +1466,24 @@ deliberately does not re-derive is the cost model — per-hop EPR time, classica
 overlap, the round-packing policy — because those are modelling choices rather than
 claims; the audit checks the plan is a faithful, feasible account of them.
 `compile-dist` refuses to write a manifest that does not add up.
+
+`entanglement_plan.json` gets the same treatment from
+`quport.schedule.audit_entanglement_schedule`, by a different route.
+`estimate_entanglement_schedule` returns aggregates and no trace, so there are no
+events to replay -- but its outputs are related to each other by *theorem* rather
+than by convention, and those are checkable: a QPU with $P$ ports cannot hold more
+than $P$ cat copies at once nor accrue more than $P \cdot T$ of port-busy time over
+a makespan $T$, and a link with $C$ channels likewise; `entanglement_time` is by
+definition the sum of per-link busy time; every gate on a qubit occupies that
+qubit's timeline, so the busiest qubit's own work is a lower bound on $T$;
+`remote_gates` is the circuit's own count of operations spanning more than one QPU;
+and no more gates can be unschedulable than there are remote ones.
+
+Monotonicity is checked too, but it belongs to the estimator rather than to any one
+result, so it is obtained by scheduling one fixed plan twice: widening ports or link
+channels can only let an acquire return earlier, so the makespan must not rise, and
+slowing `epr_gen` or lowering `epr_success_prob` can only push events later, so it
+must not fall. Over 672 schedules spanning four topologies, every property held.
 
 `q0_phys` and `q1_phys` here are positions in the *routed* per-QPU programs, not
 in `physical_circuit`. Local routing permutes qubits inside a QPU whenever
