@@ -224,7 +224,14 @@ def test_unbounded_ports_match_hypergraph_ebits(seed: int) -> None:
     :mod:`quport.aggregation` walks a mapped circuit and allocates real ports;
     :mod:`quport.hypergraph` evaluates a closed-form lambda-1 metric over
     packets. With ports unconstrained they are two independent computations of
-    the same quantity, so any divergence is a bug in one of them.
+    the same quantity whenever each cross-QPU gate's root is forced -- which is
+    the case here, and in every compile, because the default basis leaves ``cx``
+    as the only two-qubit gate and only its control is diagonal. Any divergence
+    on such a circuit is a bug in one of them.
+
+    Symmetric gates leave the root free and the two choose it from different
+    information; see
+    ``test_symmetric_gates_leave_the_two_e_bit_models_free_to_differ``.
     """
     from quport.compiler import compile_distributed
 
@@ -238,6 +245,11 @@ def test_unbounded_ports_match_hypergraph_ebits(seed: int) -> None:
     result = compile_distributed(qc, cfg, seed=seed)
     arch = MultiQPUArchitecture(cfg)
     mapped = result.physical_circuit
+
+    assert all(
+        len(instruction.qubits) < 2 or instruction.operation.name == "cx"
+        for instruction in mapped.data
+    ), "the fixture must only hold gates whose root is forced"
 
     plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=UNBOUNDED_PORTS)
     decomposition = build_distributable_packets(mapped)
@@ -326,3 +338,70 @@ def test_aggregate_rejects_wrong_argument_types() -> None:
         aggregate_remote_operations(object(), arch)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="arch must be a MultiQPUArchitecture"):
         aggregate_remote_operations(QuantumCircuit(1), object())  # type: ignore[arg-type]
+
+
+def test_a_wide_gate_no_one_can_gather_counts_as_one_unschedulable_gate() -> None:
+    """``unschedulable_gates`` counts gates, not the teleports they would take.
+
+    An operation on three qubits spanning three QPUs needs two teleports. When
+    no port can serve it, that is still one gate the machine cannot run --
+    counting it twice would put the figure above ``remote_gates``, which
+    :func:`quport.schedule.audit_entanglement_schedule` reports as impossible.
+    """
+    arch = _arch(n_qpus=3, compute=1, comm=0)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.ccx(0, 1, 2)
+
+    plan = aggregate_remote_operations(mapped, arch)
+
+    assert plan.remote_gates == 1
+    assert plan.unschedulable_gates == 1
+    assert plan.blocks == ()
+    assert plan.epr_pairs == 0
+
+
+def test_a_wide_gate_is_served_or_not_served_as_a_whole() -> None:
+    """Gathering some operands and not others would leave the gate unrunnable.
+
+    The host needs a free port for every foreign operand at once, so a budget
+    that covers only one of two teleports serves neither.
+    """
+    arch = _arch(n_qpus=3, compute=1, comm=1)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.ccx(0, 2, 4)
+
+    plan = aggregate_remote_operations(mapped, arch)
+
+    # One port on the host cannot hold both foreign operands.
+    assert plan.unschedulable_gates == 1
+    assert plan.blocks == ()
+
+    roomier = aggregate_remote_operations(mapped, arch, ports_per_qpu=2)
+    assert roomier.unschedulable_gates == 0
+    assert [block.protocol for block in roomier.blocks] == ["teleport", "teleport"]
+    assert roomier.epr_pairs == 4
+
+
+def test_symmetric_gates_leave_the_two_e_bit_models_free_to_differ() -> None:
+    """Both models are upper bounds, and neither dominates on symmetric gates.
+
+    The agreement pinned by ``test_unbounded_ports_match_hypergraph_ebits`` holds
+    when each gate's root is forced. A ``cz`` leaves it free, and the two make
+    that choice from different information: packets are built without knowing
+    the placement, aggregation knows every operand's QPU. What must still hold
+    is that each is a real plan -- no more than the per-gate baseline.
+    """
+    arch = _arch(n_qpus=3, compute=1, comm=1)
+    part = [arch.qpu_of_phys(phys) for phys in range(arch.n_phys)]
+
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cz(0, 2)
+    mapped.cz(2, 4)
+    mapped.cz(0, 4)
+    mapped.cz(0, 2)
+
+    plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=UNBOUNDED_PORTS)
+    hypergraph = ebit_cost(build_distributable_packets(mapped), part, 3)
+
+    assert plan.epr_pairs <= plan.baseline_epr_pairs
+    assert hypergraph <= plan.baseline_epr_pairs

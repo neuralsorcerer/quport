@@ -548,11 +548,20 @@ needs a free port on the root's QPU to run the entangler. When a port is needed 
 none is free, the least recently used copy is released, and a fresh EPR pair is spent
 if that root is needed again. The plan records those `evictions`.
 
-The two computations are independent implementations of the same quantity: with an
-unbounded port budget, `aggregate_remote_operations(...).epr_pairs` equals
-`ebit_cost(...)` exactly, which
-`tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits` pins down
-over compiled random circuits.
+The two computations are independent implementations of the same quantity, and with
+an unbounded port budget they agree exactly whenever each cross-QPU gate's root is
+forced -- that is, whenever exactly one operand is diagonal, as it is for every $CX$,
+and so for every circuit compiled into QuPort's default basis.
+`tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits` pins that
+down over compiled random circuits.
+
+Symmetric gates ($CZ$, $CP$, $CRZ$, $R_{ZZ}$) leave the root free, and there the two
+part company by construction. Packets are built without knowing the placement, so
+`build_distributable_packets` chooses a root from the gate sequence alone, while
+`aggregate_remote_operations` knows every operand's QPU and prefers a root whose cat
+copy already reaches the partner's. Both are deterministic upper bounds on the same
+optimum, and on a circuit built from symmetric gates either can come out the lower of
+the two.
 
 ### Entanglement-aware scheduling
 

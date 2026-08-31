@@ -1473,7 +1473,6 @@ def estimate_entanglement_schedule(
         return start, finish
 
     def establish(ordinal: int) -> None:
-        nonlocal unschedulable
         block = blocks[ordinal]
         state = runtime[ordinal]
         source = block.root_qpu
@@ -1489,7 +1488,10 @@ def estimate_entanglement_schedule(
             state.feasible = False
             state.ready = qubit_ready[block.root_phys] + UNSCHEDULABLE_PENALTY
             qubit_ready[block.root_phys] = state.ready
-            unschedulable += block.size()
+            # The gates this block would have served are counted where they are
+            # reached, so an operation gathered by several blocks -- a wide gate
+            # needing one teleport per foreign operand -- counts once, not once
+            # per block.
             return
 
         state.hops = hops
@@ -1563,6 +1565,8 @@ def estimate_entanglement_schedule(
         ordinals = members.get(index)
         if ordinals is not None:
             remote_gates += 1
+            if any(not runtime[ordinal].feasible for ordinal in ordinals):
+                unschedulable += 1
             host = blocks[ordinals[0]].remote_qpu
             roots = {blocks[ordinal].root_phys for ordinal in ordinals}
             duration = lat.swap if operation.name == "swap" else lat.twoq

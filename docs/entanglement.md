@@ -168,11 +168,19 @@ same question on a mapped circuit where they are not:
   and a fresh EPR pair is spent if that root comes back. The plan reports those as
   `evictions`.
 
-The two computations are independent implementations of the same quantity. With an
-unbounded port budget `aggregate_remote_operations(...).epr_pairs` equals
-`ebit_cost(...)` exactly, which
-`tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits` pins down on
-compiled random circuits.
+The two computations are independent implementations of the same quantity, and with
+an unbounded port budget they agree exactly whenever the root of each cross-QPU gate
+is forced -- that is, whenever exactly one operand is diagonal, as it is for every
+`cx`, and so for every circuit compiled into QuPort's default basis.
+`tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits` pins that
+down on compiled random circuits.
+
+Symmetric gates (`cz`, `cp`, `crz`, `rzz`) leave the root free to choose, and there
+the two part company by design: packets are built without knowing the placement, so
+`build_distributable_packets` picks a root from the gate sequence alone, while
+`aggregate_remote_operations` knows which QPU every operand sits on and prefers a
+root whose cat copy already reaches the partner's QPU. Both are deterministic upper
+bounds on the same optimum, and either can come out lower on a given circuit.
 
 `max_block_gates` caps how many gates one block may serve, which trades EPR savings
 against how long a port stays pinned.

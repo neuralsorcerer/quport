@@ -31,10 +31,22 @@ partitioning objective over logical qubits. This module answers it *after*
 placement, on real physical qubits, and additionally respects the comm-port
 budget: a QPU with ``P`` ports can host at most ``P`` cat copies at once, so a
 plan that would exceed that evicts its least recently used copy and pays for a
-fresh EPR pair when the evicted root is needed again. With an unbounded port
-budget the two agree exactly, which
-``tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits``
-pins down.
+fresh EPR pair when the evicted root is needed again.
+
+With an unbounded port budget the two agree exactly whenever each cross-QPU
+gate's root is forced -- whenever one operand is diagonal and the other is not,
+as for every ``cx``, and so for every circuit compiled into QuPort's default
+basis. ``tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits``
+pins that down.
+
+Symmetric gates (``cz``, ``cp``, ``crz``, ``rzz``) leave the root free to
+choose, and there the two part company by construction: packets are built
+without knowing the placement, so
+:func:`~quport.hypergraph.build_distributable_packets` picks a root from the
+gate sequence alone, while this module knows which QPU every operand sits on
+and prefers a root whose cat copy already reaches the partner's QPU. Both are
+deterministic upper bounds on the same optimum, and either can be the lower of
+the two on a given circuit.
 
 The resulting plan feeds :func:`quport.schedule.estimate_entanglement_schedule`,
 which is where port hold times and link capacity turn into a makespan.
@@ -140,8 +152,10 @@ class AggregationPlan:
         EPR pairs an un-aggregated, one-transaction-per-gate compiler would
         consume on the same circuit. Aggregation can only lower this.
     unschedulable_gates:
-        Cross-QPU gates that no protocol can serve because the QPU that would
-        have to host the entanglement has no comm ports at all.
+        Cross-QPU gates that no protocol can serve, because a QPU the
+        entanglement would have to use has no comm port free for it at all --
+        for a wide operation, because the host cannot hold every foreign
+        operand at once. Counted once per gate, whatever it would have cost.
     evictions:
         Times a live cat copy was released early to free a port. Each eviction
         costs one extra EPR pair if the same root is needed again.
@@ -385,15 +399,18 @@ def aggregate_remote_operations(
             evictions += 1
         return True
 
-    def emit_teleport(root_phys: int, root_qpu: int, host_qpu: int, index: int) -> bool:
-        """Record a teleport round trip; return False when a port is missing.
+    def teleport_feasible(root_qpu: int, host_qpu: int) -> bool:
+        """Can a teleport round trip run at all between these two QPUs?
 
-        Both ends are checked: the host must have a port to receive the
-        teleported qubit, and the source must have one to hold its half of the
-        EPR pair while it is consumed.
+        Both ends need a port: the host to receive the teleported qubit, and the
+        source to hold its half of the EPR pair while it is consumed.
         """
-        if not ensure_free_ports(host_qpu) or not ensure_free_ports(root_qpu):
-            return False
+        return ports[host_qpu] > 0 and ports[root_qpu] > 0
+
+    def emit_teleport(root_phys: int, root_qpu: int, host_qpu: int, index: int) -> None:
+        """Record a teleport round trip, freeing the ports it occupies."""
+        ensure_free_ports(host_qpu)
+        ensure_free_ports(root_qpu)
         finished.append(
             RemoteBlock(
                 protocol="teleport",
@@ -404,7 +421,6 @@ def aggregate_remote_operations(
                 epr_pairs=_EPR_PER_PROTOCOL["teleport"],
             )
         )
-        return True
 
     def placement_rank(
         position: int, qubits: list[int], qpus: list[int]
@@ -456,15 +472,19 @@ def aggregate_remote_operations(
             if foreign:
                 remote_gates += 1
                 # Every foreign operand has to sit on the host at the same time,
-                # so the host needs that many free ports at once.
-                if ensure_free_ports(host, len(foreign)):
+                # so the host needs that many free ports at once, and each
+                # operand's own QPU needs one to send it. An operation none of
+                # them can gather is one gate that cannot run, however many
+                # teleports it would have taken.
+                if ports[host] >= len(foreign) and all(
+                    teleport_feasible(qpu, host) for _qubit, qpu in foreign
+                ):
+                    ensure_free_ports(host, len(foreign))
                     for qubit, qpu in foreign:
-                        if emit_teleport(qubit, qpu, host, index):
-                            baseline += 2
-                        else:
-                            unschedulable += 1
+                        emit_teleport(qubit, qpu, host, index)
+                        baseline += 2
                 else:
-                    unschedulable += len(foreign)
+                    unschedulable += 1
             continue
 
         first, second = qubits
@@ -485,7 +505,8 @@ def aggregate_remote_operations(
         if not candidates:
             # Neither operand is diagonal: teleport the second operand to the
             # first operand's QPU and back.
-            if emit_teleport(second, qpu_second, qpu_first, index):
+            if teleport_feasible(qpu_second, qpu_first):
+                emit_teleport(second, qpu_second, qpu_first, index)
                 baseline += 2
             else:
                 unschedulable += 1

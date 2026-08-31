@@ -522,6 +522,8 @@ def reassemble_distributed_program(
     queues: dict[int, dict[int, deque[int]]] = {}
     retired: dict[int, list[bool]] = {}
     marker_at: dict[tuple[int, int], int] = {}
+    marker_qubits: dict[tuple[int, int], list[int]] = {}
+    mapped_at = {qubit: index for index, qubit in enumerate(mapped.qubits)}
 
     def carried_clbits(instruction: Any) -> list[Any]:
         """Map an instruction's classical arguments onto the merged circuit."""
@@ -546,6 +548,9 @@ def reassemble_distributed_program(
             ordinal = _remote_barrier_ordinal(instruction.operation)
             if ordinal is not None:
                 marker_at[(ordinal, qpu)] = index
+                marker_qubits[(ordinal, qpu)] = [
+                    positions[qubit] for qubit in instruction.qubits
+                ]
             for qubit in instruction.qubits:
                 per_qubit.setdefault(positions[qubit], deque()).append(index)
         data[qpu] = instructions
@@ -591,24 +596,31 @@ def reassemble_distributed_program(
 
         for ordinal in sorted(pending):
             op = remote_ops[ordinal]
+            source = mapped.data[op.index]
+            # An operation is charged to the QPUs its own operands sit on, which
+            # is the set `split_into_qpus` emitted markers for. Reading it from
+            # the operation rather than from the manifest's two endpoints is what
+            # lets an operation on three or more qubits be rebuilt at all.
+            source_qpus = [
+                arch.qpu_of_phys(mapped_at[qubit]) for qubit in source.qubits
+            ]
             sides: list[tuple[int, int]] = []
-            for qpu in (op.qpu0, op.qpu1):
+            for qpu in dict.fromkeys(source_qpus):
                 marker = marker_at.get((ordinal, qpu))
                 if marker is None:
                     raise ValueError(
                         f"program for QPU {qpu} has no marker for remote "
                         f"operation {ordinal}"
                     )
-                if retired[qpu][marker] or not leads(qpu, marker):
-                    sides = []
-                    break
                 sides.append((qpu, marker))
-            if not sides:
+            if any(
+                retired[qpu][marker] or not leads(qpu, marker) for qpu, marker in sides
+            ):
                 continue
-            source = mapped.data[op.index]
+            operands = _remote_operands(ordinal, op, source_qpus, marker_qubits)
             out.append(
                 source.operation,
-                [out.qubits[op.q0_phys], out.qubits[op.q1_phys]],
+                [out.qubits[operand] for operand in operands],
                 carried_clbits(source),
             )
             for qpu, marker in sides:
@@ -626,6 +638,64 @@ def reassemble_distributed_program(
     if restore_layout:
         _append_layout_restoration(out, local_routed, arch, width)
     return out
+
+
+def _remote_operands(
+    ordinal: int,
+    op: RemoteOp,
+    source_qpus: Sequence[int],
+    marker_qubits: Mapping[tuple[int, int], list[int]],
+) -> list[int]:
+    """Rebuild a remote operation's operands from the markers that name them.
+
+    :func:`split_into_qpus` emits one marker per participating QPU, over that
+    QPU's operands in operand order. Walking the operation's operand-to-QPU
+    sequence and taking each QPU's marked qubits in turn therefore recovers the
+    whole operand list -- including the third and later operands of a wide
+    operation, which the two-endpoint manifest does not name.
+
+    The markers are also the only record of where routing left each operand, so
+    the manifest's own endpoints are checked against them: a manifest paired
+    with programs it was not written for names the wrong qubits, and that is a
+    mistake worth reporting rather than merging.
+    """
+    cursors: dict[int, int] = {}
+    operands: list[int] = []
+    for qpu in source_qpus:
+        marked = marker_qubits[(ordinal, qpu)]
+        cursor = cursors.get(qpu, 0)
+        if cursor >= len(marked):
+            raise ValueError(
+                f"the marker for remote operation {ordinal} on QPU {qpu} names "
+                f"{len(marked)} qubits, fewer than the operation uses there"
+            )
+        cursors[qpu] = cursor + 1
+        operands.append(marked[cursor])
+
+    for qpu, used in cursors.items():
+        marked = marker_qubits[(ordinal, qpu)]
+        if used != len(marked):
+            raise ValueError(
+                f"the marker for remote operation {ordinal} on QPU {qpu} names "
+                f"{len(marked)} qubits, more than the operation uses there"
+            )
+
+    leading: dict[int, int] = {}
+    for position, qpu in enumerate(source_qpus):
+        leading.setdefault(qpu, operands[position])
+    for named_qpu, named_qubit, field in (
+        (op.qpu0, op.q0_phys, "q0_phys"),
+        (op.qpu1, op.q1_phys, "q1_phys"),
+    ):
+        marked_qubit = leading.get(named_qpu)
+        if marked_qubit != named_qubit:
+            raise ValueError(
+                f"remote operation {ordinal} names {field}={named_qubit} on QPU "
+                f"{named_qpu}, but the programs put that operand on "
+                f"{marked_qubit}; the manifest does not match these programs"
+            )
+
+    return operands
 
 
 def _append_layout_restoration(

@@ -494,3 +494,62 @@ def test_slower_or_less_reliable_entanglement_never_shortens_a_schedule():
         if previous is not None:
             assert makespan >= previous - 1e-9
         previous = makespan
+
+
+def test_a_wide_gate_the_links_cannot_serve_counts_once() -> None:
+    """Blocks are the plan's unit of work; ``unschedulable_gates`` counts gates.
+
+    A three-qubit gate spanning three QPUs is gathered by two teleport blocks.
+    With no link capacity neither can run, but that is one gate the schedule
+    could not place, and the audit's ``unschedulable <= remote`` check says so.
+    """
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = _arch(n_qpus=3, compute_qubits_per_qpu=1, comm_qubits_per_qpu=2)
+    starved = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=3,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=2,
+            intra_topology="clique",
+            inter_topology="switch",
+            link_capacity=0,
+        )
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.ccx(0, 3, 6)
+
+    plan = aggregate_remote_operations(mapped, starved)
+    assert len(plan.blocks) == 2
+
+    model = LatencyModel()
+    summary = estimate_entanglement_schedule(mapped, starved, model, plan=plan)
+
+    assert summary.remote_gates == 1
+    assert summary.unschedulable_gates == 1
+    assert audit_entanglement_schedule(summary, mapped, starved, model, plan=plan) == ()
+
+
+def test_an_infeasible_cat_block_still_charges_every_gate_it_served() -> None:
+    """One block, many gates: each gate it cannot serve is one gate lost."""
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=2,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+            link_capacity=0,
+        )
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)
+    mapped.cx(0, 4)
+
+    plan = aggregate_remote_operations(mapped, arch)
+    assert len(plan.blocks) == 1
+    assert plan.blocks[0].size() == 2
+
+    summary = estimate_entanglement_schedule(mapped, arch, LatencyModel(), plan=plan)
+    assert summary.remote_gates == 2
+    assert summary.unschedulable_gates == 2

@@ -1595,3 +1595,89 @@ def test_compile_distributed_ships_a_manifest_matching_its_routed_programs() -> 
         arch = MultiQPUArchitecture(cfg)
         assert arch.qpu_of_phys(op.q0_phys) == op.qpu0
         assert arch.qpu_of_phys(op.q1_phys) == op.qpu1
+
+
+def _wide_gate_arch(n_qpus: int, compute: int) -> MultiQPUArchitecture:
+    return MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=n_qpus,
+            compute_qubits_per_qpu=compute,
+            comm_qubits_per_qpu=1,
+            intra_topology="clique",
+            inter_topology="switch",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("n_qpus", "compute", "operands"),
+    [
+        # Three operands on three QPUs: two of the markers sit on QPUs the
+        # two-endpoint manifest never names.
+        (3, 1, (0, 2, 4)),
+        # Three operands on two QPUs: one marker covers two of them, so the
+        # merge has to take them in operand order rather than one per QPU.
+        (2, 2, (0, 1, 3)),
+    ],
+)
+def test_wide_remote_operations_survive_the_round_trip(
+    n_qpus: int, compute: int, operands: tuple[int, int, int]
+) -> None:
+    """An operation on three qubits spanning QPUs must reassemble exactly.
+
+    ``split_into_qpus`` supports operations wider than two qubits, marking every
+    participating QPU. Reassembly therefore has to rebuild the whole operand
+    list from those markers -- the manifest names only two endpoints -- and
+    retire every marker, including the ones on QPUs the manifest never mentions.
+    """
+    from quport.distributed import reassemble_distributed_program
+    from quport.protocol import verify_distributed_program
+
+    arch = _wide_gate_arch(n_qpus, compute)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(operands[0])
+    mapped.ccx(*operands)
+    mapped.h(operands[2])
+
+    program = split_into_qpus(mapped, arch)
+    assert len(program.remote_ops) == 1
+
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, restore_layout=False
+    )
+
+    rebuilt = [
+        (
+            instruction.operation.name,
+            [merged.find_bit(q).index for q in instruction.qubits],
+        )
+        for instruction in merged.data
+    ]
+    assert ("ccx", list(operands)) in rebuilt
+    assert verify_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+
+
+def test_reassembly_rejects_a_manifest_from_other_programs() -> None:
+    """The markers are the record of where routing left an operand.
+
+    A manifest paired with programs it was not written for names a qubit the
+    markers put elsewhere. Merging it would silently wire the remote gate to the
+    wrong state, so it is reported instead.
+    """
+    from dataclasses import replace
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = _wide_gate_arch(2, 2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)
+
+    program = split_into_qpus(mapped, arch)
+    stale = [replace(program.remote_ops[0], q1_phys=4)]
+
+    with pytest.raises(ValueError, match="does not match these programs"):
+        reassemble_distributed_program(
+            mapped, program.local_circuits, stale, arch, restore_layout=False
+        )
