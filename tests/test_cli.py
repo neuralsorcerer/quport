@@ -81,14 +81,14 @@ def test_input_qasm_loader_reports_missing_qasm3_importer(
     input_path = tmp_path / "input.qasm"
     input_path.write_text("OPENQASM 3.0;\nqubit[1] q;\n", encoding="utf-8")
 
-    def _missing_importer(path: str) -> QuantumCircuit:
+    def _missing_importer(source: str) -> QuantumCircuit:
         raise MissingOptionalLibraryError(
             libname="qiskit_qasm3_import",
             name="loading from OpenQASM 3",
             pip_install="pip install qiskit_qasm3_import",
         )
 
-    monkeypatch.setattr("quport.cli.qasm3.load", _missing_importer)
+    monkeypatch.setattr("quport.cli.qasm3.loads", _missing_importer)
 
     with pytest.raises(typer.BadParameter, match="qiskit_qasm3_import"):
         _load_or_random_circuit(
@@ -732,7 +732,7 @@ def test_headerless_input_reports_both_parser_failures(
     failure = _missing_importer if qasm3_error == "missing_importer" else _parse_error
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", failure)
+        monkeypatch.setattr("quport.cli.qasm3.loads", failure)
         with pytest.raises(typer.BadParameter, match=expected):
             _load_or_random_circuit(
                 input_qasm=str(input_path),
@@ -1036,3 +1036,67 @@ def test_migrate_honours_an_expensive_teleport(tmp_path: Path) -> None:
     # Cheap teleports do get used, and beat the control.
     assert cheap_payload["moves"] > 0
     assert cheap_payload["temporal_ebits"] < cheap_payload["best_static_ebits"]
+
+
+def test_input_qasm_loader_accepts_a_byte_order_mark(tmp_path: Path) -> None:
+    """A file written by a Windows editor starts with a BOM.
+
+    The loader decodes with ``utf-8-sig`` so the version header is still found,
+    but the OpenQASM 2 parser rejects the mark as a non-ASCII byte. Parsing the
+    text that was already decoded, rather than re-reading the path, is what
+    makes that tolerance real.
+    """
+    input_path = tmp_path / "bom.qasm"
+    _write_qasm(input_path, leading_text="﻿")
+
+    circuit = _load_or_random_circuit(
+        input_qasm=str(input_path),
+        n_logical=None,
+        depth=0,
+        seed=0,
+    )
+
+    assert circuit.num_qubits == 3
+
+
+def test_input_qasm_loader_accepts_a_byte_order_mark_on_qasm3(tmp_path: Path) -> None:
+    from qiskit import qasm3
+
+    circuit = QuantumCircuit(3)
+    circuit.h(0)
+    circuit.cx(0, 2)
+    input_path = tmp_path / "bom3.qasm"
+    input_path.write_text("﻿" + qasm3.dumps(circuit), encoding="utf-8")
+
+    loaded = _load_or_random_circuit(
+        input_qasm=str(input_path),
+        n_logical=None,
+        depth=0,
+        seed=0,
+    )
+
+    assert loaded.num_qubits == 3
+
+
+def test_input_qasm_loader_resolves_includes_next_to_the_program(
+    tmp_path: Path,
+) -> None:
+    """`qasm2.load` searches the input file's own directory; parsing the decoded
+    text must keep doing so, or a program including a sibling stops loading."""
+    (tmp_path / "mylib.inc").write_text("gate mygate a { x a; }\n", encoding="utf-8")
+    input_path = tmp_path / "program.qasm"
+    input_path.write_text(
+        'OPENQASM 2.0;\ninclude "qelib1.inc";\ninclude "mylib.inc";\n'
+        "qreg q[2];\nmygate q[0];\ncx q[0], q[1];\n",
+        encoding="utf-8",
+    )
+
+    circuit = _load_or_random_circuit(
+        input_qasm=str(input_path),
+        n_logical=None,
+        depth=0,
+        seed=0,
+    )
+
+    assert circuit.num_qubits == 2
+    assert "mygate" in circuit.count_ops()

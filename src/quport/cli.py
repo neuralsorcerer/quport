@@ -101,10 +101,22 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
             f"Unable to read --input-qasm file {input_qasm!r}: {exc}"
         ) from exc
 
+    # Parse the text that was already decoded rather than re-reading the path.
+    # `utf-8-sig` above drops a byte-order mark, which the OpenQASM 2 parser
+    # rejects as a non-ASCII byte -- and a file written by a Windows editor
+    # routinely has one.
+    def parse_qasm2() -> QuantumCircuit:
+        # `qasm2.load` appends the input file's own directory to the include
+        # path; keep that, so a program including a sibling file still resolves.
+        return qasm2.loads(source, include_path=(".", str(input_path.parent)))
+
+    def parse_qasm3() -> QuantumCircuit:
+        return qasm3.loads(source)
+
     version = _qasm_version(source)
     if version == 2:
         try:
-            return qasm2.load(str(input_path))
+            return parse_qasm2()
         except Exception as exc:
             raise typer.BadParameter(
                 f"Unable to parse OpenQASM 2 input {input_qasm!r}: {exc}"
@@ -112,7 +124,7 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
 
     if version == 3:
         try:
-            return qasm3.load(str(input_path))
+            return parse_qasm3()
         except MissingOptionalLibraryError as exc:
             raise typer.BadParameter(
                 "OpenQASM 3 input requires Qiskit's optional importer. "
@@ -124,10 +136,10 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
             ) from exc
 
     try:
-        return qasm3.load(str(input_path))
+        return parse_qasm3()
     except MissingOptionalLibraryError:
         try:
-            return qasm2.load(str(input_path))
+            return parse_qasm2()
         except Exception as exc:
             raise typer.BadParameter(
                 "Unable to detect an OpenQASM version header and the input could "
@@ -135,7 +147,7 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
             ) from exc
     except Exception as qasm3_exc:
         try:
-            return qasm2.load(str(input_path))
+            return parse_qasm2()
         except Exception as qasm2_exc:
             raise typer.BadParameter(
                 "Unable to detect an OpenQASM version header. Parsing failed as "
