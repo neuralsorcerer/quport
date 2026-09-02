@@ -674,7 +674,11 @@ def _remote_operands(
 
     for qpu, used in cursors.items():
         marked = marker_qubits[(ordinal, qpu)]
-        if used != len(marked):
+        # A marker names the operation's operands on that QPU, and may name one
+        # more after them: the shared qubit that orders it against the QPU's
+        # other markers, which is what keeps routing from reordering them.
+        # Anything beyond that does not describe this operation.
+        if len(marked) > used + 1:
             raise ValueError(
                 f"the marker for remote operation {ordinal} on QPU {qpu} names "
                 f"{len(marked)} qubits, more than the operation uses there"
@@ -800,6 +804,38 @@ def split_into_qpus(
     # marker sits in this sequence, because an emitted QASM program carries no
     # labels and a routed program may list its barriers in a different order.
     barriers_emitted = [0] * n_qpus
+    def emit_marker(qpu: int, operands: Sequence[int], label: str) -> None:
+        """Mark a remote operation on ``qpu``, ordered against its other markers.
+
+        A marker naming only the operation's own operand does not order itself
+        against the QPU's *other* remote operations, so local routing is free to
+        emit two of them in the opposite order -- and the local gates it then
+        interleaves can tie those markers together in that order, leaving the
+        per-QPU programs demanding an execution no schedule satisfies. Remote
+        operations are synchronization points with other QPUs, so their program
+        order is not the transpiler's to choose.
+
+        Each marker therefore also names the qubit the QPU's previous marker
+        sat on, which puts an edge between the two in the local DAG and, by
+        transitivity, keeps every marker on this QPU in program order. Naming
+        one extra qubit is the smallest constraint that does so; a marker over
+        the whole block would order the QPU's local gates against every remote
+        operation as well.
+
+        The operation's own operands come first, in operand order, so a reader
+        recovers them by position; the ordering qubit follows them.
+        """
+        marked = list(operands)
+        previous = last_marker_qubit[qpu]
+        if previous is not None and previous not in marked:
+            marked.append(previous)
+        local[qpu].barrier(*marked, label=label)
+        barriers_emitted[qpu] += 1
+        last_marker_qubit[qpu] = operands[0]
+
+    # The qubit each QPU's most recent remote marker sat on, threaded through
+    # the next one so the local DAG keeps them in order.
+    last_marker_qubit: list[int | None] = [None] * n_qpus
 
     qindex = {q: i for i, q in enumerate(mapped.qubits)}
     cindex = {c: i for i, c in enumerate(mapped.clbits)}
@@ -869,10 +905,8 @@ def split_into_qpus(
                 # on can be recovered after local routing has permuted things;
                 # see `remap_remote_ops_to_routed`.
                 label = remote_barrier_label(len(remote_ops) - 1)
-                local[qpu0].barrier(q0, label=label)
-                local[qpu1].barrier(q1, label=label)
-                barriers_emitted[qpu0] += 1
-                barriers_emitted[qpu1] += 1
+                emit_marker(qpu0, (q0,), label)
+                emit_marker(qpu1, (q1,), label)
 
         else:
             # multi-qubit ops shouldn't appear if you translated to max_operands=2; keep safe.
@@ -917,7 +951,6 @@ def split_into_qpus(
                 )
                 label = remote_barrier_label(len(remote_ops) - 1)
                 for qpu in qpu_order:
-                    local[qpu].barrier(*qpu_qubits[qpu], label=label)
-                    barriers_emitted[qpu] += 1
+                    emit_marker(qpu, qpu_qubits[qpu], label)
 
     return DistributedProgram(local_circuits=local, remote_ops=remote_ops)

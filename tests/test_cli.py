@@ -747,10 +747,13 @@ def test_compile_dist_bundle_is_consumable_from_the_qasm_alone(tmp_path: Path) -
 
     A consumer only has the emitted text: barriers carry no labels there, so the
     manifest's marker index is the only thing that says which barrier belongs to
-    which remote operation. A ``line`` intra-topology makes both hazards real --
-    routing permutes qubits inside a QPU, and it reorders barriers that sit on
-    disjoint qubits -- so pairing by position or trusting pre-routing indices
-    would both fail here.
+    which remote operation. A ``line`` intra-topology makes the hazard real --
+    routing permutes qubits inside a QPU -- so trusting pre-routing indices
+    would fail here.
+
+    A marker lists the operation's operand first and the qubit ordering it
+    against the QPU's previous marker after it, so the operand is the barrier's
+    leading argument.
     """
     import re
 
@@ -790,9 +793,9 @@ def test_compile_dist_bundle_is_consumable_from_the_qasm_alone(tmp_path: Path) -
 
     barriers = {
         qpu: [
-            int(match)
-            for match in re.findall(
-                r"barrier \$(\d+);",
+            int(arguments.split(",")[0].strip().removeprefix("$"))
+            for arguments in re.findall(
+                r"barrier ([^;]+);",
                 (out_dir / f"qpu_{qpu}_routed.qasm").read_text(encoding="utf-8"),
             )
         ]
@@ -803,9 +806,25 @@ def test_compile_dist_bundle_is_consumable_from_the_qasm_alone(tmp_path: Path) -
         assert barriers[op["qpu0"]][op["qpu0_marker"]] == op["q0_phys"]
         assert barriers[op["qpu1"]][op["qpu1_marker"]] == op["q1_phys"]
 
-    # The markers genuinely disagree with positional pairing, so the assertions
-    # above are not passing by accident.
-    assert any(op["qpu0_marker"] != index for index, op in enumerate(remote_ops))
+    # A marker that also carries an ordering qubit lists two arguments, so a
+    # consumer has to read the leading one rather than assume a lone qubit.
+    # This is what makes the pairing above a real parse rather than a
+    # coincidence of one-argument barriers.
+    assert any(
+        "," in arguments
+        for qpu in (0, 1)
+        for arguments in re.findall(
+            r"barrier ([^;]+);",
+            (out_dir / f"qpu_{qpu}_routed.qasm").read_text(encoding="utf-8"),
+        )
+    )
+
+    # Those ordering qubits are there to keep each QPU's markers in the
+    # manifest's own order through routing, which is what lets a consumer pair
+    # them by index at all.
+    for qpu in (0, 1):
+        indices = [op[f"qpu{qpu}_marker"] for op in remote_ops]
+        assert indices == sorted(indices)
 
 
 def _write_three_qpu_config(path: Path) -> None:

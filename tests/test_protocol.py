@@ -373,41 +373,86 @@ def test_reassembly_recovers_the_unrouted_split_too() -> None:
 
 
 def test_reassembly_follows_qubit_dataflow_not_program_order() -> None:
-    """Two QPUs may list the same remote operations in opposite orders.
+    """A local gate may be listed either side of a marker on another qubit.
 
-    Barriers on disjoint qubits commute, so a routed program can order its
-    markers however its DAG rebuild happened to. Reading each program strictly
-    linearly would deadlock here; merging by qubit dataflow does not.
+    Routing rebuilds each program from its DAG, so a gate that touches none of a
+    remote operation's qubits can come out before or after that operation's
+    marker. Both orders describe the same computation; merging by qubit dataflow
+    accepts either, while reading the program linearly against the manifest
+    would not.
     """
     from quport.distributed import reassemble_distributed_program, split_into_qpus
+    from quport.protocol import verify_distributed_program
 
     cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
     arch = MultiQPUArchitecture(cfg)
     mapped = QuantumCircuit(arch.n_phys)
     mapped.cx(0, 3)  # remote op 0, on qubits 0 and 3
-    mapped.cx(1, 4)  # remote op 1, on qubits 1 and 4 -- disjoint from op 0
+    mapped.h(1)  # local to QPU 0, on a qubit the remote operation never touches
 
     program = split_into_qpus(mapped, arch)
 
-    # Hand QPU 1 its markers in the opposite order. Both orders are legal: the
-    # two operations touch disjoint qubits, so nothing constrains them.
-    swapped = QuantumCircuit(arch.n_phys)
-    order = [1, 0]
-    for index in order:
-        for instruction in program.local_circuits[1].data:
-            label = getattr(instruction.operation, "label", None)
-            if label == f"quport_remote_{index}":
-                swapped.append(instruction.operation, instruction.qubits, [])
+    # Hand QPU 0 its local gate before the marker instead of after it.
+    reordered = QuantumCircuit(arch.n_phys)
+    instructions = list(program.local_circuits[0].data)
+    for instruction in sorted(
+        instructions, key=lambda item: item.operation.name != "h"
+    ):
+        reordered.append(instruction.operation, instruction.qubits, [])
 
     merged = reassemble_distributed_program(
         mapped,
-        {0: program.local_circuits[0], 1: swapped},
+        {0: reordered, 1: program.local_circuits[1]},
         program.remote_ops,
         arch,
         restore_layout=False,
     )
 
-    assert [instruction.operation.name for instruction in merged.data] == ["cx", "cx"]
+    assert sorted(instruction.operation.name for instruction in merged.data) == [
+        "cx",
+        "h",
+    ]
+    assert verify_distributed_program(
+        mapped, {0: reordered, 1: program.local_circuits[1]}, program.remote_ops, arch
+    )
+
+
+@pytest.mark.parametrize("intra", ["clique", "line", "ring", "grid2d"])
+def test_routing_cannot_reorder_a_qpus_remote_markers(intra: str) -> None:
+    """Remote operations are synchronization points; their order is not routing's.
+
+    A marker naming only its own operand does not order itself against the
+    QPU's other markers, so the transpiler used to be free to emit two of them
+    the other way round -- and the local gates it interleaves then tie them
+    together in that order, leaving two QPUs demanding opposite orders and no
+    execution satisfying both. Each marker therefore also names the previous
+    marker's qubit.
+    """
+    from quport.distributed import _remote_barrier_ordinal
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology=intra,  # type: ignore[arg-type]
+        optimization_level=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    result = compile_distributed(random_benchmark_circuit(5, 8, 7), cfg, seed=7)
+    assert len(result.routed_remote_ops) > 2, "the fixture must exercise ordering"
+
+    for circuit in result.local_routed.values():
+        ordinals = [
+            ordinal
+            for instruction in circuit.data
+            if (ordinal := _remote_barrier_ordinal(instruction.operation)) is not None
+        ]
+        assert ordinals == sorted(ordinals)
+
+    assert verify_distributed_program(
+        result.physical_circuit, result.local_routed, result.routed_remote_ops, arch
+    )
 
 
 def test_reassembly_reports_contradictory_orderings() -> None:
