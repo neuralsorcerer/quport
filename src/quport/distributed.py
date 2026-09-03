@@ -719,7 +719,16 @@ def _append_layout_restoration(
         layout = getattr(routed, "layout", None)
         if layout is None:
             continue
-        positions = layout.final_index_layout(filter_ancillas=False)
+        try:
+            positions = layout.final_index_layout(filter_ancillas=False)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # A program that did not come from the transpiler can still carry a
+            # layout: a circuit read back from physical-qubit OpenQASM gets one
+            # built from loose qubits, which Qiskit's own accessor cannot
+            # resolve. Such a layout records no routing permutation -- the file
+            # never held one -- so there is nothing to undo, and it is treated
+            # exactly like the missing layout of an unrouted program.
+            continue
         block = arch.block_of_qpu(qpu)
         for phys in block.compute + block.comm:
             if phys < width and phys < len(positions):

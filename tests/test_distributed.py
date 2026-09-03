@@ -1681,3 +1681,71 @@ def test_reassembly_rejects_a_manifest_from_other_programs() -> None:
         reassemble_distributed_program(
             mapped, program.local_circuits, stale, arch, restore_layout=False
         )
+
+
+def test_reassembly_accepts_programs_read_back_from_qasm() -> None:
+    """A program reloaded from the shipped QASM must not crash the merge.
+
+    OpenQASM 3 writes a routed program over physical qubits, and reading one
+    back gives a circuit carrying a synthetic ``layout`` built from loose
+    qubits -- Qiskit's own ``final_index_layout`` raises on it. That layout
+    records no routing permutation, because the file never held one, so it has
+    to be treated like the missing layout of an unrouted program rather than
+    bringing the merge down.
+    """
+    from qiskit import qasm3
+
+    from quport.compiler import compile_distributed
+    from quport.distributed import (
+        reassemble_distributed_program,
+        remote_barrier_label,
+    )
+    from quport.pipeline import random_benchmark_circuit
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="clique",
+        optimization_level=0,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    result = compile_distributed(random_benchmark_circuit(8, 10, 3), cfg, seed=3)
+    assert result.routed_remote_ops, "the fixture must produce remote operations"
+
+    # Emitted QASM carries no barrier labels, so a consumer restores them from
+    # the manifest's marker positions -- which is what those fields are for.
+    reloaded: dict[int, QuantumCircuit] = {}
+    for qpu, circuit in result.local_routed.items():
+        wanted = {
+            getattr(op, f"qpu{side}_marker"): ordinal
+            for ordinal, op in enumerate(result.routed_remote_ops)
+            for side in (0, 1)
+            if getattr(op, f"qpu{side}") == qpu
+        }
+        loaded = qasm3.loads(qasm3.dumps(circuit))
+        assert loaded.layout is not None, "the fixture must exercise the bad layout"
+        rebuilt = loaded.copy_empty_like()
+        seen = 0
+        for instruction in loaded.data:
+            operation = instruction.operation
+            if getattr(operation, "_directive", False):
+                ordinal = wanted.get(seen)
+                seen += 1
+                if ordinal is not None:
+                    operation = operation.copy()
+                    operation.label = remote_barrier_label(ordinal)
+            rebuilt.append(operation, instruction.qubits, instruction.clbits)
+        reloaded[qpu] = rebuilt
+
+    merged = reassemble_distributed_program(
+        result.physical_circuit, reloaded, result.routed_remote_ops, arch
+    )
+    assert merged.size() > 0
+
+    # A clique permutes nothing, so the reloaded programs still describe the
+    # mapped circuit exactly.
+    assert verify_distributed_program(
+        result.physical_circuit, reloaded, result.routed_remote_ops, arch
+    )
