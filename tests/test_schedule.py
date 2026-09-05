@@ -2105,3 +2105,60 @@ def test_a_pair_routes_the_same_way_whichever_operand_leads() -> None:
         for edge, _count in rnd.link_utilization
     }
     assert routed == set(path_edges(shortest, low, high))
+
+
+@pytest.mark.parametrize("inter", ["ring", "degree_d", "fat_tree", "clos"])
+def test_schedule_plans_stay_consistent_at_interconnect_scale(inter: str) -> None:
+    """The audits must hold at the scale the model is documented for.
+
+    ``quport.network`` describes this model as built for ``n_qpus ~ O(10..100)``,
+    but a few QPUs are enough for every other test here -- and two faults in the
+    round packer were invisible below about twenty-five, where every path is one
+    hop and no operation is ever deferred. Long paths that overlap and contend
+    are what exercise the packer's bookkeeping, so one case per topology holds
+    that region.
+    """
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+    from quport.schedule import (
+        audit_entanglement_schedule,
+        audit_topology_schedule_plan,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=50,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology=inter,  # type: ignore[arg-type]
+        inter_degree=3,
+        link_capacity=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+    result = compile_distributed(
+        random_benchmark_circuit(40, 8, 0),
+        cfg,
+        latency=model,
+        seed=0,
+        strategy="tpccap",
+    )
+
+    assert result.schedule.remote_ops > 0, "the fixture must cross QPUs"
+    assert result.schedule.remote_rounds > 0
+
+    assert (
+        audit_topology_schedule_plan(
+            result.schedule_plan, arch, model, result.physical_circuit
+        )
+        == ()
+    )
+    assert (
+        audit_entanglement_schedule(
+            result.entanglement_schedule,
+            result.physical_circuit,
+            arch,
+            model,
+            plan=result.aggregation,
+        )
+        == ()
+    )
