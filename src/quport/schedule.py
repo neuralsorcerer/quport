@@ -568,8 +568,6 @@ def _topology_schedule_plan(
     The public summary function projects this plan down to the historical
     :class:`TopologyScheduleSummary` return type.
     """
-    from collections import defaultdict
-
     from qiskit.converters import circuit_to_dag
 
     lat = _validate_schedule_inputs(arch, model)
@@ -626,10 +624,18 @@ def _topology_schedule_plan(
         return hop_cache[key]
 
     def edges_for(a: int, b: int) -> tuple[tuple[int, int], ...]:
+        # Route the canonical orientation, not the one the caller happened to
+        # pass. A BFS next-hop table need not be reversal-symmetric, so
+        # `path_edges(sp, a, b)` and `path_edges(sp, b, a)` can name different
+        # links of the same length; caching either under an unordered key would
+        # make an operation's route depend on the orientation it was first seen
+        # with, and disagree with every other reader of the same pair.
         key = pair_key(a, b)
-        if key not in edge_cache:
-            edge_cache[key] = tuple(path_edges(sp, a, b))
-        return edge_cache[key]
+        cached = edge_cache.get(key)
+        if cached is None:
+            cached = tuple(path_edges(sp, key[0], key[1]))
+            edge_cache[key] = cached
+        return cached
 
     def is_reachable(a: int, b: int) -> bool:
         return hops_for(a, b) < UNREACHABLE_DISTANCE
@@ -814,9 +820,11 @@ def _topology_schedule_plan(
 
         while remaining:
             used_ports = [0] * n_qpus
-            used_link: defaultdict[tuple[int, int], int] = defaultdict(
-                int
-            )  # edge->count
+            # A plain dict, not a defaultdict: the feasibility probe below reads
+            # an edge that may never be used, and a defaultdict would insert it
+            # at zero. Those phantom entries reach `link_utilization`, which is
+            # supposed to say what the round's placed operations consume.
+            used_link: dict[tuple[int, int], int] = {}  # edge->count
             used_pairs: set[tuple[int, int]] = set()
             placed_pairs: list[tuple[int, int]] = []
             placed_any = False
@@ -841,7 +849,7 @@ def _topology_schedule_plan(
                 edges = edges_for(a, b)
                 feasible = True
                 for e in edges:
-                    if used_link[e] >= link_cap:
+                    if used_link.get(e, 0) >= link_cap:
                         feasible = False
                         break
                 if not feasible:
@@ -855,8 +863,9 @@ def _topology_schedule_plan(
                 peak_ports = max(peak_ports, used_ports[a], used_ports[b])
                 used_pairs.add(key)
                 for e in edges:
-                    used_link[e] += 1
-                    peak_link = max(peak_link, used_link[e])
+                    carried = used_link.get(e, 0) + 1
+                    used_link[e] = carried
+                    peak_link = max(peak_link, carried)
 
                 placed_any = True
                 round_max_cost = max(round_max_cost, remote_cost(a, b))

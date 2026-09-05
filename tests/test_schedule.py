@@ -2007,3 +2007,101 @@ def test_audit_accepts_unschedulable_penalty_rounds():
         rnd.unschedulable_ops for layer in plan.layers for rnd in layer.remote_rounds
     )
     assert audit_topology_schedule_plan(plan, arch, model, circuit) == ()
+
+
+def test_a_round_reports_only_the_links_its_operations_use() -> None:
+    """Probing a link for capacity must not enter it in the round's usage.
+
+    Testing whether an operation fits reads the load on every link of its path.
+    Reading through a ``defaultdict`` would insert each probed link at zero, and
+    those phantom entries reach ``link_utilization`` -- which is meant to say
+    what the round's *placed* operations consume, and which
+    :func:`~quport.schedule.audit_topology_schedule_plan` re-derives from those
+    operations alone.
+    """
+    from quport.schedule import audit_topology_schedule_plan
+
+    # A ring long enough that paths overlap and capacity is genuinely contested,
+    # which is what makes an operation get deferred after its links are probed.
+    cfg = MultiQPUConfig(
+        n_qpus=12,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=2,
+        inter_topology="ring",
+        link_capacity=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+
+    mapped = QuantumCircuit(arch.n_phys)
+    block = arch.block
+    for offset in range(6):
+        mapped.cx(offset * block, ((offset + 6) % 12) * block)
+
+    plan = estimate_topology_schedule_plan(mapped, arch, model)
+
+    deferred = [
+        rnd
+        for layer in plan.layers
+        for rnd in layer.remote_rounds
+        if not rnd.unschedulable_ops
+    ]
+    assert deferred, "the fixture must produce real rounds"
+    for rnd in deferred:
+        assert all(count > 0 for _edge, count in rnd.link_utilization), (
+            f"round {rnd.round_index} reports an unused link: "
+            f"{[edge for edge, count in rnd.link_utilization if count == 0]}"
+        )
+
+    assert audit_topology_schedule_plan(plan, arch, model, mapped) == ()
+
+
+def test_a_pair_routes_the_same_way_whichever_operand_leads() -> None:
+    """An undirected pair's route cannot depend on the orientation it arrives in.
+
+    A BFS next-hop table need not be reversal-symmetric: on a circulant graph
+    ``path_edges(sp, a, b)`` and ``path_edges(sp, b, a)`` name different links of
+    the same length. Routing whichever orientation happened to appear first
+    would make an operation's links depend on incidental gate order, and put the
+    trace at odds with every other reader of the same pair.
+    """
+    from quport.network import path_edges
+    from quport.schedule import audit_topology_schedule_plan
+
+    cfg = MultiQPUConfig(
+        n_qpus=50,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=2,
+        inter_topology="degree_d",
+        inter_degree=4,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    shortest = arch.qpu_shortest_paths()
+
+    asymmetric = [
+        (a, b)
+        for a in range(cfg.n_qpus)
+        for b in range(a + 1, cfg.n_qpus)
+        if set(path_edges(shortest, a, b)) != set(path_edges(shortest, b, a))
+    ]
+    assert asymmetric, "the fixture must have direction-dependent shortest paths"
+
+    # Drive one such pair from the high-numbered operand, the orientation that
+    # used to decide the cached route.
+    high, low = asymmetric[0][1], asymmetric[0][0]
+    block = arch.block
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(high * block, low * block)
+    mapped.cx(low * block, high * block)
+
+    model = LatencyModel()
+    plan = estimate_topology_schedule_plan(mapped, arch, model)
+    assert audit_topology_schedule_plan(plan, arch, model, mapped) == ()
+
+    routed = {
+        edge
+        for layer in plan.layers
+        for rnd in layer.remote_rounds
+        for edge, _count in rnd.link_utilization
+    }
+    assert routed == set(path_edges(shortest, low, high))
