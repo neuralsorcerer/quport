@@ -270,3 +270,59 @@ def test_ebit_objective_rejects_malformed_distance_tables() -> None:
         ebit_objective(decomposition, [0, 1], 2, [[0, 1.5], [1.5, 0]])  # type: ignore[list-item]
     with pytest.raises(ValueError, match="non-negative distances"):
         ebit_objective(decomposition, [0, 1], 2, [[0, -1], [-1, 0]])
+
+
+def test_report_accounts_for_teleport_served_gates() -> None:
+    """A gate with no diagonal operand costs a round trip, and the report says so.
+
+    ``swap`` is diagonal on neither operand, so no cat copy can serve it: the
+    operand is teleported to the other QPU and back, at two EPR pairs. That has
+    to show up in ``unpackable_ebits``, in the pair breakdown, and in the total,
+    which is otherwise dominated by the cat blocks around it.
+    """
+    qc = QuantumCircuit(4)
+    qc.h(0)
+    qc.swap(0, 2)
+    qc.cx(0, 2)
+    part = [0, 0, 1, 1]
+
+    decomposition = build_distributable_packets(qc)
+    assert len(decomposition.unpackable_gates) == 1
+
+    report = ebit_report(decomposition, part, 2)
+
+    assert report.unpackable_ebits == 2
+    assert report.ebits == 3  # two for the teleport, one for the cat block
+    assert report.pair_ebits == (((0, 1), 3),)
+    # The teleported operand occupies a slot on the host while the gate runs.
+    assert report.peak_cat_copies == (1, 1)
+
+    # The three independent readings of the same quantity must still agree.
+    assert ebit_cost(decomposition, part, 2) == report.ebits
+    traffic = ebit_traffic_matrix(decomposition, part, 2)
+    assert sum(sum(row) for row in traffic) == 2 * report.ebits
+
+
+def test_first_operand_symmetric_root_policy() -> None:
+    """``first_operand`` roots every symmetric gate at operand 0, as written.
+
+    Unlike ``greedy`` it never looks at which packets are open, so a run of
+    symmetric gates that share a qubit in different operand positions is split
+    into one packet per root rather than collected onto one.
+    """
+    qc = QuantumCircuit(4)
+    qc.h(0)
+    qc.h(1)
+    qc.cz(1, 0)
+    qc.cz(0, 2)
+
+    written = build_distributable_packets(qc, symmetric_root="first_operand")
+    greedy = build_distributable_packets(qc, symmetric_root="greedy")
+
+    assert [packet.root for packet in written.packets] == [1, 0]
+    assert [packet.root for packet in greedy.packets] == [0]
+
+    # Both are valid chargings of the same gates, so both cost what they claim.
+    part = [0, 0, 1, 1]
+    assert ebit_cost(written, part, 2) == 1
+    assert ebit_cost(greedy, part, 2) == 1

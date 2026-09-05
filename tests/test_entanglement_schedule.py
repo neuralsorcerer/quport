@@ -553,3 +553,43 @@ def test_an_infeasible_cat_block_still_charges_every_gate_it_served() -> None:
     summary = estimate_entanglement_schedule(mapped, arch, LatencyModel(), plan=plan)
     assert summary.remote_gates == 2
     assert summary.unschedulable_gates == 2
+
+
+def test_a_swap_is_charged_swap_time_not_two_qubit_time() -> None:
+    """SWAP is the one two-qubit gate with its own duration in the model.
+
+    A local swap occupies its QPU for ``LatencyModel.swap``; a cross-QPU swap is
+    served by a teleport (neither operand is diagonal) and the gate itself still
+    costs swap time on the host that runs it.
+    """
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = _arch(compute_qubits_per_qpu=2)
+    model = LatencyModel(oneq=1.0, twoq=10.0, swap=30.0)
+
+    local = QuantumCircuit(arch.n_phys)
+    local.swap(0, 1)  # both operands on QPU 0
+    local.cx(0, 3)  # a remote gate, run against a cat copy on QPU 1
+
+    plan = aggregate_remote_operations(local, arch)
+    summary = estimate_entanglement_schedule(local, arch, model, plan=plan)
+
+    assert summary.qpu_busy_time == (30.0, 10.0)
+    assert audit_entanglement_schedule(summary, local, arch, model, plan=plan) == ()
+
+    remote = QuantumCircuit(arch.n_phys)
+    remote.swap(0, 3)
+
+    remote_plan = aggregate_remote_operations(remote, arch)
+    assert [block.protocol for block in remote_plan.blocks] == ["teleport"]
+
+    remote_summary = estimate_entanglement_schedule(
+        remote, arch, model, plan=remote_plan
+    )
+    assert remote_summary.qpu_busy_time == (30.0, 0.0)
+    assert (
+        audit_entanglement_schedule(
+            remote_summary, remote, arch, model, plan=remote_plan
+        )
+        == ()
+    )
