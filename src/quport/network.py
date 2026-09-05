@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Callable, Literal, SupportsFloat, SupportsIndex, cast, get_args
 
@@ -631,6 +631,10 @@ class RoutingTables:
     dist: list[list[int]]
     neighbors: list[tuple[int, ...]]
     next_hop: list[Sequence[object]]
+    #: Shortest-path DAGs, filled in as pairs are first routed. The DAG of a
+    #: pair depends on the interconnect alone, so the search that these tables
+    #: exist to serve builds each one once instead of once per evaluation.
+    ecmp_dags: dict[QpuEdge, "EcmpDag | None"] = field(default_factory=dict)
 
 
 def prepare_routing_tables(
@@ -715,12 +719,15 @@ def route_prepared_link_loads(
         dist_matrix = tables.dist
         neighbors = tables.neighbors
         dist_to_dst_cache: list[list[int] | None] = [None] * n
+        dags = tables.ecmp_dags
         for a, b, w in iter_routed_pairs():
             dist_to_dst = dist_to_dst_cache[b]
             if dist_to_dst is None:
                 dist_to_dst = [dist_row[b] for dist_row in dist_matrix]
                 dist_to_dst_cache[b] = dist_to_dst
-            _route_ecmp_pair(a, b, w, dist_matrix, dist_to_dst, neighbors, add_load)
+            _route_ecmp_pair(
+                a, b, w, dist_matrix, dist_to_dst, neighbors, add_load, dags
+            )
         return loads
 
     hop_matrix = tables.next_hop
@@ -751,30 +758,31 @@ def _neighbors_from_distance_matrix(
     ]
 
 
-def _route_ecmp_pair(
+#: The shortest-path DAG of one QPU pair: layers, predecessors, and the number
+#: of shortest paths reaching each node. Built from the interconnect alone.
+EcmpDag = tuple[list[list[int]], list[list[int]], list[int]]
+
+
+def _build_ecmp_dag(
     src: int,
     dst: int,
-    weight: float,
     dist: Sequence[Sequence[int]],
     dist_to_dst: Sequence[int],
     neighbors: list[tuple[int, ...]],
-    add_load: Callable[[int, int, float], None],
-) -> None:
-    """Split traffic equally across all shortest paths for a single pair."""
+) -> EcmpDag | None:
+    """Build the shortest-path DAG from ``src`` to ``dst``, or None if trivial.
+
+    Nothing here depends on how much traffic the pair carries, which is what
+    lets a search that routes one interconnect thousands of times build it once
+    per pair. ``None`` means the pair needs no DAG: it is unreachable, the same
+    node, or a single hop, all of which the caller handles directly.
+    """
     dist_src = dist[src]
     n = len(dist)
     d = dist_src[dst]
-    if d >= UNREACHABLE_DISTANCE:
-        raise ValueError(
-            f"no path between QPU {src} and {dst} for traffic load {weight}"
-        )
-    if d <= 0:
-        return
-    if d == 1:
-        add_load(src, dst, weight)
-        return
+    if d >= UNREACHABLE_DISTANCE or d <= 1:
+        return None
 
-    # Build shortest-path DAG once (successors + predecessors) from reachable frontier.
     layers: list[list[int]] = [[] for _ in range(d + 1)]
     succ: list[list[int]] = [[] for _ in range(n)]
     pred: list[list[int]] = [[] for _ in range(n)]
@@ -805,6 +813,54 @@ def _route_ecmp_pair(
                 continue
             for v in succ[u]:
                 sigma[v] += su
+
+    return layers, pred, sigma
+
+
+def _route_ecmp_pair(
+    src: int,
+    dst: int,
+    weight: float,
+    dist: Sequence[Sequence[int]],
+    dist_to_dst: Sequence[int],
+    neighbors: list[tuple[int, ...]],
+    add_load: Callable[[int, int, float], None],
+    dag_cache: dict[QpuEdge, EcmpDag | None] | None = None,
+) -> None:
+    """Split traffic equally across all shortest paths for a single pair.
+
+    ``dag_cache`` keeps the pair's shortest-path DAG between calls. The DAG is a
+    property of the interconnect, so a partition search that routes the same
+    fabric thousands of times need only build it once; the flow accumulation
+    below still runs per call, on the same values in the same order, so cached
+    and uncached routing agree bit for bit.
+    """
+    dist_src = dist[src]
+    n = len(dist)
+    d = dist_src[dst]
+    if d >= UNREACHABLE_DISTANCE:
+        raise ValueError(
+            f"no path between QPU {src} and {dst} for traffic load {weight}"
+        )
+    if d <= 0:
+        return
+    if d == 1:
+        add_load(src, dst, weight)
+        return
+
+    if dag_cache is None:
+        built = _build_ecmp_dag(src, dst, dist, dist_to_dst, neighbors)
+    else:
+        key = (src, dst)
+        built = dag_cache.get(key, False)  # type: ignore[arg-type]
+        if built is False:
+            built = _build_ecmp_dag(src, dst, dist, dist_to_dst, neighbors)
+            dag_cache[key] = built
+    if built is None:  # pragma: no cover - d > 1 always builds a DAG
+        raise ValueError(
+            f"no path between QPU {src} and {dst} for traffic load {weight}"
+        )
+    layers, pred, sigma = built
 
     if sigma[dst] <= 0:
         raise ValueError(

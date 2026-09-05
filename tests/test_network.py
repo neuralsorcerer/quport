@@ -1372,3 +1372,59 @@ def test_accumulate_traffic_is_additive_into_an_existing_matrix() -> None:
     accumulate_traffic([(0, 1, 2.5)], [0, 1], traffic)
 
     assert traffic == [[0.0, 4.0], [4.0, 0.0]]
+
+
+def test_cached_shortest_path_dags_route_bit_for_bit_like_fresh_ones() -> None:
+    """Reusing tables across routings must not change a single load.
+
+    A pair's shortest-path DAG depends on the interconnect, not on the traffic,
+    so prepared tables build each one once and keep it -- which is what makes a
+    partition search that routes the same fabric thousands of times affordable.
+    The flow accumulation still runs per call on the same values in the same
+    order, so a table reused across many traffic matrices has to agree exactly
+    with tables built fresh for each one, and with the validating path that
+    keeps no cache at all.
+    """
+    import random
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.network import (
+        prepare_routing_tables,
+        route_link_loads,
+        route_prepared_link_loads,
+    )
+
+    # A degree-limited fabric with multi-hop paths and ties, so the DAGs are
+    # non-trivial and equal-cost splits actually happen.
+    cfg = MultiQPUConfig(
+        n_qpus=16,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology="degree_d",
+        inter_degree=3,
+    )
+    shortest = MultiQPUArchitecture(cfg).qpu_shortest_paths()
+    assert max(max(row) for row in shortest.dist) > 1, "the fabric must be multi-hop"
+
+    reused = prepare_routing_tables(shortest, cfg.n_qpus, "ecmp")
+    rng = random.Random(11)
+
+    for _ in range(8):
+        traffic = [[0.0] * cfg.n_qpus for _ in range(cfg.n_qpus)]
+        for a in range(cfg.n_qpus):
+            for b in range(a + 1, cfg.n_qpus):
+                if rng.random() < 0.5:
+                    weight = float(rng.randint(1, 97))
+                    traffic[a][b] = weight
+                    traffic[b][a] = weight
+
+        from_reused = route_prepared_link_loads(traffic, reused)
+        from_fresh = route_prepared_link_loads(
+            traffic, prepare_routing_tables(shortest, cfg.n_qpus, "ecmp")
+        )
+        validating = route_link_loads(traffic, shortest, mode="ecmp")
+
+        assert from_reused == from_fresh
+        assert from_reused == validating
+
+    assert reused.ecmp_dags, "the fixture must actually populate the cache"

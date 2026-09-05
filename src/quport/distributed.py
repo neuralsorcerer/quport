@@ -813,6 +813,7 @@ def split_into_qpus(
     # marker sits in this sequence, because an emitted QASM program carries no
     # labels and a routed program may list its barriers in a different order.
     barriers_emitted = [0] * n_qpus
+
     def emit_marker(qpu: int, operands: Sequence[int], label: str) -> None:
         """Mark a remote operation on ``qpu``, ordered against its other markers.
 
