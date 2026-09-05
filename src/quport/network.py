@@ -634,6 +634,11 @@ class RoutingTables:
     #: Shortest-path DAGs, filled in as pairs are first routed. The DAG of a
     #: pair depends on the interconnect alone, so the search that these tables
     #: exist to serve builds each one once instead of once per evaluation.
+    #:
+    #: One DAG per multi-hop pair, each sized by the QPU count, so the cache
+    #: grows as the cube of it: about 5 MiB at 50 QPUs and 45 MiB at 100, the
+    #: top of the range this module is written for. It lives and dies with the
+    #: tables, so a sweep over topologies pays for one at a time.
     ecmp_dags: dict[QpuEdge, "EcmpDag | None"] = field(default_factory=dict)
 
 
