@@ -10,7 +10,8 @@ import csv
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TypeAlias, TypeVar
+from pathlib import Path
+from typing import TextIO, TypeAlias, TypeVar
 
 from qiskit import QuantumCircuit, transpile
 from qiskit.circuit.random import random_circuit
@@ -50,6 +51,20 @@ _BENCHMARK_METHOD_IDS = {
 _BENCHMARK_METHOD_LABELS = {
     method_id: strategy for strategy, method_id in _BENCHMARK_METHOD_IDS.items()
 }
+
+
+def _open_csv_for_write(out_csv: str) -> TextIO:
+    """Open ``out_csv`` for writing, creating the directory it names.
+
+    A sweep can run for minutes before it reaches this line. Leaving the
+    directory to the caller meant the whole run was lost to a FileNotFoundError
+    once it finished, so the parent is created here as the bundle writers and
+    the ``--out-dir`` commands already do.
+    """
+    parent = Path(out_csv).parent
+    if parent != Path(""):
+        parent.mkdir(parents=True, exist_ok=True)
+    return open(out_csv, "w", newline="", encoding="utf-8")
 
 
 def benchmark_method_labels() -> dict[float, str]:
@@ -525,7 +540,7 @@ def benchmark_random_circuits(
             )
 
     if out_csv:
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        with _open_csv_for_write(out_csv) as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -659,7 +674,7 @@ def sweep_topologies(
         "cost_median",
         "transpile_time_mean",
     ]
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    with _open_csv_for_write(out_csv) as f:
         writer = csv.DictWriter(f, fieldnames=sweep_fieldnames)
         writer.writeheader()
         writer.writerows(summary)

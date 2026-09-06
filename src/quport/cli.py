@@ -54,6 +54,19 @@ console = Console()
 _QASM_VERSION_RE = re.compile(r"\AOPENQASM\s+([23])(?:\.0)?\s*;", re.ASCII)
 
 
+def _output_path(out: str) -> Path:
+    """Return ``out`` as a path, creating the directory it names.
+
+    A command has already done its work by the time it writes; leaving the
+    directory to the caller threw the results away with a FileNotFoundError.
+    The ``--out-dir`` commands and the bundle writers already create theirs.
+    """
+    path = Path(out)
+    if path.parent != Path(""):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _print_path(message: str) -> None:
     """Print a message containing a filesystem path, keeping it on one line.
 
@@ -298,7 +311,7 @@ def map(
     )
 
     if out:
-        Path(out).write_text(qasm3.dumps(res.mapped_circuit), encoding="utf-8")
+        _output_path(out).write_text(qasm3.dumps(res.mapped_circuit), encoding="utf-8")
         _print_path(f"Wrote mapped circuit to {out}")
 
 
@@ -545,7 +558,7 @@ def ebits(
                 console.print(f"  {problem}")
             raise typer.Exit(code=1)
 
-        Path(out).write_text(
+        _output_path(out).write_text(
             json.dumps(
                 {
                     "aggregation": plan.to_dict(),
@@ -568,7 +581,9 @@ def ebits(
         program = build_telegate_circuit(
             res.physical_circuit, arch, plan, coherent=False
         )
-        Path(emit_qasm).write_text(qasm3.dumps(program.circuit), encoding="utf-8")
+        _output_path(emit_qasm).write_text(
+            qasm3.dumps(program.circuit), encoding="utf-8"
+        )
         _print_path(
             f"Wrote telegate circuit ({program.n_ancillas} protocol ancillas) "
             f"to {emit_qasm}"
@@ -687,7 +702,7 @@ def optimal(
         )
 
     if out:
-        Path(out).write_text(
+        _output_path(out).write_text(
             json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
         )
         _print_path(f"Wrote gap report to {out}")
@@ -767,7 +782,7 @@ def migrate(
         )
 
     if out:
-        Path(out).write_text(
+        _output_path(out).write_text(
             json.dumps(
                 {
                     "strategy": strategy,

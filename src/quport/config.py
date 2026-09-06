@@ -11,6 +11,7 @@ import importlib.util
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from pathlib import Path
 from typing import Any, Literal
 
 from quport._validation import (
@@ -275,8 +276,13 @@ def dump_config(cfg: MultiQPUConfig, path: str) -> None:
     """Save MultiQPUConfig to JSON or YAML.
 
     Output is plain UTF-8 with no byte-order mark, which both parsers read back.
+    The directory the path names is created, as ``write_remote_ops_json`` does,
+    so writing a config into a fresh results directory does not fail.
     """
     data: dict[str, Any] = asdict(cfg)
+    parent = Path(path).parent
+    if parent != Path(""):
+        parent.mkdir(parents=True, exist_ok=True)
     if _is_yaml_path(path):
         yaml = _load_yaml_module()
         with open(path, "w", encoding="utf-8") as f:

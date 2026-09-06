@@ -1119,3 +1119,55 @@ def test_input_qasm_loader_resolves_includes_next_to_the_program(
 
     assert circuit.num_qubits == 2
     assert "mygate" in circuit.count_ops()
+
+
+@pytest.mark.parametrize(
+    ("args", "name"),
+    [
+        (["gen-config"], "cfg.json"),
+        (["bench", "--n-logical", "4", "--depth", "2", "--trials", "1"], "bench.csv"),
+        (["sweep", "--n-logical", "4", "--depth", "2", "--trials", "1"], "sweep.csv"),
+        (["map", "--n-logical", "4", "--depth", "2"], "mapped.qasm"),
+        (["optimal", "--n-logical", "4", "--depth", "2"], "gap.json"),
+        (["migrate", "--n-logical", "4", "--depth", "2"], "migration.json"),
+        (["ebits", "--n-logical", "4", "--depth", "2"], "ebits.json"),
+    ],
+)
+def test_single_file_outputs_create_the_directory_they_name(
+    tmp_path: Path, args: list[str], name: str
+) -> None:
+    """The work is already done by the time a command writes its result.
+
+    A missing parent directory used to surface as a FileNotFoundError traceback
+    after the run finished, discarding a sweep that can take minutes. The
+    ``--out-dir`` commands and the manifest writer have always created theirs.
+    """
+    out = tmp_path / "fresh" / "nested" / name
+    assert not out.parent.exists()
+
+    _run([*args, "--out", str(out)])
+
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_emit_qasm_creates_the_directory_it_names(tmp_path: Path) -> None:
+    """``--emit-qasm`` writes the executable telegate circuit, on the same path."""
+    out = tmp_path / "fresh" / "telegate.qasm"
+    assert not out.parent.exists()
+
+    _run(
+        ["ebits", "--n-logical", "4", "--depth", "2", "--emit-qasm", str(out)],
+    )
+
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_a_bare_output_filename_still_writes_to_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path with no directory component must not be treated as a directory."""
+    monkeypatch.chdir(tmp_path)
+
+    _run(["gen-config", "--out", "bare.json"])
+
+    assert (tmp_path / "bare.json").is_file()
