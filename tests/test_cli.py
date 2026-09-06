@@ -1171,3 +1171,61 @@ def test_a_bare_output_filename_still_writes_to_the_working_directory(
     _run(["gen-config", "--out", "bare.json"])
 
     assert (tmp_path / "bare.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ('{"n_qpus": 2,,}', "Invalid --config file"),
+        ("[1, 2, 3]", "Invalid --config file"),
+        ('{"nope": 1}', "Invalid --config file"),
+        ('{"n_qpus": 0}', "n_qpus must be positive"),
+        ('{"n_qpus": -1}', "n_qpus must be positive"),
+        ('{"n_qpus": 2, "inter_topology": "banana"}', "Unknown inter_topology"),
+    ],
+)
+def test_a_bad_config_file_is_reported_without_a_traceback(
+    tmp_path: Path, contents: str, expected: str
+) -> None:
+    """``_load_config_or_default`` exists to keep config problems off the console
+    as tracebacks, but only caught the missing-PyYAML case. A typo'd path, text
+    neither parser accepts, and a document that parses but cannot describe an
+    architecture are all far more common, and all printed a traceback.
+
+    ``topology-info`` is the command that shows this: it reads the inter-QPU
+    graph without constructing an architecture, so it never reached the checks
+    every other command runs, and reported a table for ``n_qpus: 0``.
+    """
+    config = tmp_path / "cfg.json"
+    config.write_text(contents, encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["topology-info", "--config", str(config)])
+
+    assert result.exit_code == 2, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert expected in result.output.replace("\n", " ").replace("  ", " ")
+
+
+def test_an_unreadable_config_path_is_reported_without_a_traceback(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "does-not-exist.json"
+
+    result = CliRunner().invoke(app, ["topology-info", "--config", str(missing)])
+
+    assert result.exit_code == 2, result.output
+    assert "Unable to read --config file" in result.output.replace("\n", " ")
+
+
+def test_a_malformed_yaml_config_is_reported_without_a_traceback(
+    tmp_path: Path,
+) -> None:
+    """PyYAML raises its own hierarchy, not a ValueError, so it needs naming."""
+    pytest.importorskip("yaml")
+    config = tmp_path / "cfg.yaml"
+    config.write_text("n_qpus: [unclosed\n", encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["topology-info", "--config", str(config)])
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid --config file" in result.output.replace("\n", " ")

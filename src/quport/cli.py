@@ -20,7 +20,7 @@ from qiskit.exceptions import MissingOptionalLibraryError
 from rich.console import Console
 from rich.table import Table
 
-from quport.architecture import MultiQPUArchitecture
+from quport.architecture import MultiQPUArchitecture, validate_architecture_config
 from quport.compiler import compile_distributed
 from quport.config import (
     LatencyModel,
@@ -192,20 +192,46 @@ def _load_or_random_circuit(
     return random_benchmark_circuit(n_logical, depth, seed)
 
 
+def _config_parse_errors() -> tuple[type[BaseException], ...]:
+    """Return the exception types a bad config file raises.
+
+    ``json.JSONDecodeError`` is a ``ValueError``, as are the field checks in
+    ``MultiQPUConfig``; PyYAML raises its own hierarchy, and is optional, so it
+    is added only when it is installed.
+    """
+    errors: tuple[type[BaseException], ...] = (ValueError,)
+    if optional_module_available("yaml"):
+        errors += (importlib.import_module("yaml").YAMLError,)
+    return errors
+
+
 def _load_config_or_default(config: str | None) -> MultiQPUConfig:
     """Load a config file, or fall back to defaults when none is given.
 
-    ``load_config`` raises ``RuntimeError`` when a YAML path is requested without
-    the optional PyYAML dependency.  Surface that as a CLI error so users see the
-    install hint instead of a traceback, matching how the plotting extra is
-    handled.
+    Every way a config file can be wrong is reported as a CLI error rather than
+    a traceback: a path that cannot be read, text neither parser accepts, and a
+    document that parses but does not describe a buildable architecture --
+    ``topology-info`` reads the inter-QPU graph without constructing one, so it
+    used to report a table for a config every other command rejects.
+    ``load_config`` also raises
+    ``RuntimeError`` when a YAML path is requested without the optional PyYAML
+    dependency, whose message is the install hint, matching how the plotting
+    extra is handled.
     """
     if config is None:
         return MultiQPUConfig()
     try:
-        return load_config(config)
+        cfg = load_config(config)
+        validate_architecture_config(cfg)
+        return cfg
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Unable to read --config file {config!r}: {exc}"
+        ) from exc
+    except _config_parse_errors() as exc:
+        raise typer.BadParameter(f"Invalid --config file {config!r}: {exc}") from exc
 
 
 def _dump_config_or_fail(cfg: MultiQPUConfig, out: str) -> None:
