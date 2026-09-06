@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -637,7 +638,7 @@ def test_input_qasm_loader_reports_a_bad_qasm3_body(tmp_path: Path) -> None:
         raise ValueError("bad qasm3 body")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", _fails)
+        monkeypatch.setattr("quport.cli.qasm3.loads", _fails)
         with pytest.raises(typer.BadParameter, match="Unable to parse OpenQASM 3"):
             _load_or_random_circuit(
                 input_qasm=str(input_path),
@@ -663,7 +664,7 @@ def test_headerless_input_falls_back_from_qasm3_to_qasm2(tmp_path: Path) -> None
         raise ValueError("no qasm3 here")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", _fails)
+        monkeypatch.setattr("quport.cli.qasm3.loads", _fails)
         circuit = _load_or_random_circuit(
             input_qasm=str(input_path),
             n_logical=None,
@@ -695,7 +696,7 @@ def test_headerless_input_falls_back_when_the_qasm3_importer_is_missing(
         )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", _missing_importer)
+        monkeypatch.setattr("quport.cli.qasm3.loads", _missing_importer)
         circuit = _load_or_random_circuit(
             input_qasm=str(input_path),
             n_logical=None,
@@ -1079,6 +1080,13 @@ def test_input_qasm_loader_accepts_a_byte_order_mark(tmp_path: Path) -> None:
 
 
 def test_input_qasm_loader_accepts_a_byte_order_mark_on_qasm3(tmp_path: Path) -> None:
+    """The parser must be handed source with no byte-order mark.
+
+    Reading the file back through the real importer would only test this where
+    ``qiskit_qasm3_import`` happens to be installed, and it is not required by
+    any extra. Standing in for the parser checks what this loader is
+    responsible for -- what it decodes and passes on -- everywhere instead.
+    """
     from qiskit import qasm3
 
     circuit = QuantumCircuit(3)
@@ -1087,13 +1095,23 @@ def test_input_qasm_loader_accepts_a_byte_order_mark_on_qasm3(tmp_path: Path) ->
     input_path = tmp_path / "bom3.qasm"
     input_path.write_text("﻿" + qasm3.dumps(circuit), encoding="utf-8")
 
-    loaded = _load_or_random_circuit(
-        input_qasm=str(input_path),
-        n_logical=None,
-        depth=0,
-        seed=0,
-    )
+    seen: list[str] = []
 
+    def _record(source: str) -> QuantumCircuit:
+        seen.append(source)
+        return circuit
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("quport.cli.qasm3.loads", _record)
+        loaded = _load_or_random_circuit(
+            input_qasm=str(input_path),
+            n_logical=None,
+            depth=0,
+            seed=0,
+        )
+
+    assert seen and not seen[0].startswith("﻿")
+    assert seen[0].lstrip().startswith("OPENQASM 3")
     assert loaded.num_qubits == 3
 
 
@@ -1184,7 +1202,7 @@ def test_a_bare_output_filename_still_writes_to_the_working_directory(
         ('{"n_qpus": 2, "inter_topology": "banana"}', "Unknown inter_topology"),
     ],
 )
-def test_a_bad_config_file_is_reported_without_a_traceback(
+def test_a_bad_config_file_is_reported_as_a_cli_error(
     tmp_path: Path, contents: str, expected: str
 ) -> None:
     """``_load_config_or_default`` exists to keep config problems off the console
@@ -1192,40 +1210,51 @@ def test_a_bad_config_file_is_reported_without_a_traceback(
     neither parser accepts, and a document that parses but cannot describe an
     architecture are all far more common, and all printed a traceback.
 
-    ``topology-info`` is the command that shows this: it reads the inter-QPU
-    graph without constructing an architecture, so it never reached the checks
-    every other command runs, and reported a table for ``n_qpus: 0``.
+    The last two of these are what ``topology-info`` shows: it reads the
+    inter-QPU graph without constructing an architecture, so it never reached
+    the checks every other command runs, and printed a table for ``n_qpus: 0``.
     """
+    from quport.cli import _load_config_or_default
+
     config = tmp_path / "cfg.json"
     config.write_text(contents, encoding="utf-8")
 
-    result = CliRunner().invoke(app, ["topology-info", "--config", str(config)])
-
-    assert result.exit_code == 2, result.output
-    assert result.exception is None or isinstance(result.exception, SystemExit)
-    assert expected in result.output.replace("\n", " ").replace("  ", " ")
+    with pytest.raises(typer.BadParameter, match=re.escape(expected)):
+        _load_config_or_default(str(config))
 
 
-def test_an_unreadable_config_path_is_reported_without_a_traceback(
-    tmp_path: Path,
-) -> None:
+def test_an_unreadable_config_path_is_reported_as_a_cli_error(tmp_path: Path) -> None:
+    from quport.cli import _load_config_or_default
+
     missing = tmp_path / "does-not-exist.json"
 
-    result = CliRunner().invoke(app, ["topology-info", "--config", str(missing)])
-
-    assert result.exit_code == 2, result.output
-    assert "Unable to read --config file" in result.output.replace("\n", " ")
+    with pytest.raises(typer.BadParameter, match="Unable to read --config file"):
+        _load_config_or_default(str(missing))
 
 
-def test_a_malformed_yaml_config_is_reported_without_a_traceback(
-    tmp_path: Path,
-) -> None:
+def test_a_malformed_yaml_config_is_reported_as_a_cli_error(tmp_path: Path) -> None:
     """PyYAML raises its own hierarchy, not a ValueError, so it needs naming."""
     pytest.importorskip("yaml")
+    from quport.cli import _load_config_or_default
+
     config = tmp_path / "cfg.yaml"
     config.write_text("n_qpus: [unclosed\n", encoding="utf-8")
 
+    with pytest.raises(typer.BadParameter, match="Invalid --config file"):
+        _load_config_or_default(str(config))
+
+
+def test_a_bad_config_exits_without_a_traceback(tmp_path: Path) -> None:
+    """End to end, the command must exit as a usage error rather than crash.
+
+    The message itself is asserted above, against the exception: the rendered
+    box is wrapped to the console width and coloured when the environment asks
+    for it, so matching text in it turns on where the path happens to break.
+    """
+    config = tmp_path / "cfg.json"
+    config.write_text('{"n_qpus": 0}', encoding="utf-8")
+
     result = CliRunner().invoke(app, ["topology-info", "--config", str(config)])
 
-    assert result.exit_code == 2, result.output
-    assert "Invalid --config file" in result.output.replace("\n", " ")
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)

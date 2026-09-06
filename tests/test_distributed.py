@@ -1693,6 +1693,10 @@ def test_reassembly_accepts_programs_read_back_from_qasm() -> None:
     to be treated like the missing layout of an unrouted program rather than
     bringing the merge down.
     """
+    # Reading OpenQASM 3 back needs an importer no extra installs, so the
+    # round trip runs only where it is present. Nothing else in this file
+    # depends on it.
+    pytest.importorskip("qiskit_qasm3_import")
     from qiskit import qasm3
 
     from quport.compiler import compile_distributed
