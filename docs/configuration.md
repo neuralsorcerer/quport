@@ -32,6 +32,17 @@ files beside benchmark outputs.
 | `layout_method` | `"sabre"` | Qiskit layout method for global transpilation | non-empty string |
 | `routing_method` | `"sabre"` | Qiskit routing method | non-empty string |
 
+### Loading a config file
+
+`load_config` reads JSON or YAML, picking the parser from the suffix without
+regard to case, and drops a leading byte-order mark so a file saved by an editor
+that writes one still loads. `dump_config` creates the directory its path names.
+
+The CLI checks a `--config` file as it loads it: a path it cannot read, text
+neither parser accepts, an unknown field, and a document that parses but cannot
+describe an architecture are all reported as errors naming the file, rather than
+surfacing later as a traceback from wherever the value was first used.
+
 ### Derived quantities
 
 - `total_physical_qubits()` returns `n_qpus * (compute_qubits_per_qpu + comm_qubits_per_qpu)`.

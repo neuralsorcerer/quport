@@ -23,10 +23,15 @@ quport gen-config
 ```
 
 Writes an example config to `quport_config.json` and prints the resolved
-`MultiQPUConfig`. The format follows the `--out` extension; `.yaml`/`.yml`
-requires the `yaml` extra.
+`MultiQPUConfig`. The format follows the `--out` extension, whatever its case;
+`.yaml`/`.yml` requires the `yaml` extra.
 Use this as the safest starting point for editing architecture fields because it
 contains all current config keys.
+
+Every command that writes a file creates the directory the path names, so
+`--out` and `--out-dir` can point into a results directory that does not exist
+yet. A `--config` file is checked as it is read, and a file that cannot be read,
+parsed, or turned into an architecture is reported as an error naming the file.
 
 ## `quport topology-info`
 
