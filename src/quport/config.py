@@ -242,22 +242,42 @@ def _validate_config_data(data: Any, path: str) -> dict[str, Any]:
     return out
 
 
+def _is_yaml_path(path: str) -> bool:
+    """Return whether ``path`` names a YAML file rather than a JSON one.
+
+    The suffix is matched without regard to case: ``config.YAML`` is an ordinary
+    filename on the case-insensitive filesystems of macOS and Windows, and
+    sniffing it as JSON would report a decode error about a file that is valid.
+    Loading and saving share this so a round trip cannot pick two formats.
+    """
+    return path.lower().endswith((".yaml", ".yml"))
+
+
 def load_config(path: str) -> MultiQPUConfig:
-    """Load MultiQPUConfig from JSON or YAML."""
-    if path.endswith((".yaml", ".yml")):
+    """Load MultiQPUConfig from JSON or YAML.
+
+    Files are decoded as ``utf-8-sig`` so a leading byte-order mark is dropped
+    rather than parsed. Editors on Windows write one by default, and the JSON
+    parser rejects it outright; PyYAML already strips it, so reading both this
+    way keeps a config usable in whichever format it was saved.
+    """
+    if _is_yaml_path(path):
         yaml = _load_yaml_module()
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             data = yaml.safe_load(handle)
     else:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             data = json.load(handle)
     return MultiQPUConfig(**_validate_config_data(data, path))
 
 
 def dump_config(cfg: MultiQPUConfig, path: str) -> None:
-    """Save MultiQPUConfig to JSON or YAML."""
+    """Save MultiQPUConfig to JSON or YAML.
+
+    Output is plain UTF-8 with no byte-order mark, which both parsers read back.
+    """
     data: dict[str, Any] = asdict(cfg)
-    if path.endswith((".yaml", ".yml")):
+    if _is_yaml_path(path):
         yaml = _load_yaml_module()
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, sort_keys=False)
