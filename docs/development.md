@@ -117,3 +117,37 @@ A strong QuPort PR should include:
 3. tests/checks run;
 4. docs updates for user-visible behavior;
 5. notes about limitations or modeling assumptions when applicable.
+
+## Validation in hot paths
+
+Public functions validate their arguments on every call. Search loops must not
+pay for that repeatedly, so several modules pair a validating entry point with a
+prepared or unvalidated core: `quport.network.prepare_routing_tables` with
+`route_prepared_link_loads`, `accumulate_traffic` and
+`accumulate_boundary_counts`, and `quport.hypergraph._ebit_objective_fast`.
+
+When changing either half, keep two properties:
+
+- the prepared path performs the same arithmetic in the same order, so results
+  stay bit-identical rather than merely close;
+- the validating path keeps its checks and its error messages, since those are
+  what the tests pin.
+
+## Changing a partitioning objective
+
+The objective terms are not independent knobs. `w_port` and `w_cong` were tuned
+against a `w_dist` term that charges every cut gate; an e-bit count is smaller by
+the aggregation factor, so a penalty left at its old scale stops biasing the
+objective and becomes it. That is not hypothetical -- it is what made the `ebit`
+strategy score worse than plain balanced partitioning at the objective it is named
+for. When adding or reweighting a term, check the terms are commensurate on a real
+instance, not just that the code runs.
+
+`quport.exact` is the tool for that check. `optimal_partition` gives the number a
+strategy should be compared against, and `partition_gap` raises outright if a
+heuristic scores below a proved optimum, since one of the two would then be wrong.
+It is deliberately independent of the partitioners: a shared bug would have to
+appear in both a branch-and-bound cost and an annealing objective to go unnoticed.
+The branch and bound is itself validated against exhaustive enumeration over every
+feasible assignment in `tests/test_exact.py`, which is the only real argument that
+its pruning and canonical form never lose an optimum.

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -81,14 +82,14 @@ def test_input_qasm_loader_reports_missing_qasm3_importer(
     input_path = tmp_path / "input.qasm"
     input_path.write_text("OPENQASM 3.0;\nqubit[1] q;\n", encoding="utf-8")
 
-    def _missing_importer(path: str) -> QuantumCircuit:
+    def _missing_importer(source: str) -> QuantumCircuit:
         raise MissingOptionalLibraryError(
             libname="qiskit_qasm3_import",
             name="loading from OpenQASM 3",
             pip_install="pip install qiskit_qasm3_import",
         )
 
-    monkeypatch.setattr("quport.cli.qasm3.load", _missing_importer)
+    monkeypatch.setattr("quport.cli.qasm3.loads", _missing_importer)
 
     with pytest.raises(typer.BadParameter, match="qiskit_qasm3_import"):
         _load_or_random_circuit(
@@ -338,6 +339,7 @@ def test_compile_dist_writes_routed_programs_and_schedule_manifests(
         "remote_ops.json",
         "schedule.json",
         "schedule_trace.json",
+        "entanglement_plan.json",
     }
 
     summary = json.loads((out_dir / "schedule.json").read_text(encoding="utf-8"))
@@ -347,6 +349,21 @@ def test_compile_dist_writes_routed_programs_and_schedule_manifests(
     assert summary["remote_ops"] == sum(
         layer["remote_ops"] for layer in trace["layers"]
     )
+
+    remote_ops = json.loads((out_dir / "remote_ops.json").read_text(encoding="utf-8"))
+    for op in remote_ops:
+        assert op["qpu0_marker"] is not None
+        assert op["qpu1_marker"] is not None
+
+    entanglement = json.loads(
+        (out_dir / "entanglement_plan.json").read_text(encoding="utf-8")
+    )
+    aggregation = entanglement["aggregation"]
+    assert aggregation["epr_pairs"] == sum(
+        block["epr_pairs"] for block in aggregation["blocks"]
+    )
+    assert aggregation["epr_pairs"] <= aggregation["baseline_epr_pairs"]
+    assert entanglement["schedule"]["epr_pairs"] == aggregation["epr_pairs"]
 
 
 def test_sweep_writes_summary_csv(tmp_path: Path) -> None:
@@ -621,7 +638,7 @@ def test_input_qasm_loader_reports_a_bad_qasm3_body(tmp_path: Path) -> None:
         raise ValueError("bad qasm3 body")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", _fails)
+        monkeypatch.setattr("quport.cli.qasm3.loads", _fails)
         with pytest.raises(typer.BadParameter, match="Unable to parse OpenQASM 3"):
             _load_or_random_circuit(
                 input_qasm=str(input_path),
@@ -647,7 +664,7 @@ def test_headerless_input_falls_back_from_qasm3_to_qasm2(tmp_path: Path) -> None
         raise ValueError("no qasm3 here")
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", _fails)
+        monkeypatch.setattr("quport.cli.qasm3.loads", _fails)
         circuit = _load_or_random_circuit(
             input_qasm=str(input_path),
             n_logical=None,
@@ -679,7 +696,7 @@ def test_headerless_input_falls_back_when_the_qasm3_importer_is_missing(
         )
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", _missing_importer)
+        monkeypatch.setattr("quport.cli.qasm3.loads", _missing_importer)
         circuit = _load_or_random_circuit(
             input_qasm=str(input_path),
             n_logical=None,
@@ -716,7 +733,7 @@ def test_headerless_input_reports_both_parser_failures(
     failure = _missing_importer if qasm3_error == "missing_importer" else _parse_error
 
     with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr("quport.cli.qasm3.load", failure)
+        monkeypatch.setattr("quport.cli.qasm3.loads", failure)
         with pytest.raises(typer.BadParameter, match=expected):
             _load_or_random_circuit(
                 input_qasm=str(input_path),
@@ -724,3 +741,520 @@ def test_headerless_input_reports_both_parser_failures(
                 depth=1,
                 seed=0,
             )
+
+
+def test_compile_dist_bundle_is_consumable_from_the_qasm_alone(tmp_path: Path) -> None:
+    """The shipped manifest and QASM files must agree qubit for qubit.
+
+    A consumer only has the emitted text: barriers carry no labels there, so the
+    manifest's marker index is the only thing that says which barrier belongs to
+    which remote operation. A ``line`` intra-topology makes the hazard real --
+    routing permutes qubits inside a QPU -- so trusting pre-routing indices
+    would fail here.
+
+    A marker lists the operation's operand first and the qubit ordering it
+    against the QPU's previous marker after it, so the operand is the barrier's
+    leading argument.
+    """
+    import re
+
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        json.dumps(
+            {
+                "n_qpus": 2,
+                "compute_qubits_per_qpu": 4,
+                "comm_qubits_per_qpu": 1,
+                "intra_topology": "line",
+                "optimization_level": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "bundle"
+
+    _run(
+        [
+            "compile-dist",
+            "--n-logical",
+            "9",
+            "--depth",
+            "14",
+            "--seed",
+            "4",
+            "--config",
+            str(config),
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    remote_ops = json.loads((out_dir / "remote_ops.json").read_text(encoding="utf-8"))
+    assert remote_ops, "the fixture must produce remote operations"
+
+    barriers = {
+        qpu: [
+            int(arguments.split(",")[0].strip().removeprefix("$"))
+            for arguments in re.findall(
+                r"barrier ([^;]+);",
+                (out_dir / f"qpu_{qpu}_routed.qasm").read_text(encoding="utf-8"),
+            )
+        ]
+        for qpu in (0, 1)
+    }
+
+    for op in remote_ops:
+        assert barriers[op["qpu0"]][op["qpu0_marker"]] == op["q0_phys"]
+        assert barriers[op["qpu1"]][op["qpu1_marker"]] == op["q1_phys"]
+
+    # A marker that also carries an ordering qubit lists two arguments, so a
+    # consumer has to read the leading one rather than assume a lone qubit.
+    # This is what makes the pairing above a real parse rather than a
+    # coincidence of one-argument barriers.
+    assert any(
+        "," in arguments
+        for qpu in (0, 1)
+        for arguments in re.findall(
+            r"barrier ([^;]+);",
+            (out_dir / f"qpu_{qpu}_routed.qasm").read_text(encoding="utf-8"),
+        )
+    )
+
+    # Those ordering qubits are there to keep each QPU's markers in the
+    # manifest's own order through routing, which is what lets a consumer pair
+    # them by index at all.
+    for qpu in (0, 1):
+        indices = [op[f"qpu{qpu}_marker"] for op in remote_ops]
+        assert indices == sorted(indices)
+
+
+def _write_three_qpu_config(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "n_qpus": 3,
+                "compute_qubits_per_qpu": 3,
+                "comm_qubits_per_qpu": 2,
+                "intra_topology": "clique",
+                "inter_topology": "ring",
+                "optimization_level": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_optimal_reports_a_gap_for_both_objectives(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    out = tmp_path / "gap.json"
+
+    result = _run(
+        [
+            "optimal",
+            "--n-logical",
+            "9",
+            "--depth",
+            "10",
+            "--seed",
+            "0",
+            "--config",
+            str(config),
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert "Optimality gap" in result.output  # type: ignore[attr-defined]
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["strategy"] == "ebit"
+    assert payload["n_qpus"] == 3
+    for objective in ("cut", "ebits"):
+        entry = payload[objective]
+        assert entry["proved_optimal"] is True
+        # A heuristic below the optimum would have raised inside partition_gap.
+        assert entry["heuristic"] >= entry["optimal"]
+        assert entry["absolute"] == entry["heuristic"] - entry["optimal"]
+
+
+def test_optimal_flags_an_exhausted_node_budget(tmp_path: Path) -> None:
+    """An unproved bound must not be presented as a measured gap."""
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+
+    result = _run(
+        [
+            "optimal",
+            "--n-logical",
+            "9",
+            "--depth",
+            "10",
+            "--config",
+            str(config),
+            "--max-nodes",
+            "3",
+        ]
+    )
+
+    output = result.output  # type: ignore[attr-defined]
+    assert "Node budget exhausted" in output
+    assert ">= " in output
+
+
+def test_optimal_scores_the_requested_strategy(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    ebit_out = tmp_path / "ebit.json"
+    sa_out = tmp_path / "sa.json"
+
+    for strategy, out in (("ebit", ebit_out), ("tpccap_sa", sa_out)):
+        _run(
+            [
+                "optimal",
+                "--n-logical",
+                "9",
+                "--depth",
+                "10",
+                "--seed",
+                "0",
+                "--config",
+                str(config),
+                "--strategy",
+                strategy,
+                "--out",
+                str(out),
+            ]
+        )
+
+    ebit = json.loads(ebit_out.read_text(encoding="utf-8"))
+    sa = json.loads(sa_out.read_text(encoding="utf-8"))
+
+    assert ebit["strategy"] == "ebit"
+    assert sa["strategy"] == "tpccap_sa"
+    # The e-bit strategy is the one aiming at this objective; if it stopped
+    # winning here the penalty weights have drifted out of scale again.
+    assert ebit["ebits"]["heuristic"] < sa["ebits"]["heuristic"]
+
+
+def test_migrate_reports_a_saving_and_writes_a_plan(tmp_path: Path) -> None:
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    out = tmp_path / "plan.json"
+
+    result = _run(
+        [
+            "migrate",
+            "--n-logical",
+            "9",
+            "--depth",
+            "16",
+            "--seed",
+            "0",
+            "--config",
+            str(config),
+            "--windows",
+            "3",
+            "--out",
+            str(out),
+        ]
+    )
+
+    assert "Time-varying placement" in result.output  # type: ignore[attr-defined]
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["temporal_ebits"] <= payload["best_static_ebits"]
+    assert payload["best_static_ebits"] <= payload["seed_ebits"]
+    assert payload["reduction_vs_seed"] >= 0.0
+    assert payload["reduction_by_migration"] >= 0.0
+    assert (
+        payload["packet_ebits"]
+        + payload["unpackable_ebits"]
+        + payload["migration_ebits"]
+        == payload["temporal_ebits"]
+    )
+
+    plan = payload["plan"]
+    assert len(plan["assignments"]) == len(plan["windows"])
+    assert plan["windows"][0]["start"] == 0
+    for before, after in zip(plan["windows"], plan["windows"][1:]):
+        assert before["stop"] == after["start"]
+    assert len(plan["migrations"]) * payload["migration_cost"] == (
+        payload["migration_ebits"]
+    )
+
+
+def test_migrate_with_one_window_cannot_migrate(tmp_path: Path) -> None:
+    """One window is the static model: the search may still re-place, never move.
+
+    It is not a no-op -- the neighbourhood includes whole-circuit moves, so a
+    single window still improves the static placement. What it cannot do is
+    migrate, which is exactly why it is the control the report compares against.
+    """
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    out = tmp_path / "plan.json"
+
+    _run(
+        [
+            "migrate",
+            "--n-logical",
+            "9",
+            "--depth",
+            "12",
+            "--config",
+            str(config),
+            "--windows",
+            "1",
+            "--out",
+            str(out),
+        ]
+    )
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["moves"] == 0
+    assert payload["migration_ebits"] == 0
+    assert payload["plan"]["migrations"] == []
+    assert len(payload["plan"]["windows"]) == 1
+    assert payload["temporal_ebits"] == payload["best_static_ebits"]
+    assert payload["temporal_ebits"] <= payload["seed_ebits"]
+
+
+def test_migrate_honours_an_expensive_teleport(tmp_path: Path) -> None:
+    """Price migration high enough and no qubit is worth moving."""
+    config = tmp_path / "cfg.json"
+    _write_three_qpu_config(config)
+    cheap = tmp_path / "cheap.json"
+    dear = tmp_path / "dear.json"
+
+    for cost, out in (("1", cheap), ("1000", dear)):
+        _run(
+            [
+                "migrate",
+                "--n-logical",
+                "9",
+                "--depth",
+                "16",
+                "--seed",
+                "0",
+                "--config",
+                str(config),
+                "--windows",
+                "3",
+                "--migration-cost",
+                cost,
+                "--out",
+                str(out),
+            ]
+        )
+
+    cheap_payload = json.loads(cheap.read_text(encoding="utf-8"))
+    dear_payload = json.loads(dear.read_text(encoding="utf-8"))
+
+    assert dear_payload["moves"] == 0
+    assert dear_payload["migration_ebits"] == 0
+    # Without migration the best it can do is the static control.
+    assert dear_payload["temporal_ebits"] == dear_payload["best_static_ebits"]
+    # Cheap teleports do get used, and beat the control.
+    assert cheap_payload["moves"] > 0
+    assert cheap_payload["temporal_ebits"] < cheap_payload["best_static_ebits"]
+
+
+def test_input_qasm_loader_accepts_a_byte_order_mark(tmp_path: Path) -> None:
+    """A file written by a Windows editor starts with a BOM.
+
+    The loader decodes with ``utf-8-sig`` so the version header is still found,
+    but the OpenQASM 2 parser rejects the mark as a non-ASCII byte. Parsing the
+    text that was already decoded, rather than re-reading the path, is what
+    makes that tolerance real.
+    """
+    input_path = tmp_path / "bom.qasm"
+    _write_qasm(input_path, leading_text="﻿")
+
+    circuit = _load_or_random_circuit(
+        input_qasm=str(input_path),
+        n_logical=None,
+        depth=0,
+        seed=0,
+    )
+
+    assert circuit.num_qubits == 3
+
+
+def test_input_qasm_loader_accepts_a_byte_order_mark_on_qasm3(tmp_path: Path) -> None:
+    """The parser must be handed source with no byte-order mark.
+
+    Reading the file back through the real importer would only test this where
+    ``qiskit_qasm3_import`` happens to be installed, and it is not required by
+    any extra. Standing in for the parser checks what this loader is
+    responsible for -- what it decodes and passes on -- everywhere instead.
+    """
+    from qiskit import qasm3
+
+    circuit = QuantumCircuit(3)
+    circuit.h(0)
+    circuit.cx(0, 2)
+    input_path = tmp_path / "bom3.qasm"
+    input_path.write_text("﻿" + qasm3.dumps(circuit), encoding="utf-8")
+
+    seen: list[str] = []
+
+    def _record(source: str) -> QuantumCircuit:
+        seen.append(source)
+        return circuit
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr("quport.cli.qasm3.loads", _record)
+        loaded = _load_or_random_circuit(
+            input_qasm=str(input_path),
+            n_logical=None,
+            depth=0,
+            seed=0,
+        )
+
+    assert seen and not seen[0].startswith("﻿")
+    assert seen[0].lstrip().startswith("OPENQASM 3")
+    assert loaded.num_qubits == 3
+
+
+def test_input_qasm_loader_resolves_includes_next_to_the_program(
+    tmp_path: Path,
+) -> None:
+    """`qasm2.load` searches the input file's own directory; parsing the decoded
+    text must keep doing so, or a program including a sibling stops loading."""
+    (tmp_path / "mylib.inc").write_text("gate mygate a { x a; }\n", encoding="utf-8")
+    input_path = tmp_path / "program.qasm"
+    input_path.write_text(
+        'OPENQASM 2.0;\ninclude "qelib1.inc";\ninclude "mylib.inc";\n'
+        "qreg q[2];\nmygate q[0];\ncx q[0], q[1];\n",
+        encoding="utf-8",
+    )
+
+    circuit = _load_or_random_circuit(
+        input_qasm=str(input_path),
+        n_logical=None,
+        depth=0,
+        seed=0,
+    )
+
+    assert circuit.num_qubits == 2
+    assert "mygate" in circuit.count_ops()
+
+
+@pytest.mark.parametrize(
+    ("args", "name"),
+    [
+        (["gen-config"], "cfg.json"),
+        (["bench", "--n-logical", "4", "--depth", "2", "--trials", "1"], "bench.csv"),
+        (["sweep", "--n-logical", "4", "--depth", "2", "--trials", "1"], "sweep.csv"),
+        (["map", "--n-logical", "4", "--depth", "2"], "mapped.qasm"),
+        (["optimal", "--n-logical", "4", "--depth", "2"], "gap.json"),
+        (["migrate", "--n-logical", "4", "--depth", "2"], "migration.json"),
+        (["ebits", "--n-logical", "4", "--depth", "2"], "ebits.json"),
+    ],
+)
+def test_single_file_outputs_create_the_directory_they_name(
+    tmp_path: Path, args: list[str], name: str
+) -> None:
+    """The work is already done by the time a command writes its result.
+
+    A missing parent directory used to surface as a FileNotFoundError traceback
+    after the run finished, discarding a sweep that can take minutes. The
+    ``--out-dir`` commands and the manifest writer have always created theirs.
+    """
+    out = tmp_path / "fresh" / "nested" / name
+    assert not out.parent.exists()
+
+    _run([*args, "--out", str(out)])
+
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_emit_qasm_creates_the_directory_it_names(tmp_path: Path) -> None:
+    """``--emit-qasm`` writes the executable telegate circuit, on the same path."""
+    out = tmp_path / "fresh" / "telegate.qasm"
+    assert not out.parent.exists()
+
+    _run(
+        ["ebits", "--n-logical", "4", "--depth", "2", "--emit-qasm", str(out)],
+    )
+
+    assert out.is_file() and out.stat().st_size > 0
+
+
+def test_a_bare_output_filename_still_writes_to_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path with no directory component must not be treated as a directory."""
+    monkeypatch.chdir(tmp_path)
+
+    _run(["gen-config", "--out", "bare.json"])
+
+    assert (tmp_path / "bare.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ('{"n_qpus": 2,,}', "Invalid --config file"),
+        ("[1, 2, 3]", "Invalid --config file"),
+        ('{"nope": 1}', "Invalid --config file"),
+        ('{"n_qpus": 0}', "n_qpus must be positive"),
+        ('{"n_qpus": -1}', "n_qpus must be positive"),
+        ('{"n_qpus": 2, "inter_topology": "banana"}', "Unknown inter_topology"),
+    ],
+)
+def test_a_bad_config_file_is_reported_as_a_cli_error(
+    tmp_path: Path, contents: str, expected: str
+) -> None:
+    """``_load_config_or_default`` exists to keep config problems off the console
+    as tracebacks, but only caught the missing-PyYAML case. A typo'd path, text
+    neither parser accepts, and a document that parses but cannot describe an
+    architecture are all far more common, and all printed a traceback.
+
+    The last two of these are what ``topology-info`` shows: it reads the
+    inter-QPU graph without constructing an architecture, so it never reached
+    the checks every other command runs, and printed a table for ``n_qpus: 0``.
+    """
+    from quport.cli import _load_config_or_default
+
+    config = tmp_path / "cfg.json"
+    config.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(typer.BadParameter, match=re.escape(expected)):
+        _load_config_or_default(str(config))
+
+
+def test_an_unreadable_config_path_is_reported_as_a_cli_error(tmp_path: Path) -> None:
+    from quport.cli import _load_config_or_default
+
+    missing = tmp_path / "does-not-exist.json"
+
+    with pytest.raises(typer.BadParameter, match="Unable to read --config file"):
+        _load_config_or_default(str(missing))
+
+
+def test_a_malformed_yaml_config_is_reported_as_a_cli_error(tmp_path: Path) -> None:
+    """PyYAML raises its own hierarchy, not a ValueError, so it needs naming."""
+    pytest.importorskip("yaml")
+    from quport.cli import _load_config_or_default
+
+    config = tmp_path / "cfg.yaml"
+    config.write_text("n_qpus: [unclosed\n", encoding="utf-8")
+
+    with pytest.raises(typer.BadParameter, match="Invalid --config file"):
+        _load_config_or_default(str(config))
+
+
+def test_a_bad_config_exits_without_a_traceback(tmp_path: Path) -> None:
+    """End to end, the command must exit as a usage error rather than crash.
+
+    The message itself is asserted above, against the exception: the rendered
+    box is wrapped to the console width and coloured when the environment asks
+    for it, so matching text in it turns on where the path happens to break.
+    """
+    config = tmp_path / "cfg.json"
+    config.write_text('{"n_qpus": 0}', encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["topology-info", "--config", str(config)])
+
+    assert result.exit_code == 2
+    assert isinstance(result.exception, SystemExit)

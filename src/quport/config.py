@@ -11,6 +11,7 @@ import importlib.util
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from pathlib import Path
 from typing import Any, Literal
 
 from quport._validation import (
@@ -46,6 +47,21 @@ def _validate_nonempty_string(value: object, *, label: str) -> str:
     if not out:
         raise ValueError(f"{label} must be a non-empty string")
     return out
+
+
+def validate_epr_success_prob(
+    value: object, *, label: str = "epr_success_prob"
+) -> float:
+    """Return a heralded-entanglement success probability in ``(0, 1]``.
+
+    Zero is rejected rather than clamped: a link that never succeeds needs an
+    unbounded number of attempts, which is a modelling error rather than a
+    schedule with an infinite makespan.
+    """
+    probability = validate_nonnegative_finite_float(value, label=label)
+    if probability <= 0.0 or probability > 1.0:
+        raise ValueError(f"{label} must be within (0, 1]")
+    return probability
 
 
 def _normalize_basis_gates(value: object) -> tuple[str, ...]:
@@ -155,6 +171,29 @@ class LatencyModel:
     classical_rtt: float = 20.0
     remote_gate_overhead: float = 50.0
 
+    # Heralded entanglement success probability per attempt, in (0, 1].
+    #
+    # Physical entanglement generation is probabilistic and heralded, so the
+    # number of attempts needed for one usable EPR pair is geometric with mean
+    # ``1 / epr_success_prob``. The entanglement-aware scheduler multiplies
+    # ``epr_gen`` by that factor; the default of 1.0 models a deterministic link
+    # and leaves every pre-existing estimator's numbers unchanged.
+    epr_success_prob: float = 1.0
+
+    def expected_epr_time(self, hops: int = 1) -> float:
+        """Expected time to distribute one EPR pair across ``hops`` links.
+
+        Entanglement swapping along a path needs every hop to succeed, so the
+        elementary generation cost is charged per hop and scaled by the expected
+        attempt count ``1 / epr_success_prob``.
+        """
+        hops_value = validate_nonnegative_integral(hops, label="hops")
+        epr_gen = validate_nonnegative_finite_float(self.epr_gen, label="epr_gen")
+        success = validate_epr_success_prob(self.epr_success_prob)
+        return validate_finite_result(
+            hops_value * epr_gen / success, label="expected EPR time"
+        )
+
     def estimate_latency(
         self, n_1q: int, n_2q: int, swaps: int, remote_2q: int, depth: int | None = None
     ) -> float:
@@ -204,22 +243,47 @@ def _validate_config_data(data: Any, path: str) -> dict[str, Any]:
     return out
 
 
+def _is_yaml_path(path: str) -> bool:
+    """Return whether ``path`` names a YAML file rather than a JSON one.
+
+    The suffix is matched without regard to case: ``config.YAML`` is an ordinary
+    filename on the case-insensitive filesystems of macOS and Windows, and
+    sniffing it as JSON would report a decode error about a file that is valid.
+    Loading and saving share this so a round trip cannot pick two formats.
+    """
+    return path.lower().endswith((".yaml", ".yml"))
+
+
 def load_config(path: str) -> MultiQPUConfig:
-    """Load MultiQPUConfig from JSON or YAML."""
-    if path.endswith((".yaml", ".yml")):
+    """Load MultiQPUConfig from JSON or YAML.
+
+    Files are decoded as ``utf-8-sig`` so a leading byte-order mark is dropped
+    rather than parsed. Editors on Windows write one by default, and the JSON
+    parser rejects it outright; PyYAML already strips it, so reading both this
+    way keeps a config usable in whichever format it was saved.
+    """
+    if _is_yaml_path(path):
         yaml = _load_yaml_module()
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             data = yaml.safe_load(handle)
     else:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8-sig") as handle:
             data = json.load(handle)
     return MultiQPUConfig(**_validate_config_data(data, path))
 
 
 def dump_config(cfg: MultiQPUConfig, path: str) -> None:
-    """Save MultiQPUConfig to JSON or YAML."""
+    """Save MultiQPUConfig to JSON or YAML.
+
+    Output is plain UTF-8 with no byte-order mark, which both parsers read back.
+    The directory the path names is created, as ``write_remote_ops_json`` does,
+    so writing a config into a fresh results directory does not fail.
+    """
     data: dict[str, Any] = asdict(cfg)
-    if path.endswith((".yaml", ".yml")):
+    parent = Path(path).parent
+    if parent != Path(""):
+        parent.mkdir(parents=True, exist_ok=True)
+    if _is_yaml_path(path):
         yaml = _load_yaml_module()
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(data, f, sort_keys=False)

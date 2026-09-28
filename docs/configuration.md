@@ -32,6 +32,17 @@ files beside benchmark outputs.
 | `layout_method` | `"sabre"` | Qiskit layout method for global transpilation | non-empty string |
 | `routing_method` | `"sabre"` | Qiskit routing method | non-empty string |
 
+### Loading a config file
+
+`load_config` reads JSON or YAML, picking the parser from the suffix without
+regard to case, and drops a leading byte-order mark so a file saved by an editor
+that writes one still loads. `dump_config` creates the directory its path names.
+
+The CLI checks a `--config` file as it loads it: a path it cannot read, text
+neither parser accepts, an unknown field, and a document that parses but cannot
+describe an architecture are all reported as errors naming the file, rather than
+surfacing later as a traceback from wherever the value was first used.
+
 ### Derived quantities
 
 - `total_physical_qubits()` returns `n_qpus * (compute_qubits_per_qpu + comm_qubits_per_qpu)`.
@@ -59,11 +70,18 @@ files beside benchmark outputs.
 | `epr_gen` | `200.0` | entanglement generation/network setup cost | remote operation cost |
 | `classical_rtt` | `20.0` | classical round-trip component | remote operation cost and async overlap model |
 | `remote_gate_overhead` | `50.0` | remote gate protocol overhead | remote operation cost |
+| `epr_success_prob` | `1.0` | heralded entanglement success probability per attempt, in `(0, 1]` | entanglement-aware schedule only |
 
 `estimate_latency(n_1q, n_2q, swaps, remote_2q, depth=None)` computes a scalar
 latency proxy and validates all counts and coefficients before computing. The
 optional `depth` argument adds a soft depth penalty and is not a replacement for a
 schedule estimator.
+
+`expected_epr_time(hops)` returns `hops * epr_gen / epr_success_prob`, the expected
+time to distribute one EPR pair across `hops` links: entanglement generation is
+heralded, so one usable pair needs `1 / epr_success_prob` attempts on average. Only
+`estimate_entanglement_schedule` reads `epr_success_prob`, and its default of `1.0`
+models a deterministic link, so every other estimator is unchanged.
 
 ## Config files
 

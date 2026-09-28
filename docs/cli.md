@@ -23,10 +23,15 @@ quport gen-config
 ```
 
 Writes an example config to `quport_config.json` and prints the resolved
-`MultiQPUConfig`. The format follows the `--out` extension; `.yaml`/`.yml`
-requires the `yaml` extra.
+`MultiQPUConfig`. The format follows the `--out` extension, whatever its case;
+`.yaml`/`.yml` requires the `yaml` extra.
 Use this as the safest starting point for editing architecture fields because it
 contains all current config keys.
+
+Every command that writes a file creates the directory the path names, so
+`--out` and `--out-dir` can point into a results directory that does not exist
+yet. A `--config` file is checked as it is read, and a file that cannot be read,
+parsed, or turned into an architecture is reported as an error naming the file.
 
 ## `quport topology-info`
 
@@ -55,7 +60,7 @@ Options:
 - `--n-logical`: logical qubit count;
 - `--depth`: random circuit depth;
 - `--seed`: random circuit and transpiler seed;
-- `--strategy`: `balanced`, `cluster`, `tpccap`, or `tpccap_sa`;
+- `--strategy`: `balanced`, `cluster`, `ebit`, `tpccap`, or `tpccap_sa`;
 - `--config`: optional JSON/YAML config path;
 - `--input-qasm`: optional OpenQASM 2/3 file to map instead of generating a random circuit;
 - `--out`: optional mapped OpenQASM 3 output.
@@ -114,6 +119,74 @@ but it is not the preferred distributed-compilation workflow. Prefer `compile-di
 when you want to avoid cross-QPU global routing and keep remote operations explicit
 from the compilation flow.
 
+## `quport ebits`
+
+```bash
+quport ebits --n-logical 16 --depth 20 --seed 0 --strategy ebit --out entanglement_plan.json
+```
+
+Reports EPR-pair demand after communication aggregation: cross-QPU gates, EPR pairs
+with and without aggregation, the saving, block count, port evictions, peak cat
+copies per QPU, the port-unconstrained e-bit count, and both the entanglement-aware
+and topology-aware makespans. `--out` writes the full plan, including each block's
+root qubit, host QPU, protocol, and served gate indices — after
+`audit_entanglement_schedule` has checked it against the port and link budgets it
+claims to respect, the circuit's own cross-QPU operation count, and the plan it
+came from. An inconsistent schedule is reported and not written.
+
+`--emit-qasm PATH` additionally writes the executable protocol circuit as
+OpenQASM 3, with explicit EPR pairs, mid-circuit measurement, and `if`
+feedforward. `--verify` simulates the unitary form of that circuit and confirms
+it reproduces the mapped circuit, exiting non-zero if it does not; it reports a
+clear error when the architecture has too few comm ports for the plan to be
+runnable, or when the circuit is too wide to simulate.
+
+See [Entanglement model](entanglement.md) for what these numbers mean.
+
+## `quport optimal`
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit --out gap.json
+```
+
+Scores a strategy's partition against the exact optimum, under both the classical
+cut objective and the e-bit objective, by solving the same instance with branch and
+bound. Reports the heuristic's cost, the optimum, the relative gap, and whether the
+optimum was proved.
+
+`--max-nodes` bounds the search. When the budget runs out the "optimal" column is
+only an upper bound on the true optimum, so the gap is rendered as `>= x%` and a
+warning is printed; `--out` records `proved_optimal` for each objective. The command
+exits non-zero if a heuristic scores *below* a proved optimum, since one of the two
+would then be wrong.
+
+The tree is over set partitions, so keep the instance small -- roughly a dozen
+qubits. This calibrates the heuristics; it is not a compile path.
+
+## `quport migrate`
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json --out plan.json
+```
+
+Reports what letting qubits move between QPUs mid-circuit would save. Cuts the
+instruction stream into `--windows` windows, gives each its own placement, and
+charges `--migration-cost` EPR pairs (one by default) for every qubit whose QPU
+changes between neighbouring windows.
+
+Three costs are printed, because two different effects contribute: the seed
+placement's cost, the best placement the search reaches with migration forbidden,
+and the best with migration allowed. "saved by migration" compares the last two,
+holding the placement search constant, and is the number that answers whether
+teleport-based migration is worth having. Each migration is listed as
+`qubit q: QPU a -> b after window w`.
+
+`--out` writes the plan: windows, per-window assignments, migrations, and the
+cost breakdown.
+
+The plan is an analysis, not a compile artifact — `compile-dist` still emits a
+single static placement.
+
 ## `quport compile-dist`
 
 ```bash
@@ -125,12 +198,20 @@ to compile an application circuit from OpenQASM 2/3 instead of generating a rand
 benchmark. Output artifacts:
 
 - `qpu_<id>_routed.qasm`: locally routed per-QPU programs;
-- `remote_ops.json`: ordered remote operation manifest;
+- `remote_ops.json`: ordered remote operation manifest, in the routed programs' physical-qubit labelling (local routing permutes qubits inside a QPU unless the intra-QPU topology is a clique, so the pre-routing indices would point elsewhere);
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
-- `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds.
+- `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
+- `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary (audited before writing, like the schedule trace).
 
 The schedule JSON writers use `allow_nan=False` and the schedule serializers
 validate timings, counts, QPU pairs, and link-utilization pairs before export.
+
+Before `schedule_trace.json` is written, `audit_topology_schedule_plan` re-derives
+every figure in it independently — layer and round intervals, per-round port and
+link usage against the configured budgets, round durations, and all six summary
+aggregates — plus a check that the plan accounts for exactly the cross-QPU
+operations the circuit contains. A manifest that does not add up is reported and
+not written, and the command exits non-zero.
 
 Recommended checks after running:
 
@@ -138,6 +219,7 @@ Recommended checks after running:
 python -m json.tool compile_out/remote_ops.json >/dev/null
 python -m json.tool compile_out/schedule.json >/dev/null
 python -m json.tool compile_out/schedule_trace.json >/dev/null
+python -m json.tool compile_out/entanglement_plan.json >/dev/null
 ```
 
 ## Choosing between CLI commands
@@ -149,5 +231,8 @@ python -m json.tool compile_out/schedule_trace.json >/dev/null
 | repeated global-routing comparisons | `quport bench` |
 | topology/port aggregate summaries | `quport sweep` |
 | quick makespan estimate | `quport schedule` |
+| EPR-pair budget and communication plan | `quport ebits` |
+| value of moving qubits between QPUs mid-circuit | `quport migrate` |
+| how far a partition is from optimal | `quport optimal` |
 | per-QPU split of a globally mapped circuit | `quport split` |
 | explicit distributed compile artifacts | `quport compile-dist` |

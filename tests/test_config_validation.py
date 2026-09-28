@@ -123,3 +123,64 @@ def test_yaml_config_round_trips_through_dump_and_load(tmp_path: Path) -> None:
     assert not written.lstrip().startswith("{")
 
     assert load_config(str(path)) == original
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [("cfg.json", '{"n_qpus": 3}'), ("cfg.yaml", "n_qpus: 3\n")],
+)
+def test_load_config_reads_a_file_saved_with_a_byte_order_mark(
+    tmp_path: Path, name: str, text: str
+) -> None:
+    """Editors on Windows prepend a BOM, and the JSON parser refuses one.
+
+    PyYAML strips it already, so before this the same config was readable saved
+    as YAML and unreadable saved as JSON. The CLI's ``--input-qasm`` has always
+    tolerated a BOM; ``--config`` feeds every subcommand and now matches it.
+    """
+    from quport.config import load_config
+
+    if name.endswith(".yaml"):
+        pytest.importorskip("yaml")
+    config = tmp_path / name
+    config.write_text(text, encoding="utf-8-sig")
+    assert config.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    assert load_config(str(config)).n_qpus == 3
+
+
+@pytest.mark.parametrize("suffix", [".YAML", ".YML", ".Yaml"])
+def test_yaml_is_parsed_as_yaml_whatever_the_suffix_case(
+    tmp_path: Path, suffix: str
+) -> None:
+    """``config.YAML`` is an ordinary name on macOS and Windows.
+
+    An uppercase YAML suffix used to fall through to the JSON parser, which
+    reported a decode error against a file that was perfectly valid. A
+    round-trip check cannot see this, because writing picked the same wrong
+    format as reading; the file has to be written as YAML by hand.
+    """
+    pytest.importorskip("yaml")
+    from quport.config import load_config
+
+    path = tmp_path / f"cfg{suffix}"
+    path.write_text("n_qpus: 5\n", encoding="utf-8")
+
+    assert load_config(str(path)).n_qpus == 5
+
+
+@pytest.mark.parametrize("suffix", [".YAML", ".YML", ".yaml", ".JSON", ".json"])
+def test_config_round_trips_whatever_the_suffix_case(
+    tmp_path: Path, suffix: str
+) -> None:
+    """Saving and loading must agree on the format for a given name."""
+    if suffix.lower() in {".yaml", ".yml"}:
+        pytest.importorskip("yaml")
+    from quport.config import dump_config, load_config
+
+    path = tmp_path / f"cfg{suffix}"
+    cfg = MultiQPUConfig(n_qpus=5)
+
+    dump_config(cfg, str(path))
+
+    assert load_config(str(path)) == cfg

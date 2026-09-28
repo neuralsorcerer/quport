@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import re
 from dataclasses import asdict
 from pathlib import Path
@@ -19,6 +20,7 @@ from qiskit.exceptions import MissingOptionalLibraryError
 from rich.console import Console
 from rich.table import Table
 
+from quport.architecture import MultiQPUArchitecture, validate_architecture_config
 from quport.compiler import compile_distributed
 from quport.config import (
     LatencyModel,
@@ -28,6 +30,8 @@ from quport.config import (
     optional_module_available,
 )
 from quport.distributed import write_remote_ops_json
+from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
+from quport.interaction import extract_twoq_weights
 from quport.network import build_qpu_graph, topology_metrics
 from quport.pipeline import (
     benchmark_method_labels,
@@ -36,6 +40,11 @@ from quport.pipeline import (
     random_benchmark_circuit,
     sweep_topologies,
 )
+from quport.schedule import (
+    audit_entanglement_schedule,
+    audit_topology_schedule_plan,
+)
+from quport.temporal import optimize_temporal_partition, split_windows
 
 app = typer.Typer(
     add_completion=False, help="QuPort: multi-QPU circuit mapping + benchmarks"
@@ -43,6 +52,19 @@ app = typer.Typer(
 console = Console()
 
 _QASM_VERSION_RE = re.compile(r"\AOPENQASM\s+([23])(?:\.0)?\s*;", re.ASCII)
+
+
+def _output_path(out: str) -> Path:
+    """Return ``out`` as a path, creating the directory it names.
+
+    A command has already done its work by the time it writes; leaving the
+    directory to the caller threw the results away with a FileNotFoundError.
+    The ``--out-dir`` commands and the bundle writers already create theirs.
+    """
+    path = Path(out)
+    if path.parent != Path(""):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _print_path(message: str) -> None:
@@ -92,10 +114,22 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
             f"Unable to read --input-qasm file {input_qasm!r}: {exc}"
         ) from exc
 
+    # Parse the text that was already decoded rather than re-reading the path.
+    # `utf-8-sig` above drops a byte-order mark, which the OpenQASM 2 parser
+    # rejects as a non-ASCII byte -- and a file written by a Windows editor
+    # routinely has one.
+    def parse_qasm2() -> QuantumCircuit:
+        # `qasm2.load` appends the input file's own directory to the include
+        # path; keep that, so a program including a sibling file still resolves.
+        return qasm2.loads(source, include_path=(".", str(input_path.parent)))
+
+    def parse_qasm3() -> QuantumCircuit:
+        return qasm3.loads(source)
+
     version = _qasm_version(source)
     if version == 2:
         try:
-            return qasm2.load(str(input_path))
+            return parse_qasm2()
         except Exception as exc:
             raise typer.BadParameter(
                 f"Unable to parse OpenQASM 2 input {input_qasm!r}: {exc}"
@@ -103,7 +137,7 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
 
     if version == 3:
         try:
-            return qasm3.load(str(input_path))
+            return parse_qasm3()
         except MissingOptionalLibraryError as exc:
             raise typer.BadParameter(
                 "OpenQASM 3 input requires Qiskit's optional importer. "
@@ -115,10 +149,10 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
             ) from exc
 
     try:
-        return qasm3.load(str(input_path))
+        return parse_qasm3()
     except MissingOptionalLibraryError:
         try:
-            return qasm2.load(str(input_path))
+            return parse_qasm2()
         except Exception as exc:
             raise typer.BadParameter(
                 "Unable to detect an OpenQASM version header and the input could "
@@ -126,7 +160,7 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
             ) from exc
     except Exception as qasm3_exc:
         try:
-            return qasm2.load(str(input_path))
+            return parse_qasm2()
         except Exception as qasm2_exc:
             raise typer.BadParameter(
                 "Unable to detect an OpenQASM version header. Parsing failed as "
@@ -158,20 +192,46 @@ def _load_or_random_circuit(
     return random_benchmark_circuit(n_logical, depth, seed)
 
 
+def _config_parse_errors() -> tuple[type[BaseException], ...]:
+    """Return the exception types a bad config file raises.
+
+    ``json.JSONDecodeError`` is a ``ValueError``, as are the field checks in
+    ``MultiQPUConfig``; PyYAML raises its own hierarchy, and is optional, so it
+    is added only when it is installed.
+    """
+    errors: tuple[type[BaseException], ...] = (ValueError,)
+    if optional_module_available("yaml"):
+        errors += (importlib.import_module("yaml").YAMLError,)
+    return errors
+
+
 def _load_config_or_default(config: str | None) -> MultiQPUConfig:
     """Load a config file, or fall back to defaults when none is given.
 
-    ``load_config`` raises ``RuntimeError`` when a YAML path is requested without
-    the optional PyYAML dependency.  Surface that as a CLI error so users see the
-    install hint instead of a traceback, matching how the plotting extra is
-    handled.
+    Every way a config file can be wrong is reported as a CLI error rather than
+    a traceback: a path that cannot be read, text neither parser accepts, and a
+    document that parses but does not describe a buildable architecture --
+    ``topology-info`` reads the inter-QPU graph without constructing one, so it
+    used to report a table for a config every other command rejects.
+    ``load_config`` also raises
+    ``RuntimeError`` when a YAML path is requested without the optional PyYAML
+    dependency, whose message is the install hint, matching how the plotting
+    extra is handled.
     """
     if config is None:
         return MultiQPUConfig()
     try:
-        return load_config(config)
+        cfg = load_config(config)
+        validate_architecture_config(cfg)
+        return cfg
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"Unable to read --config file {config!r}: {exc}"
+        ) from exc
+    except _config_parse_errors() as exc:
+        raise typer.BadParameter(f"Invalid --config file {config!r}: {exc}") from exc
 
 
 def _dump_config_or_fail(cfg: MultiQPUConfig, out: str) -> None:
@@ -245,7 +305,8 @@ def map(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
-        "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -276,7 +337,7 @@ def map(
     )
 
     if out:
-        Path(out).write_text(qasm3.dumps(res.mapped_circuit), encoding="utf-8")
+        _output_path(out).write_text(qasm3.dumps(res.mapped_circuit), encoding="utf-8")
         _print_path(f"Wrote mapped circuit to {out}")
 
 
@@ -288,7 +349,7 @@ def bench(
     seed: int = typer.Option(0, help="Base seed"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,cluster,tpccap,tpccap_sa",
+        help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     out: str = typer.Option("results.csv", help="Output CSV path"),
@@ -321,7 +382,7 @@ def sweep(
     out: str = typer.Option("sweep.csv", help="Output CSV summary"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
-        help="Comma-separated strategies: baseline,balanced,cluster,tpccap,tpccap_sa",
+        help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     plot: str | None = typer.Option(
         None, help="Optional PNG plot (requires quport[viz])"
@@ -366,7 +427,8 @@ def schedule(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
-        "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -376,7 +438,6 @@ def schedule(
     ),
 ) -> None:
     """Estimate parallel multi-QPU makespan for a mapped random circuit."""
-    from .architecture import MultiQPUArchitecture
     from .schedule import estimate_parallel_makespan_layered
 
     cfg = _load_config_or_default(config)
@@ -400,7 +461,8 @@ def split(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
-        "tpccap", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -413,7 +475,6 @@ def split(
     ),
 ) -> None:
     """Split a mapped circuit into per-QPU local circuits + remote-op list (JSON)."""
-    from .architecture import MultiQPUArchitecture
     from .distributed import split_into_qpus
 
     cfg = _load_config_or_default(config)
@@ -441,6 +502,339 @@ def split(
 
 
 @app.command()
+def ebits(
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
+    depth: int = typer.Option(20, help="Random circuit depth"),
+    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    strategy: str = typer.Option(
+        "ebit",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
+    ),
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
+    out: str | None = typer.Option(
+        None, help="Optional JSON path for the full entanglement plan"
+    ),
+    emit_qasm: str | None = typer.Option(
+        None,
+        "--emit-qasm",
+        help=(
+            "Optional OpenQASM 3 path for the executable telegate circuit "
+            "(explicit EPR pairs, mid-circuit measurement, and feedforward)"
+        ),
+    ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help=(
+            "Check by state-vector simulation that the emitted protocol "
+            "reproduces the mapped circuit (small circuits only)"
+        ),
+    ),
+) -> None:
+    """Report EPR-pair (e-bit) demand after communication aggregation.
+
+    Compares the entanglement a per-gate telegate compiler would consume against
+    the aggregated plan, then schedules that plan against the configured
+    comm-port and link budgets.
+    """
+    cfg = _load_config_or_default(config)
+    latency = LatencyModel()
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
+
+    res = compile_distributed(qc, cfg, latency=latency, seed=seed, strategy=strategy)
+    plan = res.aggregation
+    report = res.ebits
+    sched = res.entanglement_schedule
+
+    table = Table(title="Entanglement Demand")
+    table.add_column("metric")
+    table.add_column("value")
+    table.add_row("cross-QPU gates", str(plan.remote_gates))
+    table.add_row("EPR pairs (aggregated)", str(plan.epr_pairs))
+    table.add_row("EPR pairs (per gate)", str(plan.baseline_epr_pairs))
+    table.add_row("saved", f"{plan.reduction * 100:.1f}%")
+    table.add_row("blocks", str(len(plan.blocks)))
+    table.add_row("port evictions", str(plan.evictions))
+    table.add_row("peak cat copies per QPU", str(list(plan.peak_cat_copies)))
+    table.add_row("e-bits (port-unconstrained)", str(report.ebits))
+    table.add_row("distributable packets", str(report.active_packets))
+    table.add_row("makespan (entanglement-aware)", f"{sched.makespan:.2f}")
+    table.add_row("makespan (topology-aware)", f"{res.schedule.makespan:.2f}")
+    table.add_row("unschedulable gates", str(sched.unschedulable_gates))
+    console.print(table)
+
+    if out:
+        # The same rule as `compile-dist`: a manifest written for someone else to
+        # act on is checked before it ships, not after they trust it.
+        problems = audit_entanglement_schedule(
+            sched, res.physical_circuit, MultiQPUArchitecture(cfg), latency, plan=plan
+        )
+        if problems:
+            console.print("[bold red]Entanglement schedule is inconsistent:[/bold red]")
+            for problem in problems[:10]:
+                console.print(f"  {problem}")
+            raise typer.Exit(code=1)
+
+        _output_path(out).write_text(
+            json.dumps(
+                {
+                    "aggregation": plan.to_dict(),
+                    "ebits": report.to_dict(),
+                    "schedule": sched.to_dict(),
+                },
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        _print_path(f"Wrote entanglement plan to {out}")
+
+    if emit_qasm or verify:
+        from .protocol import build_telegate_circuit, verify_telegate_equivalence
+
+        arch = MultiQPUArchitecture(cfg)
+
+    if emit_qasm:
+        program = build_telegate_circuit(
+            res.physical_circuit, arch, plan, coherent=False
+        )
+        _output_path(emit_qasm).write_text(
+            qasm3.dumps(program.circuit), encoding="utf-8"
+        )
+        _print_path(
+            f"Wrote telegate circuit ({program.n_ancillas} protocol ancillas) "
+            f"to {emit_qasm}"
+        )
+
+    if verify:
+        try:
+            equivalent = verify_telegate_equivalence(res.physical_circuit, arch, plan)
+        except ValueError as exc:
+            raise typer.BadParameter(f"Cannot verify this plan: {exc}") from exc
+        if equivalent:
+            console.print("[bold green]Verified:[/bold green] protocol matches circuit")
+        else:
+            console.print("[bold red]Verification failed[/bold red]")
+            raise typer.Exit(code=1)
+
+
+@app.command()
+def optimal(
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
+    depth: int = typer.Option(12, help="Random circuit depth"),
+    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    strategy: str = typer.Option(
+        "ebit",
+        help="Partition strategy to score: balanced, cluster, ebit, tpccap, tpccap_sa",
+    ),
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
+    max_nodes: int = typer.Option(
+        DEFAULT_MAX_NODES,
+        "--max-nodes",
+        help="Branch-and-bound node budget; exhausting it reports a bound, not a proof",
+    ),
+    out: str | None = typer.Option(None, help="Optional JSON path for the gap report"),
+) -> None:
+    """Score a strategy's partition against the exact optimum.
+
+    Solves the same instance exactly by branch and bound and reports how much
+    the heuristic leaves on the table, under both the classical cut objective
+    and the e-bit objective. The tree is over set partitions, so this is for
+    calibration on small instances -- roughly a dozen qubits -- not compiling.
+    """
+    cfg = _load_config_or_default(config)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
+
+    res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
+    weights = extract_twoq_weights(res.basis_circuit)
+    capacity = cfg.capacity_per_qpu()
+
+    table = Table(title=f"Optimality gap ({strategy}, {res.basis_circuit.num_qubits}q)")
+    table.add_column("objective")
+    table.add_column("heuristic", justify="right")
+    table.add_column("optimal", justify="right")
+    table.add_column("gap", justify="right")
+    table.add_column("proved", justify="right")
+
+    payload: dict[str, Any] = {"strategy": strategy, "n_qpus": cfg.n_qpus}
+    objectives: tuple[tuple[Objective, dict[str, Any]], ...] = (
+        ("cut", {"weights": weights}),
+        ("ebits", {"packets": res.packets}),
+    )
+    for objective, kwargs in objectives:
+        try:
+            gap = partition_gap(
+                res.partition,
+                cfg.n_qpus,
+                capacity,
+                objective=objective,
+                max_nodes=max_nodes,
+                **kwargs,
+            )
+        except ValueError as exc:
+            # A heuristic below a proved optimum is a bug in one of the two, not
+            # a bad command line, so say which comparison failed and stop.
+            console.print(f"[bold red]{objective}:[/bold red] {exc}")
+            raise typer.Exit(code=1) from exc
+        # Without a proof, `optimal` is only an upper bound on the true optimum,
+        # so the computed gap is a lower bound on the real one -- and can even
+        # come out negative. Render it as the bound it is rather than as a
+        # number that reads like a measurement.
+        if gap.proved_optimal:
+            rendered = f"{gap.relative * 100:.1f}%"
+        else:
+            rendered = f">= {max(gap.relative, 0.0) * 100:.1f}%"
+        table.add_row(
+            objective,
+            f"{gap.heuristic:g}",
+            f"{gap.optimal:g}",
+            rendered,
+            "yes" if gap.proved_optimal else "no",
+        )
+        payload[objective] = {
+            "heuristic": gap.heuristic,
+            "optimal": gap.optimal,
+            "absolute": gap.absolute,
+            # `relative` is infinite when the optimum is zero and the heuristic
+            # is not. JSON has no infinity, so that case is written as null
+            # rather than as a finite number that would misreport it.
+            "relative": gap.relative if math.isfinite(gap.relative) else None,
+            "proved_optimal": gap.proved_optimal,
+        }
+
+    console.print(table)
+    if not all(payload[key]["proved_optimal"] for key in ("cut", "ebits")):
+        console.print(
+            "[yellow]Node budget exhausted:[/yellow] the reported optimum is an "
+            "upper bound, so the true gap is at least as large as shown."
+        )
+
+    if out:
+        _output_path(out).write_text(
+            json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8"
+        )
+        _print_path(f"Wrote gap report to {out}")
+
+
+@app.command()
+def migrate(
+    n_logical: int | None = typer.Option(
+        None, help="Number of logical qubits for generated random circuits"
+    ),
+    depth: int = typer.Option(20, help="Random circuit depth"),
+    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    strategy: str = typer.Option(
+        "ebit",
+        help="Partition strategy for the static placement to improve on",
+    ),
+    windows: int = typer.Option(
+        3, help="Number of time windows to cut the instruction stream into"
+    ),
+    migration_cost: int = typer.Option(
+        1, "--migration-cost", help="EPR pairs to teleport one qubit between QPUs"
+    ),
+    config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
+    input_qasm: str | None = typer.Option(
+        None,
+        "--input-qasm",
+        help="Load an OpenQASM 2/3 circuit instead of generating one",
+    ),
+    out: str | None = typer.Option(
+        None, help="Optional JSON path for the placement plan"
+    ),
+) -> None:
+    """Report what letting qubits move between QPUs mid-circuit would save.
+
+    Cuts the instruction stream into windows, gives each its own placement, and
+    charges a teleport for every qubit whose QPU changes between neighbouring
+    windows. The search starts from the static placement, so the reported plan
+    never costs more than holding one assignment for the whole circuit.
+    """
+    cfg = _load_config_or_default(config)
+    qc = _load_or_random_circuit(
+        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+    )
+
+    res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
+    capacity = cfg.capacity_per_qpu()
+
+    window_ranges = split_windows(res.packets, windows)
+    result = optimize_temporal_partition(
+        res.packets,
+        res.partition,
+        cfg.n_qpus,
+        capacity,
+        window_ranges,
+        migration_cost=migration_cost,
+        seed=seed,
+    )
+
+    table = Table(title=f"Time-varying placement ({len(window_ranges)} windows)")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    table.add_row("EPR pairs, seed placement", str(result.static_cost))
+    table.add_row("EPR pairs, best static", str(result.stationary_cost))
+    table.add_row("EPR pairs, time-varying", str(result.cost.total))
+    table.add_row("  of which cat copies", str(result.cost.packet_ebits))
+    table.add_row("  of which teleported gates", str(result.cost.unpackable_ebits))
+    table.add_row("  of which migrations", str(result.cost.migration_ebits))
+    table.add_row("qubit migrations", str(result.cost.moves))
+    table.add_row("saved vs seed", f"{result.reduction * 100:.1f}%")
+    table.add_row("saved by migration", f"{result.migration_reduction * 100:.1f}%")
+    table.add_row("search passes", str(result.passes))
+    console.print(table)
+
+    for qubit, boundary, source, target in result.partition.migrations():
+        console.print(
+            f"  qubit {qubit}: QPU {source} -> {target} after window {boundary}"
+        )
+
+    if out:
+        _output_path(out).write_text(
+            json.dumps(
+                {
+                    "strategy": strategy,
+                    "n_qpus": cfg.n_qpus,
+                    "migration_cost": migration_cost,
+                    "seed_ebits": result.static_cost,
+                    "best_static_ebits": result.stationary_cost,
+                    "temporal_ebits": result.cost.total,
+                    "packet_ebits": result.cost.packet_ebits,
+                    "unpackable_ebits": result.cost.unpackable_ebits,
+                    "migration_ebits": result.cost.migration_ebits,
+                    "moves": result.cost.moves,
+                    "reduction_vs_seed": result.reduction,
+                    "reduction_by_migration": result.migration_reduction,
+                    "passes": result.passes,
+                    "plan": result.partition.to_dict(),
+                },
+                indent=2,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        _print_path(f"Wrote placement plan to {out}")
+
+
+@app.command()
 def compile_dist(
     n_logical: int | None = typer.Option(
         None, help="Number of logical qubits for generated random circuits"
@@ -448,7 +842,8 @@ def compile_dist(
     depth: int = typer.Option(20, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
-        "tpccap_sa", help="Partition strategy: balanced, cluster, tpccap, tpccap_sa"
+        "tpccap_sa",
+        help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     temporal_decay: float = typer.Option(
         0.98, help="Time-decay factor for 2Q weights (<=1). Use 1 for uniform."
@@ -467,9 +862,12 @@ def compile_dist(
 
     Outputs:
       - qpu_<id>_routed.qasm : routed per-QPU local programs
-      - remote_ops.json     : ordered remote-op trace
+      - remote_ops.json     : ordered remote-op trace, in the routed programs'
+        physical-qubit labelling
       - schedule.json       : topology-aware schedule summary
       - schedule_trace.json : detailed per-layer/per-round communication plan with absolute timing
+      - entanglement_plan.json : aggregated EPR blocks, e-bit report, and the
+        entanglement-aware schedule summary
     """
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
@@ -492,13 +890,56 @@ def compile_dist(
     for qpu, c in res.local_routed.items():
         (outp / f"qpu_{qpu}_routed.qasm").write_text(qasm3.dumps(c), encoding="utf-8")
 
-    write_remote_ops_json(res.program.remote_ops, outp / "remote_ops.json")
+    # The bundle ships routed programs, so it ships the manifest that matches
+    # them: local routing permutes qubits inside a QPU unless the intra-QPU
+    # topology is a clique, and the pre-routing indices would point elsewhere.
+    write_remote_ops_json(res.routed_remote_ops, outp / "remote_ops.json")
     (outp / "schedule.json").write_text(
         json.dumps(res.schedule.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",
     )
+    # The trace is written for downstream consumers to schedule against, and a
+    # consumer cannot tell a sound manifest from a self-consistent-looking wrong
+    # one. Re-derive its numbers before shipping it, and refuse to ship a
+    # manifest that does not add up.
+    inconsistencies = audit_topology_schedule_plan(
+        res.schedule_plan, MultiQPUArchitecture(cfg), latency, res.physical_circuit
+    )
+    if inconsistencies:
+        console.print("[bold red]Schedule plan is inconsistent:[/bold red]")
+        for problem in inconsistencies[:10]:
+            console.print(f"  {problem}")
+        if len(inconsistencies) > 10:
+            console.print(f"  ... and {len(inconsistencies) - 10} more")
+        raise typer.Exit(code=1)
+
     (outp / "schedule_trace.json").write_text(
         json.dumps(res.schedule_plan.to_dict(), indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    entanglement_problems = audit_entanglement_schedule(
+        res.entanglement_schedule,
+        res.physical_circuit,
+        MultiQPUArchitecture(cfg),
+        latency,
+        plan=res.aggregation,
+    )
+    if entanglement_problems:
+        console.print("[bold red]Entanglement schedule is inconsistent:[/bold red]")
+        for problem in entanglement_problems[:10]:
+            console.print(f"  {problem}")
+        raise typer.Exit(code=1)
+
+    (outp / "entanglement_plan.json").write_text(
+        json.dumps(
+            {
+                "aggregation": res.aggregation.to_dict(),
+                "ebits": res.ebits.to_dict(),
+                "schedule": res.entanglement_schedule.to_dict(),
+            },
+            indent=2,
+            allow_nan=False,
+        ),
         encoding="utf-8",
     )
 
@@ -507,7 +948,16 @@ def compile_dist(
         f"[bold]Remote2Q:[/bold] {res.global_metrics.remote_2q}  [bold]Local SWAPs:[/bold] {swaps_total}"
     )
     console.print(
+        f"[bold]EPR pairs:[/bold] {res.aggregation.epr_pairs} "
+        f"(un-aggregated {res.aggregation.baseline_epr_pairs}, "
+        f"saved {res.aggregation.reduction * 100:.1f}%)  "
+        f"[bold]Blocks:[/bold] {len(res.aggregation.blocks)}"
+    )
+    console.print(
         f"[bold]Makespan (topology-aware):[/bold] {res.schedule.makespan:.2f}  [bold]Remote rounds:[/bold] {res.schedule.remote_rounds}"
+    )
+    console.print(
+        f"[bold]Makespan (entanglement-aware):[/bold] {res.entanglement_schedule.makespan:.2f}"
     )
     console.print(
         f"[bold]Times:[/bold] mapping={res.mapping_time_s:.4f}s  local_transpile={res.local_transpile_time_s:.4f}s"

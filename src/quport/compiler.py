@@ -39,9 +39,21 @@ from dataclasses import dataclass
 from qiskit import QuantumCircuit, transpile
 
 from quport._validation import validate_nonnegative_integral
+from quport.aggregation import AggregationPlan, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig
-from quport.distributed import DistributedProgram, split_into_qpus
+from quport.distributed import (
+    DistributedProgram,
+    RemoteOp,
+    remap_remote_ops_to_routed,
+    split_into_qpus,
+)
+from quport.hypergraph import (
+    EbitReport,
+    PacketDecomposition,
+    build_distributable_packets,
+    ebit_report,
+)
 from quport.interaction import (
     extract_temporal_twoq_weights,
     extract_twoq_weights,
@@ -58,8 +70,10 @@ from quport.partition import (
     tpccap_sa_partition,
 )
 from quport.schedule import (
+    EntanglementScheduleSummary,
     TopologySchedulePlan,
     TopologyScheduleSummary,
+    estimate_entanglement_schedule,
     estimate_topology_schedule_plan,
 )
 
@@ -81,6 +95,13 @@ def _translate_to_basis(
 @dataclass(frozen=True)
 class DistributedCompileResult:
     physical_circuit: QuantumCircuit
+
+    # The circuit after basis translation, before layout.  `partition` and
+    # `packets` are indexed by *its* qubits, not the input circuit's and not
+    # the physical circuit's, so anything that re-derives a partitioning input
+    # -- interaction weights, an exact-optimum reference -- has to start here.
+    basis_circuit: QuantumCircuit
+
     cfg: MultiQPUConfig
     strategy: str
     partition: list[int]
@@ -94,11 +115,23 @@ class DistributedCompileResult:
     # Routed local programs (one per QPU)
     local_routed: dict[int, QuantumCircuit]
 
+    # `program.remote_ops` names physical qubits as they stand *before* local
+    # routing.  Routing permutes qubits inside a QPU whenever the intra-QPU
+    # topology is not a clique, so this is the manifest that matches
+    # `local_routed`, and the one to ship alongside those programs.
+    routed_remote_ops: list[RemoteOp]
+
     # Metrics
     global_metrics: CircuitMetrics
     local_metrics: dict[int, dict[str, int]]  # op counts per QPU (including swaps)
     schedule: TopologyScheduleSummary
     schedule_plan: TopologySchedulePlan
+
+    # Entanglement accounting
+    packets: PacketDecomposition
+    ebits: EbitReport
+    aggregation: AggregationPlan
+    entanglement_schedule: EntanglementScheduleSummary
 
     # Times
     mapping_time_s: float
@@ -121,11 +154,28 @@ def compile_distributed(
     - "cluster"    : heavy-edge clustering baseline
     - "tpccap"     : TPCCAP (topology+port+congestion aware)
     - "tpccap_sa"  : TPCCAP + simulated annealing refinement (recommended)
+    - "ebit"       : TPCCAP-SA driven by hop-scaled e-bit demand instead of cut
+                     weight, i.e. minimising the EPR pairs a cat-entanglement
+                     compiler consumes after communication aggregation
 
     temporal_decay
     --------------
     If < 1, uses time-decayed weights to bias the partitioner toward reducing
     *early* remote interactions.
+
+    Notes
+    -----
+    The ``"ebit"`` objective replaces the weighted-cut-distance term with
+    hop-scaled e-bit demand, and rescales the rest of the objective to match.
+    The boundary-qubit port penalty is dropped: it runs one to two orders of
+    magnitude larger than an e-bit count, and it measures the wrong resource,
+    because a cat-entanglement compiler needs a port for a live cat copy rather
+    than for every boundary qubit -- and a port shortage is already priced by
+    :func:`quport.aggregation.aggregate_remote_operations`, which pays for it
+    in evictions and fresh EPR pairs. Congestion is kept, but routed from EPR
+    demand rather than gate demand, so it describes the traffic the objective
+    prices; :func:`quport.hypergraph.ebit_traffic_matrix` reports that demand
+    directly.
     """
     latency = latency or LatencyModel()
     if seed is not None:
@@ -136,11 +186,11 @@ def compile_distributed(
             f"Logical qubits={qc.num_qubits} exceed physical qubits={cfg.total_physical_qubits()} in config."
         )
 
-    supported_strategies = {"balanced", "cluster", "tpccap", "tpccap_sa"}
+    supported_strategies = {"balanced", "cluster", "tpccap", "tpccap_sa", "ebit"}
     if strategy not in supported_strategies:
         raise ValueError("Unknown strategy.")
 
-    is_tpccap = strategy in ("tpccap", "tpccap_sa")
+    is_tpccap = strategy in ("tpccap", "tpccap_sa", "ebit")
     temporal_decay_value = (
         validate_temporal_decay(temporal_decay, label="temporal_decay")
         if is_tpccap
@@ -162,6 +212,10 @@ def compile_distributed(
         )  # float weights
     else:
         partition_weights = extract_twoq_weights(qc_basis)  # int weights
+
+    # Packets are partition independent, so they are built once and reused by
+    # the e-bit objective, the diagnostics, and the aggregation cross-check.
+    packets = build_distributable_packets(qc_basis)
 
     capacity = cfg.capacity_per_qpu()
     part: list[int]
@@ -224,6 +278,42 @@ def compile_distributed(
         part_diag = diag
         anneal_diag = ad
 
+    elif strategy == "ebit":
+        sp = arch.qpu_shortest_paths()
+        pres, diag, ad = tpccap_sa_partition(
+            n=qc_basis.num_qubits,
+            weights=partition_weights,
+            n_qpus=cfg.n_qpus,
+            capacity=capacity,
+            comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
+            sp=sp,
+            seed=seed,
+            # Communication volume is measured in e-bits, so the cut-distance
+            # term is switched off rather than added on top of it.
+            w_dist=0.0,
+            packets=packets,
+            w_ebit=1.0,
+            # The remaining terms have to be rescaled to match. `w_port`'s
+            # squared boundary-qubit overflow is one to two orders of magnitude
+            # larger than an e-bit count, and it measures the wrong resource
+            # anyway: what a cat-entanglement compiler needs a port for is a
+            # live cat copy, not every boundary qubit. Under aggregation a port
+            # shortage is already priced -- it costs an eviction and a fresh EPR
+            # pair -- so the penalty is dropped rather than double-counted.
+            w_port=0.0,
+            # Congestion is kept, but routed from EPR demand rather than gate
+            # demand, so it describes the same traffic the e-bit term prices,
+            # and at the same weight in both stages because the 4x annealing
+            # asymmetry was tuned against the larger gate-traffic scale.
+            w_cong=0.05,
+            anneal_w_cong=0.05,
+            congestion_source="ebits",
+        )
+        part = pres.part
+        cut = pres.cut
+        part_diag = diag
+        anneal_diag = ad
+
     else:
         raise ValueError("Unknown strategy.")
 
@@ -267,12 +357,24 @@ def compile_distributed(
 
     local_time = time.perf_counter() - t1
 
+    # Re-express the remote-op manifest in the routed programs' labelling.
+    routed_remote_ops = remap_remote_ops_to_routed(program.remote_ops, local_routed)
+
     # 6) Global metrics + topology-aware schedule estimate (remote rounds)
     global_metrics = compute_metrics(physical, arch)
     sched_plan = estimate_topology_schedule_plan(physical, arch, latency)
 
+    # 7) Entanglement accounting: aggregate cross-QPU gates into blocks and
+    #    schedule them against the real comm-port and link budgets.
+    ebit_diagnostics = ebit_report(packets, part, cfg.n_qpus)
+    aggregation = aggregate_remote_operations(physical, arch)
+    entanglement = estimate_entanglement_schedule(
+        physical, arch, latency, plan=aggregation
+    )
+
     return DistributedCompileResult(
         physical_circuit=physical,
+        basis_circuit=qc_basis,
         cfg=cfg,
         strategy=strategy,
         partition=part,
@@ -281,10 +383,15 @@ def compile_distributed(
         anneal_diagnostics=anneal_diag,
         program=program,
         local_routed=local_routed,
+        routed_remote_ops=routed_remote_ops,
         global_metrics=global_metrics,
         local_metrics=local_counts,
         schedule=sched_plan.summary,
         schedule_plan=sched_plan,
+        packets=packets,
+        ebits=ebit_diagnostics,
+        aggregation=aggregation,
+        entanglement_schedule=entanglement,
         mapping_time_s=mapping_time,
         local_transpile_time_s=local_time,
     )

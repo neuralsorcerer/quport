@@ -10,6 +10,7 @@ import base64
 import json
 import math
 import os
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
 from numbers import Integral
@@ -31,6 +32,13 @@ def _validate_manifest_int(value: object, *, label: str) -> int:
     if out < 0:
         raise ValueError(f"{label} must be non-negative")
     return out
+
+
+def _validate_optional_manifest_int(value: object, *, label: str) -> int | None:
+    """Return a non-negative integer manifest field, or None when unset."""
+    if value is None:
+        return None
+    return _validate_manifest_int(value, label=label)
 
 
 def _validate_manifest_sequence(value: object, *, label: str) -> Sequence[object]:
@@ -164,6 +172,16 @@ class RemoteOp:
     clbits: tuple[int, ...]
     index: int  # global instruction index
 
+    # Position of this operation's marker barrier among all barriers of the
+    # named QPU's local program.  Barriers are the only thing an emitted QASM
+    # file carries to say *where* a remote operation belongs, and a routed
+    # program may list them in a different order than the manifest -- barriers
+    # on disjoint qubits commute, so rebuilding the circuit from its DAG can
+    # reorder them.  Pairing by position is therefore wrong; these fields make
+    # the pairing explicit.
+    qpu0_marker: int | None = None
+    qpu1_marker: int | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Return a stable, JSON-safe representation of this remote operation."""
         if not isinstance(self.name, str) or not self.name:
@@ -197,6 +215,12 @@ class RemoteOp:
             "params": params,
             "clbits": clbits,
             "index": _validate_manifest_int(self.index, label="remote operation index"),
+            "qpu0_marker": _validate_optional_manifest_int(
+                self.qpu0_marker, label="remote operation qpu0_marker"
+            ),
+            "qpu1_marker": _validate_optional_manifest_int(
+                self.qpu1_marker, label="remote operation qpu1_marker"
+            ),
         }
 
 
@@ -287,6 +311,439 @@ def write_distributed_program(
     return written
 
 
+#: Prefix of the label QuPort puts on the barriers that mark remote operations.
+#:
+#: Barrier labels are transpiler metadata: they survive routing, they are
+#: remapped along with the qubit they sit on, and they are not emitted by the
+#: OpenQASM writers. That makes them the right carrier for the one thing a
+#: routed program cannot otherwise tell you -- which physical qubit a given
+#: remote operation ended up on.
+REMOTE_BARRIER_LABEL_PREFIX = "quport_remote_"
+
+
+def remote_barrier_label(ordinal: int) -> str:
+    """Return the barrier label marking remote operation ``ordinal``."""
+    return f"{REMOTE_BARRIER_LABEL_PREFIX}{_validate_manifest_int(ordinal, label='remote operation ordinal')}"
+
+
+def _remote_barrier_ordinal(operation: object) -> int | None:
+    """Return the remote-op ordinal a barrier marks, or None if it marks none."""
+    if not getattr(operation, "_directive", False):
+        return None
+    label = getattr(operation, "label", None)
+    if not isinstance(label, str) or not label.startswith(REMOTE_BARRIER_LABEL_PREFIX):
+        return None
+    suffix = label[len(REMOTE_BARRIER_LABEL_PREFIX) :]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def remap_remote_ops_to_routed(
+    remote_ops: Sequence[RemoteOp],
+    local_routed: Mapping[int, QuantumCircuit],
+) -> list[RemoteOp]:
+    """Re-express remote operations in the labelling of *routed* local programs.
+
+    Why this is needed
+    ------------------
+    :func:`split_into_qpus` records each remote operation's physical qubits as
+    they stand in the circuit it split. Routing each local program afterwards
+    can permute qubits inside a QPU -- it always does unless the intra-QPU
+    topology is a clique -- so those indices stop pointing at the state they
+    named. Shipping the original manifest next to routed programs would tell a
+    consumer to wire the remote gate to the wrong qubit.
+
+    The routed circuits already hold the answer: the transpiler remaps the
+    synchronization barriers along with everything else, so the barrier marking
+    a remote operation sits on exactly the qubit that operation must use. This
+    function reads those barriers back, identifying them by the label
+    :func:`remote_barrier_label` attached at split time.
+
+    Returns
+    -------
+    list[RemoteOp]
+        The same operations, in the same order, with ``q0_phys`` and ``q1_phys``
+        replaced by their post-routing positions. Every other field, including
+        the global instruction ``index``, is unchanged.
+
+    Raises
+    ------
+    ValueError
+        If a routed program is missing, or a remote operation's marker barrier
+        cannot be found -- which would mean the routed programs and the manifest
+        no longer describe the same computation.
+    """
+    if not isinstance(local_routed, Mapping):
+        raise ValueError("local_routed must be a mapping of QPU id to circuit")
+
+    # (ordinal, qpu) -> (routed physical qubits in operand order, barrier position)
+    markers: dict[tuple[int, int], tuple[list[int], int]] = {}
+    for qpu, circuit in local_routed.items():
+        qpu_id = _validate_manifest_int(qpu, label="local circuit QPU id")
+        if not isinstance(circuit, QuantumCircuit):
+            raise ValueError(f"local_routed[{qpu!r}] must be a QuantumCircuit")
+        positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
+        seen_barriers = 0
+        for instruction in circuit.data:
+            if not getattr(instruction.operation, "_directive", False):
+                continue
+            position = seen_barriers
+            seen_barriers += 1
+            ordinal = _remote_barrier_ordinal(instruction.operation)
+            if ordinal is None:
+                continue
+            key = (ordinal, qpu_id)
+            if key in markers:
+                raise ValueError(
+                    f"remote operation {ordinal} is marked twice on QPU {qpu_id}"
+                )
+            markers[key] = (
+                [positions[qubit] for qubit in instruction.qubits],
+                position,
+            )
+
+    out: list[RemoteOp] = []
+    for ordinal, op in enumerate(remote_ops):
+        if not isinstance(op, RemoteOp):
+            raise ValueError(f"remote_ops[{ordinal}] must be a RemoteOp")
+        # The marker's leading qubit is the operation's operand on that QPU:
+        # split_into_qpus emits the barrier over that QPU's operands in operand
+        # order, and both q0_phys and q1_phys are the first such operand.
+        qubit0, marker0 = _routed_marker(markers, ordinal, op.qpu0)
+        qubit1, marker1 = _routed_marker(markers, ordinal, op.qpu1)
+        out.append(
+            RemoteOp(
+                name=op.name,
+                q0_phys=qubit0,
+                q1_phys=qubit1,
+                qpu0=op.qpu0,
+                qpu1=op.qpu1,
+                params=op.params,
+                clbits=op.clbits,
+                index=op.index,
+                qpu0_marker=marker0,
+                qpu1_marker=marker1,
+            )
+        )
+    return out
+
+
+def _routed_marker(
+    markers: Mapping[tuple[int, int], tuple[list[int], int]], ordinal: int, qpu: int
+) -> tuple[int, int]:
+    """Return the routed qubit and barrier position for one side of an operation."""
+    entry = markers.get((ordinal, qpu))
+    if entry is None or not entry[0]:
+        raise ValueError(
+            f"routed program for QPU {qpu} has no marker for remote operation "
+            f"{ordinal}; the manifest and the routed circuits are out of step"
+        )
+    qubits, position = entry
+    return qubits[0], position
+
+
+def reassemble_distributed_program(
+    mapped: QuantumCircuit,
+    local_routed: Mapping[int, QuantumCircuit],
+    remote_ops: Sequence[RemoteOp],
+    arch: MultiQPUArchitecture,
+    *,
+    restore_layout: bool = True,
+) -> QuantumCircuit:
+    """Merge per-QPU programs and a remote-op manifest back into one circuit.
+
+    This is the inverse of :func:`split_into_qpus` and the check that the pieces
+    a distributed compile emits still describe the circuit they came from. The
+    reassembled circuit is not meant to be executed -- the whole point of
+    distributed compilation is that these programs run on separate devices --
+    but it is directly comparable with the mapped circuit, which is what
+    :func:`quport.protocol.verify_distributed_program` does with it.
+
+    Ordering
+    --------
+    A distributed program is a **partial** order, not a linear one. Within a QPU
+    the constraint is per *qubit*: two instructions touching disjoint qubits may
+    run in either order, and routing routinely emits them in an order that
+    differs from the manifest's. Merging therefore follows qubit dataflow --
+    an instruction runs once it is first in line on every qubit it touches --
+    and a remote operation runs once its marker leads on both sides.
+
+    That is also the contract a consumer of the artifacts has to honour: reading
+    each program strictly linearly can deadlock, because two QPUs can list the
+    same pair of remote operations in opposite orders when they sit on disjoint
+    qubits.
+
+    Parameters
+    ----------
+    mapped:
+        The circuit the programs were split from. Only its width and the
+        operations named by ``remote_ops[k].index`` are used, which is how
+        parameters and custom gates survive the round trip exactly.
+    local_routed:
+        Per-QPU programs, routed or not. Both are accepted; an unrouted program
+        simply has an identity layout.
+    remote_ops:
+        The manifest matching ``local_routed``. Pass
+        :attr:`~quport.compiler.DistributedCompileResult.routed_remote_ops` for
+        routed programs and ``program.remote_ops`` for unrouted ones.
+    restore_layout:
+        Append the swaps that undo each QPU's routing permutation, so the result
+        ends in the mapped circuit's qubit labelling. Without this the output is
+        correct only up to that permutation.
+
+    Raises
+    ------
+    ValueError
+        If a marker is missing, or if the programs impose contradictory orders
+        on the remote operations -- a genuine inconsistency rather than a
+        scheduling choice.
+    """
+    if not isinstance(mapped, QuantumCircuit):
+        raise ValueError("mapped must be a QuantumCircuit")
+    if not isinstance(local_routed, Mapping):
+        raise ValueError("local_routed must be a mapping of QPU id to circuit")
+    if not isinstance(arch, MultiQPUArchitecture):
+        raise ValueError("arch must be a MultiQPUArchitecture")
+
+    width = max(arch.n_phys, len(mapped.qubits))
+    out = QuantumCircuit(QuantumRegister(width, "q"))
+    # Carry the classical side across, so measurements and conditioned
+    # operations land on the bits they named in the circuit that was split.
+    if mapped.clbits:
+        out.add_bits(mapped.clbits)
+    for creg in mapped.cregs:
+        out.add_register(creg)
+    clbit_at = {clbit: index for index, clbit in enumerate(mapped.clbits)}
+
+    qpus = sorted(local_routed)
+    data: dict[int, list[Any]] = {}
+    index_of: dict[int, dict[Any, int]] = {}
+    queues: dict[int, dict[int, deque[int]]] = {}
+    retired: dict[int, list[bool]] = {}
+    marker_at: dict[tuple[int, int], int] = {}
+    marker_qubits: dict[tuple[int, int], list[int]] = {}
+    mapped_at = {qubit: index for index, qubit in enumerate(mapped.qubits)}
+
+    def carried_clbits(instruction: Any) -> list[Any]:
+        """Map an instruction's classical arguments onto the merged circuit."""
+        if not instruction.clbits:
+            return []
+        try:
+            return [out.clbits[clbit_at[clbit]] for clbit in instruction.clbits]
+        except KeyError:  # pragma: no cover - defensive
+            raise ValueError(
+                "a per-QPU program uses classical bits the mapped circuit "
+                "does not have"
+            ) from None
+
+    for qpu in qpus:
+        circuit = local_routed[qpu]
+        if not isinstance(circuit, QuantumCircuit):
+            raise ValueError(f"local_routed[{qpu!r}] must be a QuantumCircuit")
+        instructions = list(circuit.data)
+        positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
+        per_qubit: dict[int, deque[int]] = {}
+        for index, instruction in enumerate(instructions):
+            ordinal = _remote_barrier_ordinal(instruction.operation)
+            if ordinal is not None:
+                marker_at[(ordinal, qpu)] = index
+                marker_qubits[(ordinal, qpu)] = [
+                    positions[qubit] for qubit in instruction.qubits
+                ]
+            for qubit in instruction.qubits:
+                per_qubit.setdefault(positions[qubit], deque()).append(index)
+        data[qpu] = instructions
+        index_of[qpu] = positions
+        queues[qpu] = per_qubit
+        retired[qpu] = [False] * len(instructions)
+
+    def leads(qpu: int, index: int) -> bool:
+        """True when this instruction is first in line on every qubit it uses."""
+        return all(
+            queues[qpu][index_of[qpu][qubit]][0] == index
+            for qubit in data[qpu][index].qubits
+        )
+
+    def retire(qpu: int, index: int) -> None:
+        retired[qpu][index] = True
+        for qubit in data[qpu][index].qubits:
+            queues[qpu][index_of[qpu][qubit]].popleft()
+
+    remaining = {qpu: sum(1 for inst in data[qpu] if inst.qubits) for qpu in qpus}
+    pending = set(range(len(remote_ops)))
+
+    while any(remaining.values()) or pending:
+        progressed = False
+
+        for qpu in qpus:
+            for index, instruction in enumerate(data[qpu]):
+                if retired[qpu][index] or not instruction.qubits:
+                    continue
+                if _remote_barrier_ordinal(instruction.operation) is not None:
+                    continue
+                if not leads(qpu, index):
+                    continue
+                if not getattr(instruction.operation, "_directive", False):
+                    out.append(
+                        instruction.operation,
+                        [out.qubits[index_of[qpu][q]] for q in instruction.qubits],
+                        carried_clbits(instruction),
+                    )
+                retire(qpu, index)
+                remaining[qpu] -= 1
+                progressed = True
+
+        for ordinal in sorted(pending):
+            op = remote_ops[ordinal]
+            source = mapped.data[op.index]
+            # An operation is charged to the QPUs its own operands sit on, which
+            # is the set `split_into_qpus` emitted markers for. Reading it from
+            # the operation rather than from the manifest's two endpoints is what
+            # lets an operation on three or more qubits be rebuilt at all.
+            source_qpus = [
+                arch.qpu_of_phys(mapped_at[qubit]) for qubit in source.qubits
+            ]
+            sides: list[tuple[int, int]] = []
+            for qpu in dict.fromkeys(source_qpus):
+                marker = marker_at.get((ordinal, qpu))
+                if marker is None:
+                    raise ValueError(
+                        f"program for QPU {qpu} has no marker for remote "
+                        f"operation {ordinal}"
+                    )
+                sides.append((qpu, marker))
+            if any(
+                retired[qpu][marker] or not leads(qpu, marker) for qpu, marker in sides
+            ):
+                continue
+            operands = _remote_operands(ordinal, op, source_qpus, marker_qubits)
+            out.append(
+                source.operation,
+                [out.qubits[operand] for operand in operands],
+                carried_clbits(source),
+            )
+            for qpu, marker in sides:
+                retire(qpu, marker)
+                remaining[qpu] -= 1
+            pending.discard(ordinal)
+            progressed = True
+
+        if not progressed:
+            raise ValueError(
+                "per-QPU programs impose contradictory orders on their remote "
+                "operations; the programs and the manifest are out of step"
+            )
+
+    if restore_layout:
+        _append_layout_restoration(out, local_routed, arch, width)
+    return out
+
+
+def _remote_operands(
+    ordinal: int,
+    op: RemoteOp,
+    source_qpus: Sequence[int],
+    marker_qubits: Mapping[tuple[int, int], list[int]],
+) -> list[int]:
+    """Rebuild a remote operation's operands from the markers that name them.
+
+    :func:`split_into_qpus` emits one marker per participating QPU, over that
+    QPU's operands in operand order. Walking the operation's operand-to-QPU
+    sequence and taking each QPU's marked qubits in turn therefore recovers the
+    whole operand list -- including the third and later operands of a wide
+    operation, which the two-endpoint manifest does not name.
+
+    The markers are also the only record of where routing left each operand, so
+    the manifest's own endpoints are checked against them: a manifest paired
+    with programs it was not written for names the wrong qubits, and that is a
+    mistake worth reporting rather than merging.
+    """
+    cursors: dict[int, int] = {}
+    operands: list[int] = []
+    for qpu in source_qpus:
+        marked = marker_qubits[(ordinal, qpu)]
+        cursor = cursors.get(qpu, 0)
+        if cursor >= len(marked):
+            raise ValueError(
+                f"the marker for remote operation {ordinal} on QPU {qpu} names "
+                f"{len(marked)} qubits, fewer than the operation uses there"
+            )
+        cursors[qpu] = cursor + 1
+        operands.append(marked[cursor])
+
+    for qpu, used in cursors.items():
+        marked = marker_qubits[(ordinal, qpu)]
+        # A marker names the operation's operands on that QPU, and may name one
+        # more after them: the shared qubit that orders it against the QPU's
+        # other markers, which is what keeps routing from reordering them.
+        # Anything beyond that does not describe this operation.
+        if len(marked) > used + 1:
+            raise ValueError(
+                f"the marker for remote operation {ordinal} on QPU {qpu} names "
+                f"{len(marked)} qubits, more than the operation uses there"
+            )
+
+    leading: dict[int, int] = {}
+    for position, qpu in enumerate(source_qpus):
+        leading.setdefault(qpu, operands[position])
+    for named_qpu, named_qubit, field in (
+        (op.qpu0, op.q0_phys, "q0_phys"),
+        (op.qpu1, op.q1_phys, "q1_phys"),
+    ):
+        marked_qubit = leading.get(named_qpu)
+        if marked_qubit != named_qubit:
+            raise ValueError(
+                f"remote operation {ordinal} names {field}={named_qubit} on QPU "
+                f"{named_qpu}, but the programs put that operand on "
+                f"{marked_qubit}; the manifest does not match these programs"
+            )
+
+    return operands
+
+
+def _append_layout_restoration(
+    circuit: QuantumCircuit,
+    local_routed: Mapping[int, QuantumCircuit],
+    arch: MultiQPUArchitecture,
+    width: int,
+) -> None:
+    """Append swaps undoing each QPU's routing permutation.
+
+    ``final_index_layout()`` reads "input qubit ``i`` ended at position
+    ``final[i]``". Undoing it needs the inverse, so the mapping is turned around
+    before selection-sorting the qubits back into place.
+    """
+    final = list(range(width))
+    for qpu, routed in local_routed.items():
+        layout = getattr(routed, "layout", None)
+        if layout is None:
+            continue
+        try:
+            positions = layout.final_index_layout(filter_ancillas=False)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            # A program that did not come from the transpiler can still carry a
+            # layout: a circuit read back from physical-qubit OpenQASM gets one
+            # built from loose qubits, which Qiskit's own accessor cannot
+            # resolve. Such a layout records no routing permutation -- the file
+            # never held one -- so there is nothing to undo, and it is treated
+            # exactly like the missing layout of an unrouted program.
+            continue
+        block = arch.block_of_qpu(qpu)
+        for phys in block.compute + block.comm:
+            if phys < width and phys < len(positions):
+                final[phys] = positions[phys]
+
+    holder = [0] * width
+    for source, destination in enumerate(final):
+        holder[destination] = source
+    for target in range(width):
+        source = holder.index(target)
+        if source != target:
+            circuit.swap(target, source)
+            holder[target], holder[source] = holder[source], holder[target]
+
+
 def _group_qubits_by_qpu_in_operand_order(
     qubits: list[int], qpus: list[int]
 ) -> tuple[tuple[int, ...], dict[int, list[int]]]:
@@ -352,6 +809,43 @@ def split_into_qpus(
         local[q] = _new_local_circuit(mapped, arch.n_phys)
 
     remote_ops: list[RemoteOp] = []
+    # Barriers emitted per QPU so far.  A remote operation records where its own
+    # marker sits in this sequence, because an emitted QASM program carries no
+    # labels and a routed program may list its barriers in a different order.
+    barriers_emitted = [0] * n_qpus
+
+    def emit_marker(qpu: int, operands: Sequence[int], label: str) -> None:
+        """Mark a remote operation on ``qpu``, ordered against its other markers.
+
+        A marker naming only the operation's own operand does not order itself
+        against the QPU's *other* remote operations, so local routing is free to
+        emit two of them in the opposite order -- and the local gates it then
+        interleaves can tie those markers together in that order, leaving the
+        per-QPU programs demanding an execution no schedule satisfies. Remote
+        operations are synchronization points with other QPUs, so their program
+        order is not the transpiler's to choose.
+
+        Each marker therefore also names the qubit the QPU's previous marker
+        sat on, which puts an edge between the two in the local DAG and, by
+        transitivity, keeps every marker on this QPU in program order. Naming
+        one extra qubit is the smallest constraint that does so; a marker over
+        the whole block would order the QPU's local gates against every remote
+        operation as well.
+
+        The operation's own operands come first, in operand order, so a reader
+        recovers them by position; the ordering qubit follows them.
+        """
+        marked = list(operands)
+        previous = last_marker_qubit[qpu]
+        if previous is not None and previous not in marked:
+            marked.append(previous)
+        local[qpu].barrier(*marked, label=label)
+        barriers_emitted[qpu] += 1
+        last_marker_qubit[qpu] = operands[0]
+
+    # The qubit each QPU's most recent remote marker sat on, threaded through
+    # the next one so the local DAG keeps them in order.
+    last_marker_qubit: list[int | None] = [None] * n_qpus
 
     qindex = {q: i for i, q in enumerate(mapped.qubits)}
     cindex = {c: i for i, c in enumerate(mapped.clbits)}
@@ -365,6 +859,7 @@ def split_into_qpus(
             if op.name == "barrier":
                 for qpu in range(n_qpus):
                     local[qpu].barrier()
+                    barriers_emitted[qpu] += 1
             else:
                 for qpu in range(n_qpus):
                     local[qpu].append(
@@ -380,6 +875,7 @@ def split_into_qpus(
             )
             for qpu in qpu_order:
                 local[qpu].barrier(*qpu_qubits_barrier[qpu])
+                barriers_emitted[qpu] += 1
             continue
 
         if len(qs) == 1:
@@ -410,11 +906,17 @@ def split_into_qpus(
                         params=tuple(getattr(op, "params", [])),
                         clbits=tuple(cargs_idx),
                         index=idx,
+                        qpu0_marker=barriers_emitted[qpu0],
+                        qpu1_marker=barriers_emitted[qpu1],
                     )
                 )
-                # add barriers to mark synchronization points
-                local[qpu0].barrier(q0)
-                local[qpu1].barrier(q1)
+                # Barriers mark the synchronization points.  They carry a
+                # label naming the remote op so that the qubit each one lands
+                # on can be recovered after local routing has permuted things;
+                # see `remap_remote_ops_to_routed`.
+                label = remote_barrier_label(len(remote_ops) - 1)
+                emit_marker(qpu0, (q0,), label)
+                emit_marker(qpu1, (q1,), label)
 
         else:
             # multi-qubit ops shouldn't appear if you translated to max_operands=2; keep safe.
@@ -453,9 +955,12 @@ def split_into_qpus(
                         params=tuple(getattr(op, "params", [])),
                         clbits=tuple(cargs_idx),
                         index=idx,
+                        qpu0_marker=barriers_emitted[qpu0],
+                        qpu1_marker=barriers_emitted[qpu1],
                     )
                 )
+                label = remote_barrier_label(len(remote_ops) - 1)
                 for qpu in qpu_order:
-                    local[qpu].barrier(*qpu_qubits[qpu])
+                    emit_marker(qpu, qpu_qubits[qpu], label)
 
     return DistributedProgram(local_circuits=local, remote_ops=remote_ops)

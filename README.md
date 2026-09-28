@@ -13,6 +13,7 @@ QuPort is a research software framework developed in Python using the Qiskit too
 [![Qiskit Ecosystem](https://qisk.it/e-390ee704)](https://qisk.it/e)
 [![Current Release](https://img.shields.io/github/release/neuralsorcerer/quport.svg)](https://github.com/neuralsorcerer/quport/releases)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-fcbc2c.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![Qiskit](https://img.shields.io/badge/Qiskit-2.0%2B-purple?logo=qiskit&logoColor=white)](https://www.ibm.com/quantum/qiskit/)
 [![Test Linux](https://github.com/neuralsorcerer/quport/actions/workflows/ubuntu.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/ubuntu.yml?query=branch%3Amain)
 [![Test Windows](https://github.com/neuralsorcerer/quport/actions/workflows/windows.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/windows.yml?query=branch%3Amain)
 [![Test MacOS](https://github.com/neuralsorcerer/quport/actions/workflows/macos.yml/badge.svg)](https://github.com/neuralsorcerer/quport/actions/workflows/macos.yml?query=branch%3Amain)
@@ -62,13 +63,22 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Directed Qiskit coupling maps where every undirected physical link is represented by two directed Qiskit edges.
 - Logical interaction-graph extraction from arbitrary two-qubit circuit instructions.
 - Optional temporal interaction weights that emphasize earlier two-qubit gates.
-- Capacity-constrained partitioning baselines and topology-aware partitioning.
+- Capacity-constrained partitioning baselines, topology-aware partitioning, and e-bit-aware partitioning.
+- Exact capacity-constrained partitioning by branch and bound, for both the cut and the e-bit objective, so a heuristic's result can be read against a proved optimum.
+- Time-varying qubit placement: per-window assignments with teleport-priced migration, costed in the same e-bit model and reducing exactly to static placement when nothing moves.
+- Computational-basis diagonality analysis that decides which gates one cat-entanglement can serve.
+- Distributable-packet extraction and the hypergraph $\lambda-1$ e-bit metric.
+- Communication aggregation of cross-QPU gates into cat-entanglement and teleport blocks under a comm-port budget.
+- Executable cat-entangler/cat-disentangler circuit emission, in a unitary form and a mid-circuit-measurement form with classical feedforward.
+- State-vector verification that an emitted communication plan reproduces the circuit it came from.
 - Communication-port placement hints for boundary-heavy and neighbor-diverse logical qubits.
 - Global transpilation with configurable basis gates, layout method, routing method, optimization level, and seed.
 - Distributed compilation into per-QPU OpenQASM 3 programs, remote-operation JSON, and schedule JSON.
 - Schedule estimation under QPU-port, link-capacity, network-hop, switch-pair, and switch-reconfiguration constraints.
-- Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, and makespan.
-- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, splitting, and distributed compilation.
+- Event-driven, resource-constrained entanglement scheduling with per-port hold times, per-link channels, hop-scaled EPR distribution, and a heralded-success retry model.
+- Independent auditing of both finished schedules -- re-deriving the topology plan's layer and round intervals, port and link usage, and summary aggregates from the outside, and checking the entanglement schedule against the resource and monotonicity theorems its outputs must satisfy -- so a shipped manifest is a checked claim rather than a stated one.
+- Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, EPR pairs, and makespan.
+- CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, migration analysis, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
 
 ---
@@ -292,7 +302,7 @@ $$
 
 ## Partitioning strategies
 
-QuPort supports four main partitioning strategies.
+QuPort supports five main partitioning strategies.
 
 ### `cluster`: heavy-edge clustering
 
@@ -390,6 +400,406 @@ QuPort result was produced with.
 Together with the interaction-weight difference described above, this is the second
 reason a `tpccap` versus `tpccap_sa` comparison has to state its configuration: the
 two strategies can otherwise be ranked on different scales.
+
+### `ebit`: e-bit-aware partitioning
+
+`ebit` runs the same search as `tpccap_sa` but measures communication in EPR pairs
+rather than cut gates, because one cat-entanglement can serve many gates. It is
+described in full under
+[the entanglement model](#entanglement-model-packets-e-bits-and-communication-aggregation),
+which first has to establish what a distributable packet is.
+
+---
+
+## Entanglement model: packets, e-bits, and communication aggregation
+
+Every strategy above minimizes some form of *cut weight*: the number, or weighted
+number, of two-qubit gates whose operands land on different QPUs. On a machine that
+implements remote gates with cat-entanglement, that is the wrong quantity to
+minimize, and this section describes the model QuPort uses instead.
+
+### The cat-entanglement protocol and its correctness condition
+
+A remote two-qubit gate is not executed by moving state between QPUs. The standard
+construction distributes one EPR pair and builds a *cat copy* of a root qubit:
+
+1. Distribute an EPR pair with half $a$ on QPU $A$ (which holds the root qubit $c$)
+   and half $b$ on QPU $B$.
+2. On $A$: apply $\mathrm{CX}(c\rightarrow a)$, measure $a$ in the $Z$ basis, send
+   the outcome to $B$, which applies a conditional $X$. The joint state becomes
+
+$$
+\sum_z\alpha_z\lvert z\rangle_c\lvert z\rangle_b\otimes\lvert\psi_z\rangle,
+$$
+
+   so $b$ now carries the computational-basis label of $c$.
+3. Run **every** gate that uses $c$ only through that label as a local gate on $B$,
+   against $b$.
+4. Cat-disentangler: measure $b$ in the $X$ basis, send the outcome back, and apply
+   a conditional $Z$ to $c$.
+
+Step 3 is correct exactly when every operation applied to $c$ while the copy is live
+commutes with $Z_c$. Such an operation maps
+$\lvert z\rangle_c\otimes\lvert\psi\rangle$ to
+$\lvert z\rangle_c\otimes U_z\lvert\psi\rangle$, so the $c$/$b$ correspondence
+survives and the disentangler restores $c$ exactly. An $X$, $H$, $\sqrt{X}$, or a
+$\mathrm{CX}$ that uses $c$ as its *target* breaks it, and the copy must be released
+first.
+
+`quport.entanglement.diagonal_positions` answers, for one operation, which operand
+positions commute with $Z$. It derives them from three rules, in order: an explicit
+table for gates such as `rzz` and `rzx`; `ControlledGate` structure, where every
+control operand is diagonal regardless of `ctrl_state` and every operand that is
+diagonal for the base gate stays diagonal once controlled; and a table of diagonal
+single-qubit gates. Anything else is reported as non-diagonal on every operand.
+Under-reporting only costs extra EPR pairs, so the conservative default is the safe
+one; `tests/test_entanglement.py` checks every claim against the actual unitary of
+every constructible gate in Qiskit's standard library.
+
+### Distributable packets and the $\lambda-1$ metric
+
+A **distributable packet** rooted at qubit $c$ is a maximal run of gates over which
+$c$ stays diagonal. Because diagonality is a property of the gate sequence alone,
+packets are independent of where qubits are placed: they are built once per circuit
+and re-evaluated for each candidate partition in time linear in the number of
+packet incidences, which is what makes them cheap enough for the annealing loop.
+
+Let $\mathcal{P}$ be the packets of a circuit, $\mathrm{root}(P)$ the root of packet
+$P$, and $\mathrm{partners}(P)$ the other operand of each of its gates. The number of
+EPR pairs a cat-entanglement compiler consumes under partition $\pi$ is the
+connectivity-minus-one ($\lambda-1$) metric of hypergraph partitioning:
+
+$$
+E(\pi)=\sum_{P\in\mathcal{P}}
+\Bigl\lvert\;\{\pi(t):t\in\mathrm{partners}(P)\}\setminus\{\pi(\mathrm{root}(P))\}\;\Bigr\rvert .
+$$
+
+One e-bit per packet per *distinct remote QPU*, not one per cut gate. Ten gates from
+one control into one QPU cost ten units of cut weight and one e-bit.
+
+Two kinds of gate cannot be served by a single cat copy: two-qubit gates with no
+diagonal operand (`swap`, `iswap`, `ecr`, `rxx`), and operations on three or more
+qubits, which a bipartite copy cannot bring together. A gate of either kind spanning
+$k$ QPUs is charged $2(k-1)$ e-bits, the cost of teleporting every foreign operand to
+one host and back, which is also the standard cost of an arbitrary non-local
+two-qubit unitary.
+
+Because each gate is charged to exactly one root, $E(\pi)$ is exact for the chosen
+root assignment and an upper bound over all assignments. Gates whose *both* operands
+are diagonal (`cz`, `cp`, `crz`, `rzz`) admit a choice; the default `"greedy"` policy
+reuses an operand that already roots an open packet and falls back to the lower qubit
+index.
+
+### `ebit`: e-bit-aware partitioning
+
+The `ebit` strategy runs the same TPCCAP plus simulated-annealing search as
+`tpccap_sa`, but replaces the weighted-cut-distance term with hop-scaled e-bit
+demand:
+
+$$
+J_{\mathrm{ebit}}(\pi)=
+w_{\mathrm{ebit}}\sum_{P\in\mathcal{P}}\;\sum_{q\in R(P,\pi)}d(\pi(\mathrm{root}(P)),q)
++w_{\mathrm{port}}\sum_q\max(0,B_q-P)^2
++w_{\mathrm{cong}}L_2,
+$$
+
+where $R(P,\pi)$ is the set of distinct remote QPUs packet $P$ touches. On an
+all-to-all fabric every distance is $1$ and the first term is exactly $E(\pi)$.
+
+`w_ebit` defaults to $0$ on `tpccap_partition` and `tpccap_sa_partition`, so every
+pre-existing objective and every published number is unchanged. Passing `packets`
+with `w_ebit=0` populates the `ebits` and `weighted_ebit_distance` diagnostics
+without steering the search.
+
+#### Rescaling the rest of the objective
+
+Replacing the volume term is not a local change: $w_{\mathrm{port}}$ and
+$w_{\mathrm{cong}}$ were tuned against a term that counts *every cut gate*, and an
+e-bit count is smaller by the aggregation factor. Left as they were, the penalties
+stop biasing the objective and become it.
+
+The `ebit` strategy therefore sets $w_{\mathrm{port}}=0$. Beyond the scale, the
+penalty measures the wrong resource: what a cat-entanglement compiler needs a port
+for is a *live cat copy*, not every boundary qubit, and port pressure is already
+priced downstream, because `aggregate_remote_operations` converts a shortage into
+evictions and fresh EPR pairs. Congestion is kept but routed from EPR demand rather
+than gate demand, via `congestion_source="ebits"`, so it describes the same traffic
+the volume term prices; the e-bit traffic matrix is filled by the same sweep that
+computes the cost, so the two cannot disagree. Both stages use the same congestion
+weight, since the default $4\times$ annealing asymmetry was also tuned for the
+gate-traffic scale.
+
+Over 36 configurations -- 9 to 20 logical qubits on 3 to 5 QPUs, across `ring`,
+`switch` and `mesh` interconnects, six random circuits each -- this takes the EPR
+pairs actually spent from $28.3$ to $21.4$, port evictions from $2.72$ to $2.06$,
+and the entanglement-aware makespan from $5073$ to $4237$, with peak link busy time
+essentially unchanged ($2378$ to $2406$). Fewer pairs *and* fewer evictions:
+minimising e-bits concentrates traffic into fewer, longer-lived cat copies, which
+need fewer simultaneous ports than the many short copies a boundary-minimising
+partition scatters around — the e-bit objective was already a better proxy for port
+pressure than the penalty meant to model it. `congestion_source` defaults to
+`"gates"`, so no other strategy moves.
+
+### Communication aggregation under a port budget
+
+$E(\pi)$ assumes ports are free. `quport.aggregation.aggregate_remote_operations`
+answers the same question on a real mapped circuit, where they are not: a QPU with
+$P$ comm ports can host at most $P$ cat copies at once, and starting a new block also
+needs a free port on the root's QPU to run the entangler. When a port is needed and
+none is free, the least recently used copy is released, and a fresh EPR pair is spent
+if that root is needed again. The plan records those `evictions`.
+
+The two computations are independent implementations of the same quantity, and with
+an unbounded port budget they agree exactly whenever each cross-QPU gate's root is
+forced -- that is, whenever exactly one operand is diagonal, as it is for every $CX$,
+and so for every circuit compiled into QuPort's default basis.
+`tests/test_aggregation.py::test_unbounded_ports_match_hypergraph_ebits` pins that
+down over compiled random circuits.
+
+Symmetric gates ($CZ$, $CP$, $CRZ$, $R_{ZZ}$) leave the root free, and there the two
+part company by construction. Packets are built without knowing the placement, so
+`build_distributable_packets` chooses a root from the gate sequence alone, while
+`aggregate_remote_operations` knows every operand's QPU and prefers a root whose cat
+copy already reaches the partner's. Both are deterministic upper bounds on the same
+optimum, and on a circuit built from symmetric gates either can come out the lower of
+the two.
+
+### Entanglement-aware scheduling
+
+`estimate_entanglement_schedule` schedules the aggregated plan as a
+resource-constrained system rather than a sequence of DAG layers. The layered and
+topology-aware estimators charge each layer its slowest operation, which imposes a
+global barrier between layers and charges one entanglement transaction per cross-QPU
+gate. The entanglement-aware estimator instead runs an as-soon-as-possible list
+schedule in program order against:
+
+- one timeline per physical qubit, so QPUs that share no qubits drift apart freely;
+- a pool of `comm_qubits_per_qpu` ports per QPU, each held for a whole block;
+- `link_capacity` channels on every link along the routed path;
+- hop-scaled, probabilistic distribution
+  $\tau_{\mathrm{EPR}}(h)=h\cdot\tau_{\mathrm{EPR}}/p_{\mathrm{success}}$, since
+  heralded entanglement needs $1/p$ attempts in expectation.
+
+A block costs $\tau_{\mathrm{EPR}}(h)+\tau_{\mathrm{RTT}}^{\mathrm{eff}}+\tau_{\mathrm{remote\_gate}}$
+to establish and $\tau_{\mathrm{RTT}}^{\mathrm{eff}}$ to disentangle; a teleport block
+pays a second distribution for the return trip. Gates inside a block cost ordinary
+local two-qubit time.
+
+### Proving the split itself
+
+Aggregation and the protocol expansion answer "is the entanglement right?". The
+question underneath them is whether distributed compilation preserves the
+circuit at all: the per-QPU programs and the remote-operation manifest, taken
+together, have to *be* the circuit they were split from.
+
+`reassemble_distributed_program` merges them back under the dataflow rule above
+and undoes each QPU's routing permutation, and `verify_distributed_program`
+compares the result against the mapped circuit on a pseudo-random product input.
+The suite runs this across every intra-QPU topology and optimization level, so it
+covers the routing permutation and the manifest remapping as well as the split.
+
+This is the inverse of `split_into_qpus`, and it is a verification tool rather
+than a runtime -- the point of distributed compilation is that these programs run
+on separate devices.
+
+Both verifiers compare state vectors, so they speak about the state a circuit
+prepares. Measurements that come last are dropped, since they read that state out
+without changing it; a measurement or reset that later operations depend on
+genuinely changes what the circuit computes and is refused rather than quietly
+ignored.
+
+### From plan to circuit, and proving it
+
+A communication plan is only worth as much as the protocol it stands for, so
+QuPort emits that protocol. `build_telegate_circuit` expands every block into the
+gadget it represents. For a block with root $c$ on QPU $A$, cat copy on QPU $B$,
+and EPR halves $a$ and $b$:
+
+```
+entangler:     h(a); cx(a, b); cx(c, a); cx(a, b)
+block gates:   every gate of the block, with c replaced by b
+disentangler:  h(b); cz(b, c)
+```
+
+This is the deferred-measurement form: `measure a` with `if m: x(b)` becomes
+`cx(a, b)`, and an X-basis measurement of $b$ with `if m: z(c)` becomes
+`h(b); cz(b, c)`. Writing it unitarily is what makes it checkable. Tracing the
+algebra through, the entangler leaves
+
+$$
+|\psi\rangle_c|0\rangle_a|0\rangle_b\;\longrightarrow\;
+\Bigl(\sum_z\alpha_z|z\rangle_c|z\rangle_b\Bigr)\otimes|+\rangle_a,
+$$
+
+so $a$ factors out and $b$ carries $c$'s computational-basis label; the
+disentangler returns $b$ to $|+\rangle$ with $c$ holding the result. Both
+ancillas end in a known product state regardless of the data, so an `h` restores
+them to $|0\rangle$ and the next block reuses them — the emitted width tracks
+concurrent cat copies, not block count. Passing `coherent=False` emits the real
+thing instead: mid-circuit measurement, `if` feedforward, and `reset`, which
+exports to OpenQASM 3 and runs on hardware that supports dynamic circuits.
+
+`verify_telegate_equivalence` then runs the unitary form on a pseudo-random
+product input, traces the ancillas out, and compares the reduced state of the
+data qubits against the mapped circuit. Unit fidelity certifies both halves of
+the claim at once: the data are right, **and** the ancillas came back
+unentangled — residual entanglement would show up as a mixed reduced state.
+
+That check is what makes the diagonality rule a tested property rather than a
+stated assumption. Feeding in a hand-built plan that keeps a cat copy live
+across an `X` on its root — precisely what `aggregate_remote_operations` refuses
+to emit — sends the fidelity to zero, not merely down a little
+(`tests/test_protocol.py::test_verification_fails_when_a_block_spans_a_non_diagonal_root_gate`).
+
+### Measured effect
+
+Reproduce with `n_qpus=4`, `compute_qubits_per_qpu=4`, `comm_qubits_per_qpu=2`,
+`inter_topology="switch"`, `optimization_level=0`, comparing
+`aggregation.epr_pairs` against `aggregation.baseline_epr_pairs`. QFT here is the
+controlled-phase ladder without the terminating swaps, and GHZ is one `h` followed
+by a `cx` fan-out, as built in `tests/test_protocol.py`:
+
+| Circuit | Cross-QPU gates | EPR pairs, per gate | EPR pairs, aggregated | Saved |
+|---|---|---|---|---|
+| 16-qubit QFT, `strategy="ebit"`, `seed=0` | $168$ | $168$ | $69$ | $58.9\%$ |
+| 16-qubit GHZ fan-out, `strategy="ebit"`, `seed=0` | $10$ | $10$ | $2$ | $80.0\%$ |
+| 16-qubit random depth-20, `strategy="tpccap_sa"`, seeds $0..9$ | $990$ | $990$ | $639$ | $35.5\%$ |
+
+The cross-QPU gate count moves with the partition, so the `ebit` rows also record
+the rescaling described above: under the previous penalty weights the same two
+circuits cut $190$ gates to $88$ pairs and $10$ to $3$.
+
+Structured circuits benefit most, because a control that only ever picks up $R_z$
+rotations keeps its packet open across the whole ladder. Random circuits benefit
+less: translating to the default basis puts `sx` and `x` gates on most qubits, and
+each of those closes a packet.
+
+### Letting qubits move between QPUs
+
+Every partitioner above places a logical qubit on one QPU for the whole circuit,
+and that is a real restriction rather than an implementation detail. A qubit that
+interacts with one neighbourhood early and a different one late pays for the
+mismatch on every gate of whichever half it is stranded in. A machine that can
+teleport a qubit between QPUs can move it once instead, for a single EPR pair.
+
+`quport.temporal` prices that trade-off in the same accounting: cut the
+instruction stream into contiguous **windows**, give each window its own
+assignment, and charge a teleport for every qubit whose QPU changes between
+neighbouring windows.
+
+$$
+J_{\mathrm{temporal}}(\pi_1,\dots,\pi_W)=
+\underbrace{\sum_{P\in\mathcal{P}}\;\sum_{e\in\mathrm{epochs}(P)}
+\bigl|\{\pi_{w(g)}(\mathrm{partner}(g)) : g\in e\}
+\setminus\{\pi(\mathrm{root}(P))|_e\}\bigr|}_{\text{cat copies}}
+\;+\;\sum_{q}\sum_{w<W}\;m\cdot[\pi_w(q)\neq\pi_{w+1}(q)]
+$$
+
+A window boundary is not a barrier. A cat copy stays valid as long as its root
+stays put, so the count runs over **root epochs** — maximal runs of a packet's
+gates during which the root's QPU does not change — and within an epoch one e-bit
+is charged per distinct remote QPU the partners occupy *at the time their own
+gates run*. A partner that migrates mid-packet therefore costs a second copy, and
+teleporting the root correctly kills every copy of it.
+
+That makes the generalisation faithful in the strong sense: with one window, or
+with the same assignment in every window, the cost is *identically* $E(\pi)$. A
+saving can only be reported when there is one.
+
+#### The neighbourhood is a run of windows, not one window
+
+A qubit relocated for a single window pays two migrations, in and out, and can
+only earn them back from that one window's traffic. The change that pays is
+usually to move a qubit *once* and leave it for several windows: two migrations
+against the traffic of the whole run. A single-window neighbourhood can only
+reach that through individually worse states, so it never does — on 16-qubit
+instances it found a $6.4\%$ saving where interval moves find $14.7\%$.
+
+Because the neighbourhood includes the *whole-circuit* run, the search also
+improves the static placement, and two different effects then contribute to the
+result. They are reported separately, and the temporal phase is seeded from the
+stationary optimum so that
+$\text{cost} \le \text{stationary} \le \text{seed}$ holds by construction — a
+plan that moved qubits can never lose to one that did not.
+
+Against the `ebit` strategy's partition, on random circuits with 6 seeds each:
+
+| Instance | Better static placement | Migration, on top | Migrations used |
+|---|---|---|---|
+| 9q / 3 QPUs | $7.8\%$ | $12.9\%$ – $15.4\%$ | 1–2 |
+| 12q / 3 QPUs | $6.3\%$ | $7.5\%$ – $11.1\%$ | 1–3 |
+| 16q / 4 QPUs | $4.7\%$ | $3.6\%$ – $10.5\%$ | 2–3 |
+| 20q / 5 QPUs | $3.8\%$ | $5.5\%$ – $9.2\%$ | 3–6 |
+
+The static column is a useful cross-check on its own: it says the `ebit`
+strategy's partition is still $4$–$8\%$ improvable by local search, consistent
+with the $7.7\%$ gap to the proved optimum measured above.
+
+This is an analysis of what time-varying placement is worth. `compile_distributed`
+still emits a single static placement; the windows and their assignments are a
+plan a scheduler could act on, and a number a designer can use to decide whether
+teleport-based migration is worth building.
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json
+```
+
+---
+
+### Calibrating the heuristics against the exact optimum
+
+Everything above is a heuristic, and a heuristic without a reference is a number
+without a scale. `quport.exact` solves the same two partitioning problems exactly,
+by branch and bound, on instances small enough for that to terminate:
+
+```python
+from quport.exact import optimal_partition, partition_gap
+
+best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
+gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
+print(best.objective, best.proved_optimal, best.nodes, f"{gap.relative:.1%}")
+```
+
+Three things keep the tree small, none of them a heuristic shortcut. **Canonical
+form**: both objectives are invariant under relabelling QPUs and the capacity is
+uniform, so only restricted-growth assignments are explored, collapsing $k^n$
+candidates to set partitions of at most $k$ blocks. **Monotone bounds**: each
+incremental cost counts only what an assignment *settles*, so the running total is
+an admissible lower bound and a node reaching the incumbent is cut. **A seeded
+incumbent**, so pruning bites from the first node. `max_nodes` bounds the run;
+exhausting it clears `proved_optimal` rather than passing a guess off as a proof.
+
+The branch and bound is checked against exhaustive enumeration over every feasible
+assignment — 286 cut instances and 125 e-bit instances — which is the only real
+argument that the pruning and the canonical form never silently lose an optimum.
+`partition_gap` then raises rather than reporting a negative gap when a heuristic
+scores *below* a proved optimum, since one of the two implementations would have to
+be wrong; that makes it a cross-check between two independent readings of both
+objectives, run over every shipped strategy in `tests/test_exact.py`.
+
+Over 24 instances — 8 qubits on 2 QPUs, 9 on 3, and 12 on 3 and on 4, six random
+circuits each, all-to-all:
+
+| Strategy | gap vs. optimal e-bits | gap vs. optimal cut |
+|---|---|---|
+| `tpccap` | $55.8\%$ | $40.9\%$ |
+| `cluster` | $46.5\%$ | $26.8\%$ |
+| `tpccap_sa` | $44.3\%$ | $27.4\%$ |
+| `balanced` | $36.6\%$ | $27.3\%$ |
+| `ebit` | $\mathbf{7.7\%}$ | $\mathbf{18.4\%}$ |
+
+This is what found the scaling defect described above. Before the rescaling `ebit`
+sat at $43.5\%$ — *behind plain balanced partitioning at the objective it is named
+for*. The search was never at fault: given the e-bit objective alone, the annealer
+lands within $0.2\%$ of the proved optimum.
+
+The tree is over set partitions, so this terminates on roughly a dozen qubits. It is
+for calibration, not for compiling — measure what a heuristic leaves behind, then
+trust it at scale. From the command line:
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
+```
 
 ---
 
@@ -562,6 +972,27 @@ Those serializers normalize tuple-valued QPU pairs and link-utilization entries 
 JSON-native arrays/objects and validate finite non-negative timings, non-negative
 counts, and non-self QPU/link pairs before emitting a payload.
 
+### Entanglement-aware estimator
+
+`estimate_entanglement_schedule` drops the DAG-layer abstraction entirely. Layers
+impose a global barrier between successive slices and charge one entanglement
+transaction per cross-QPU gate; both are pessimistic. This estimator runs an
+as-soon-as-possible list schedule in program order over the aggregated blocks of
+[the entanglement model](#entanglement-model-packets-e-bits-and-communication-aggregation),
+holding a comm port for a whole block and a link channel for each distribution
+window. It returns:
+
+- `makespan`;
+- `blocks` and `epr_pairs`;
+- `remote_gates` and `unschedulable_gates`;
+- `entanglement_time`, the total link occupancy summed over links;
+- `peak_ports_in_use`, `port_busy_time`, and `qpu_busy_time` per QPU;
+- `link_busy_time` per inter-QPU link.
+
+Because it neither serializes independent QPUs nor pays per gate, its makespan is
+typically well below the topology-aware figure on the same circuit; the two answer
+different questions and should not be mixed inside one comparison.
+
 ---
 
 ## Metrics and cost model
@@ -607,6 +1038,12 @@ The default `LatencyModel` contains:
 | `epr_gen` | $200.0$ | Entanglement-generation component of a remote operation. |
 | `classical_rtt` | $20.0$ | Classical round-trip component. |
 | `remote_gate_overhead` | $50.0$ | Additional remote-gate overhead. |
+| `epr_success_prob` | $1.0$ | Heralded entanglement success probability per attempt, in $(0,1]$. |
+
+`epr_success_prob` is read only by `estimate_entanglement_schedule` and
+`LatencyModel.expected_epr_time`, which scale distribution time by the expected
+attempt count $1/p$. The default of $1.0$ models a deterministic link, so
+`estimate_cost` and every older estimator return exactly the values they always did.
 
 The local component is:
 
@@ -769,6 +1206,54 @@ way to compare candidate topologies before a sweep.
 quport schedule --n-logical 80 --depth 20 --seed 7 --strategy tpccap
 ```
 
+### Report entanglement demand
+
+```bash
+quport ebits --n-logical 80 --depth 20 --seed 7 --out entanglement_plan.json
+```
+
+Prints cross-QPU gate count, EPR pairs with and without aggregation, the saving,
+block count, port evictions, peak cat copies per QPU, the port-unconstrained
+$\lambda-1$ e-bit count, and both makespan figures. `--out` additionally writes the
+full plan, including every block's root, host QPU, protocol, and served gate
+indices.
+
+Two further flags turn the plan into a circuit:
+
+```bash
+quport ebits --n-logical 4 --depth 4 --config small.json --verify --emit-qasm telegate.qasm
+```
+
+`--emit-qasm` writes the executable protocol as OpenQASM 3, with explicit EPR
+pairs, mid-circuit measurement, and `if` feedforward. `--verify` simulates the
+unitary form and confirms it reproduces the mapped circuit; it exits non-zero if
+it does not, and reports a clear error when the architecture has too few comm
+ports for the plan to be runnable at all.
+
+### Score a partition against the exact optimum
+
+```bash
+quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit --out gap.json
+```
+
+Solves the same instance exactly by branch and bound and prints the strategy's
+cost, the optimum, and the gap, under both the cut and the e-bit objective.
+`--max-nodes` bounds the search; when the budget runs out the gap is rendered as
+`>= x%` and flagged as unproved, because the reference is then only an upper bound.
+Keep the instance small — the tree is over set partitions.
+
+### See what moving qubits between QPUs would save
+
+```bash
+quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json --out plan.json
+```
+
+Prints the seed placement's EPR cost, the best cost with migration forbidden, and
+the best with it allowed, plus every migration as `qubit q: QPU a -> b after
+window w`. The middle column is the control: "saved by migration" compares
+against it, holding the placement search constant. `--migration-cost` prices a
+teleport; set it high enough and the plan collapses to pure re-placement.
+
 ### Split a mapped global circuit into local circuits and remote operations
 
 ```bash
@@ -846,6 +1331,83 @@ print(result.schedule_plan.layers[0].remote_rounds)
 print(len(result.program.remote_ops))
 print(result.local_metrics)
 ```
+
+### Entanglement demand and aggregation
+
+```python
+from quport import (
+    MultiQPUConfig,
+    aggregate_remote_operations,
+    build_distributable_packets,
+    compile_distributed,
+    ebit_cost,
+    estimate_entanglement_schedule,
+)
+from quport.architecture import MultiQPUArchitecture
+from quport.config import LatencyModel
+from quport.pipeline import random_benchmark_circuit
+
+cfg = MultiQPUConfig(
+    n_qpus=4,
+    compute_qubits_per_qpu=4,
+    comm_qubits_per_qpu=2,
+    inter_topology="switch",
+    optimization_level=0,
+)
+
+qc = random_benchmark_circuit(n_logical=16, depth=20, seed=0)
+result = compile_distributed(qc, cfg, seed=0, strategy="ebit")
+
+print(result.ebits.ebits, "e-bits with unlimited ports")
+print(result.aggregation.epr_pairs, "EPR pairs under the real port budget")
+print(result.aggregation.baseline_epr_pairs, "EPR pairs without aggregation")
+print(result.entanglement_schedule.makespan)
+
+# The same analysis on any mapped circuit. A plan and the schedule that consumes
+# it must agree on the port budget, so pass ports_per_qpu to both.
+arch = MultiQPUArchitecture(cfg)
+plan = aggregate_remote_operations(result.physical_circuit, arch, ports_per_qpu=8)
+summary = estimate_entanglement_schedule(
+    result.physical_circuit,
+    arch,
+    LatencyModel(epr_success_prob=0.5),
+    plan=plan,
+    ports_per_qpu=8,
+)
+print(summary.makespan, summary.peak_ports_in_use)
+
+# Score a candidate partition without compiling anything. Reuse result.packets:
+# they were built from the basis-translated circuit the partitioner actually saw.
+print(ebit_cost(result.packets, result.partition, cfg.n_qpus))
+print(ebit_cost(build_distributable_packets(qc), [0] * qc.num_qubits, cfg.n_qpus))
+```
+
+### Emitting and verifying the protocol
+
+```python
+from quport import (
+    MultiQPUArchitecture,
+    build_telegate_circuit,
+    verify_telegate_equivalence,
+)
+from qiskit import qasm3
+
+arch = MultiQPUArchitecture(cfg)
+
+# Unitary form: checkable by simulation.
+program = build_telegate_circuit(result.physical_circuit, arch, result.aggregation)
+print(program.n_ancillas, "protocol ancillas for", program.blocks, "blocks")
+assert verify_telegate_equivalence(result.physical_circuit, arch, result.aggregation)
+
+# Executable form: real measurement and feedforward, exportable to OpenQASM 3.
+runnable = build_telegate_circuit(
+    result.physical_circuit, arch, result.aggregation, coherent=False
+)
+qasm3.dumps(runnable.circuit)
+```
+
+Verification is a state-vector simulation, so keep the circuit small — it is
+refused above 24 qubits.
 
 ### Custom architecture inspection
 
@@ -941,9 +1503,10 @@ Produces:
 | File | Description |
 |---|---|
 | `qpu_<id>_routed.qasm` | Locally routed OpenQASM 3 circuit for QPU `<id>`. |
-| `remote_ops.json` | Ordered remote-operation trace. |
+| `remote_ops.json` | Ordered remote-operation trace, in the **routed** programs' physical-qubit labelling. |
 | `schedule.json` | Strict JSON topology-aware schedule summary produced from `TopologyScheduleSummary.to_dict()`. |
 | `schedule_trace.json` | Strict JSON per-layer/per-round communication plan produced from `TopologySchedulePlan.to_dict()`, with absolute timing, QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
+| `entanglement_plan.json` | Strict JSON bundle with the aggregated EPR blocks (`aggregation`), the $\lambda-1$ e-bit report for the chosen partition (`ebits`), and the entanglement-aware schedule summary (`schedule`). |
 
 Remote operation entries have the shape:
 
@@ -956,12 +1519,74 @@ Remote operation entries have the shape:
   "qpu0": 0,
   "qpu1": 9,
   "params": [],
-  "clbits": []
+  "clbits": [],
+  "qpu0_marker": 3,
+  "qpu1_marker": 5
 }
 ```
 
+`qpu0_marker` and `qpu1_marker` say which barrier in each QPU's emitted program
+marks this operation, counting all barriers from zero. They exist because
+pairing by position is not safe: barriers on disjoint qubits commute, so
+rebuilding a circuit from its DAG during routing can list them in an order that
+differs from the manifest's, and an emitted QASM file carries no labels to
+distinguish them.
+
+For the same reason, **a distributed program is a partial order, not a linear
+one**. Two QPUs can list the same pair of remote operations in opposite orders
+when those operations sit on disjoint qubits, and both listings are correct. A
+consumer must therefore advance each program by qubit dataflow -- an instruction
+is ready once it is first in line on every qubit it touches, and a remote
+operation once its marker leads on both sides -- rather than reading the files
+strictly top to bottom, which can deadlock.
+`quport.distributed.reassemble_distributed_program` is the reference
+implementation of that rule, and it raises when two programs genuinely
+contradict each other rather than silently picking an order.
+
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
+
+`schedule_trace.json` is audited before it is written. The estimator produces the
+summary and the trace in one pass, so nothing inside it cross-checks the two, and a
+consumer of the manifest cannot tell a sound one from a self-consistent-looking
+wrong one. `quport.schedule.audit_topology_schedule_plan` rebuilds every figure
+from the outside — layer and round intervals chain and each `end_time` is its
+`start_time` plus its duration; a layer lasts $\max(\text{local}, \sum \text{round
+durations})$; each round's port and link usage is exactly what routing its pairs
+consumes, and neither exceeds `comm_qubits_per_qpu` or `link_capacity`; each round
+lasts as long as its slowest placed operation; and all six summary fields agree
+with the trace. Passing the mapped circuit adds the one check that needs it: that
+the plan accounts for exactly the operations spanning more than one QPU. What it
+deliberately does not re-derive is the cost model — per-hop EPR time, classical-RTT
+overlap, the round-packing policy — because those are modelling choices rather than
+claims; the audit checks the plan is a faithful, feasible account of them.
+`compile-dist` refuses to write a manifest that does not add up.
+
+`entanglement_plan.json` gets the same treatment from
+`quport.schedule.audit_entanglement_schedule`, by a different route.
+`estimate_entanglement_schedule` returns aggregates and no trace, so there are no
+events to replay -- but its outputs are related to each other by *theorem* rather
+than by convention, and those are checkable: a QPU with $P$ ports cannot hold more
+than $P$ cat copies at once nor accrue more than $P \cdot T$ of port-busy time over
+a makespan $T$, and a link with $C$ channels likewise; `entanglement_time` is by
+definition the sum of per-link busy time; every gate on a qubit occupies that
+qubit's timeline, so the busiest qubit's own work is a lower bound on $T$;
+`remote_gates` is the circuit's own count of operations spanning more than one QPU;
+and no more gates can be unschedulable than there are remote ones.
+
+Monotonicity is checked too, but it belongs to the estimator rather than to any one
+result, so it is obtained by scheduling one fixed plan twice: widening ports or link
+channels can only let an acquire return earlier, so the makespan must not rise, and
+slowing `epr_gen` or lowering `epr_success_prob` can only push events later, so it
+must not fall. Over 672 schedules spanning four topologies, every property held.
+
+`q0_phys` and `q1_phys` here are positions in the *routed* per-QPU programs, not
+in `physical_circuit`. Local routing permutes qubits inside a QPU whenever
+`intra_topology` is not `clique`, so the two labellings differ and only the
+routed one matches the `qpu_<id>_routed.qasm` files shipped beside it.
+`compile_distributed` exposes both: `program.remote_ops` in the pre-routing
+labelling, and `routed_remote_ops` in the shipped one. `quport split`, which
+writes unrouted programs, correctly ships the pre-routing manifest.
 
 ---
 
@@ -975,7 +1600,7 @@ rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
 |---|---|
 | `trial` | Trial index. |
 | `seed` | Random seed used for the trial. |
-| `method` | Numeric method id: baseline `0`, balanced `1`, tpccap `2`, tpccap_sa `3`, cluster `4`. |
+| `method` | Numeric method id: baseline `0`, balanced `1`, tpccap `2`, tpccap_sa `3`, cluster `4`, ebit `5`. |
 | `strategy` | Strategy name. |
 | `swaps` | SWAP count. |
 | `remote_2q` | Remote two-qubit operation count. |
@@ -1048,8 +1673,15 @@ quport --help
 - The default latency model is intentionally simple and configurable; values are comparative cost units unless you calibrate them to a hardware backend.
 - Global mapping can insert cross-QPU routing operations because it exposes the whole modular graph to Qiskit. Use distributed compilation when you need remote operations to remain explicit.
 - Topology-aware scheduling is a deterministic estimator, not a full hardware-control stack.
+- Diagonality analysis is conservative: an operation QuPort cannot prove diagonal closes the packet, which over-counts EPR pairs rather than claiming a cat copy that would not survive.
+- Each gate is charged to exactly one packet root, so the e-bit count is exact for that assignment and an upper bound over all assignments of symmetric gates.
+- Teleport blocks are not merged: every non-diagonal cross-QPU gate pays its own round trip of two e-bits.
+- Emitted protocol circuits expand cat blocks in full; teleport blocks show the state movement as a `swap` in and out of the host ancilla rather than the Bell-measurement gadget, because the return trip needs a mid-circuit reset that would make the program non-unitary and so unverifiable by the same route.
+- State-vector verification is exponential in circuit width and is refused above 24 qubits, and it is refused outright for circuits with mid-circuit measurement or reset.
+- Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.
+- Public helpers validate their inputs on every call, which is right for an entry point and wasteful inside a search loop. The partitioners therefore validate once and reuse the result: `quport.network.prepare_routing_tables` hoists shortest-path validation, and `accumulate_traffic` / `accumulate_boundary_counts` take pre-validated edges. The prepared path accumulates in the same order as the validating one, so results are bit-identical -- `tests/test_network.py` pins that, and the partitioner's own outputs were checked unchanged across topologies, strategies and seeds.
 
 ---
 

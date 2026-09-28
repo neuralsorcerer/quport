@@ -1800,3 +1800,365 @@ def test_zero_async_overlap_charges_the_full_classical_round_trip() -> None:
         async_overlap=1.0,
     )
     assert remote_makespan(synchronous_cfg) == pytest.approx(full_rtt)
+
+
+# ---------------------------------------------------------------------------
+# Auditing a finished schedule plan
+# ---------------------------------------------------------------------------
+
+
+def _audited_case(**overrides):
+    """A compiled plan with remote rounds, plus what it takes to audit it."""
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+
+    settings = dict(
+        n_qpus=3,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        inter_topology="ring",
+        optimization_level=0,
+    )
+    settings.update(overrides)
+    cfg = MultiQPUConfig(**settings)
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+    qc = random_benchmark_circuit(n_logical=9, depth=8, seed=0)
+    res = compile_distributed(qc, cfg, model, seed=0, strategy="tpccap_sa")
+    assert any(layer.remote_rounds for layer in res.schedule_plan.layers)
+    return res, arch, model
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"inter_topology": "switch", "switch_reconfig_delay": 25.0},
+        {"inter_topology": "mesh", "comm_qubits_per_qpu": 2, "link_capacity": 2},
+        {"inter_topology": "clos", "n_qpus": 4, "comm_qubits_per_qpu": 2},
+        {"inter_topology": "fat_tree", "n_qpus": 4, "compute_qubits_per_qpu": 4},
+        {"async_classical": False},
+    ],
+    ids=["ring", "switch-reconfig", "mesh-2ports", "clos", "fat-tree", "sync-rtt"],
+)
+def test_estimator_output_survives_an_independent_re_derivation(overrides):
+    """Every figure in the plan is rebuilt from the outside and must match."""
+    from quport.schedule import audit_topology_schedule_plan
+
+    res, arch, model = _audited_case(**overrides)
+
+    assert (
+        audit_topology_schedule_plan(
+            res.schedule_plan, arch, model, res.physical_circuit
+        )
+        == ()
+    )
+
+
+def _first_round_layer(plan):
+    return next(i for i, layer in enumerate(plan.layers) if layer.remote_rounds)
+
+
+def _replace_layer(plan, index, **changes):
+    import dataclasses
+
+    layers = list(plan.layers)
+    layers[index] = dataclasses.replace(layers[index], **changes)
+    return dataclasses.replace(plan, layers=tuple(layers))
+
+
+def _replace_first_round(plan, index, **changes):
+    import dataclasses
+
+    layer = plan.layers[index]
+    rounds = list(layer.remote_rounds)
+    rounds[0] = dataclasses.replace(rounds[0], **changes)
+    return _replace_layer(plan, index, remote_rounds=tuple(rounds))
+
+
+def test_audit_catches_a_plan_that_does_not_add_up():
+    """An audit that never fails is not an audit.
+
+    Each corruption is one a real bug could produce: a slipped interval, a
+    miscounted aggregate, or a round claiming resources it did not use.
+    """
+    import dataclasses
+
+    from quport.schedule import audit_topology_schedule_plan
+
+    res, arch, model = _audited_case()
+    plan = res.schedule_plan
+    index = _first_round_layer(plan)
+    layer = plan.layers[index]
+    summary = plan.summary
+
+    cases = {
+        "starts at": _replace_layer(plan, index, start_time=layer.start_time + 1.0),
+        "not start + duration": _replace_layer(
+            plan, index, duration=layer.duration + 5.0
+        ),
+        "makespan": dataclasses.replace(
+            plan, summary=dataclasses.replace(summary, makespan=summary.makespan + 1.0)
+        ),
+        "remote ops, the trace holds": dataclasses.replace(
+            plan,
+            summary=dataclasses.replace(summary, remote_ops=summary.remote_ops - 1),
+        ),
+        "rounds, the trace has": dataclasses.replace(
+            plan,
+            summary=dataclasses.replace(
+                summary, remote_rounds=summary.remote_rounds + 3
+            ),
+        ),
+        "budget is": _replace_first_round(
+            plan,
+            index,
+            qpu_ports_used=tuple(99 for _ in layer.remote_rounds[0].qpu_ports_used),
+        ),
+        "pairs consume": _replace_first_round(plan, index, link_utilization=()),
+        "peak_link_util": dataclasses.replace(
+            plan,
+            summary=dataclasses.replace(
+                summary, peak_link_util=summary.peak_link_util + 7
+            ),
+        ),
+        "peak_qpu_ports_used": dataclasses.replace(
+            plan,
+            summary=dataclasses.replace(
+                summary, peak_qpu_ports_used=summary.peak_qpu_ports_used + 7
+            ),
+        ),
+    }
+
+    for expected, broken in cases.items():
+        problems = audit_topology_schedule_plan(broken, arch, model)
+        assert problems, f"audit missed: {expected}"
+        assert any(
+            expected in problem for problem in problems
+        ), f"audit reported {problems} for {expected!r}"
+
+
+def test_audit_catches_a_round_that_costs_nothing():
+    from quport.schedule import audit_topology_schedule_plan
+
+    res, arch, model = _audited_case()
+    plan = res.schedule_plan
+    index = _first_round_layer(plan)
+
+    problems = audit_topology_schedule_plan(
+        _replace_first_round(plan, index, duration=0.0), arch, model
+    )
+    assert problems
+
+
+def test_audit_checks_the_plan_against_the_circuit_it_came_from():
+    """Only the circuit can say whether the plan accounted for every remote op."""
+    from qiskit import QuantumCircuit as QC
+
+    from quport.schedule import audit_topology_schedule_plan
+
+    res, arch, model = _audited_case()
+
+    # Consistent with itself, but describing a different circuit.
+    other = QC(res.physical_circuit.num_qubits)
+    assert audit_topology_schedule_plan(res.schedule_plan, arch, model, other)
+    assert (
+        audit_topology_schedule_plan(res.schedule_plan, arch, model, other)[0].count(
+            "spanning more than one QPU"
+        )
+        == 1
+    )
+
+
+def test_audit_accepts_a_plan_with_no_remote_operations():
+    from quport.schedule import audit_topology_schedule_plan
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=4, comm_qubits_per_qpu=1, optimization_level=0
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+
+    circuit = QuantumCircuit(cfg.total_physical_qubits())
+    circuit.h(0)
+    circuit.cx(0, 1)
+
+    plan = estimate_topology_schedule_plan(circuit, arch, model)
+    assert plan.summary.remote_ops == 0
+    assert audit_topology_schedule_plan(plan, arch, model, circuit) == ()
+
+
+def test_audit_accepts_unschedulable_penalty_rounds():
+    """Zero comm ports makes every remote op a penalty round; that is still sound."""
+    from quport.schedule import audit_topology_schedule_plan
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0, optimization_level=0
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+
+    circuit = QuantumCircuit(cfg.total_physical_qubits())
+    circuit.cx(0, 2)
+
+    plan = estimate_topology_schedule_plan(circuit, arch, model)
+    assert plan.summary.remote_ops == 1
+    assert any(
+        rnd.unschedulable_ops for layer in plan.layers for rnd in layer.remote_rounds
+    )
+    assert audit_topology_schedule_plan(plan, arch, model, circuit) == ()
+
+
+def test_a_round_reports_only_the_links_its_operations_use() -> None:
+    """Probing a link for capacity must not enter it in the round's usage.
+
+    Testing whether an operation fits reads the load on every link of its path.
+    Reading through a ``defaultdict`` would insert each probed link at zero, and
+    those phantom entries reach ``link_utilization`` -- which is meant to say
+    what the round's *placed* operations consume, and which
+    :func:`~quport.schedule.audit_topology_schedule_plan` re-derives from those
+    operations alone.
+    """
+    from quport.schedule import audit_topology_schedule_plan
+
+    # A ring long enough that paths overlap and capacity is genuinely contested,
+    # which is what makes an operation get deferred after its links are probed.
+    cfg = MultiQPUConfig(
+        n_qpus=12,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=2,
+        inter_topology="ring",
+        link_capacity=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+
+    mapped = QuantumCircuit(arch.n_phys)
+    block = arch.block
+    for offset in range(6):
+        mapped.cx(offset * block, ((offset + 6) % 12) * block)
+
+    plan = estimate_topology_schedule_plan(mapped, arch, model)
+
+    deferred = [
+        rnd
+        for layer in plan.layers
+        for rnd in layer.remote_rounds
+        if not rnd.unschedulable_ops
+    ]
+    assert deferred, "the fixture must produce real rounds"
+    for rnd in deferred:
+        assert all(count > 0 for _edge, count in rnd.link_utilization), (
+            f"round {rnd.round_index} reports an unused link: "
+            f"{[edge for edge, count in rnd.link_utilization if count == 0]}"
+        )
+
+    assert audit_topology_schedule_plan(plan, arch, model, mapped) == ()
+
+
+def test_a_pair_routes_the_same_way_whichever_operand_leads() -> None:
+    """An undirected pair's route cannot depend on the orientation it arrives in.
+
+    A BFS next-hop table need not be reversal-symmetric: on a circulant graph
+    ``path_edges(sp, a, b)`` and ``path_edges(sp, b, a)`` name different links of
+    the same length. Routing whichever orientation happened to appear first
+    would make an operation's links depend on incidental gate order, and put the
+    trace at odds with every other reader of the same pair.
+    """
+    from quport.network import path_edges
+    from quport.schedule import audit_topology_schedule_plan
+
+    cfg = MultiQPUConfig(
+        n_qpus=50,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=2,
+        inter_topology="degree_d",
+        inter_degree=4,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    shortest = arch.qpu_shortest_paths()
+
+    asymmetric = [
+        (a, b)
+        for a in range(cfg.n_qpus)
+        for b in range(a + 1, cfg.n_qpus)
+        if set(path_edges(shortest, a, b)) != set(path_edges(shortest, b, a))
+    ]
+    assert asymmetric, "the fixture must have direction-dependent shortest paths"
+
+    # Drive one such pair from the high-numbered operand, the orientation that
+    # used to decide the cached route.
+    high, low = asymmetric[0][1], asymmetric[0][0]
+    block = arch.block
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(high * block, low * block)
+    mapped.cx(low * block, high * block)
+
+    model = LatencyModel()
+    plan = estimate_topology_schedule_plan(mapped, arch, model)
+    assert audit_topology_schedule_plan(plan, arch, model, mapped) == ()
+
+    routed = {
+        edge
+        for layer in plan.layers
+        for rnd in layer.remote_rounds
+        for edge, _count in rnd.link_utilization
+    }
+    assert routed == set(path_edges(shortest, low, high))
+
+
+@pytest.mark.parametrize("inter", ["ring", "degree_d", "fat_tree", "clos"])
+def test_schedule_plans_stay_consistent_at_interconnect_scale(inter: str) -> None:
+    """The audits must hold at the scale the model is documented for.
+
+    ``quport.network`` describes this model as built for ``n_qpus ~ O(10..100)``,
+    but a few QPUs are enough for every other test here -- and two faults in the
+    round packer were invisible below about twenty-five, where every path is one
+    hop and no operation is ever deferred. Long paths that overlap and contend
+    are what exercise the packer's bookkeeping, so one case per topology holds
+    that region.
+    """
+    from quport.compiler import compile_distributed
+    from quport.pipeline import random_benchmark_circuit
+    from quport.schedule import (
+        audit_entanglement_schedule,
+        audit_topology_schedule_plan,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=50,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        inter_topology=inter,  # type: ignore[arg-type]
+        inter_degree=3,
+        link_capacity=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+    result = compile_distributed(
+        random_benchmark_circuit(40, 8, 0),
+        cfg,
+        latency=model,
+        seed=0,
+        strategy="tpccap",
+    )
+
+    assert result.schedule.remote_ops > 0, "the fixture must cross QPUs"
+    assert result.schedule.remote_rounds > 0
+
+    assert (
+        audit_topology_schedule_plan(
+            result.schedule_plan, arch, model, result.physical_circuit
+        )
+        == ()
+    )
+    assert (
+        audit_entanglement_schedule(
+            result.entanglement_schedule,
+            result.physical_circuit,
+            arch,
+            model,
+            plan=result.aggregation,
+        )
+        == ()
+    )

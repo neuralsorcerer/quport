@@ -74,6 +74,137 @@ The written bundle contains local QASM programs and a remote-operation manifest.
 If you need locally routed QPU programs exactly as produced by `compile_distributed`,
 write `res.local_routed` yourself or use the CLI `compile-dist` command.
 
+## EPR-pair accounting and communication aggregation
+
+```python
+from quport import (
+    LatencyModel,
+    MultiQPUArchitecture,
+    MultiQPUConfig,
+    aggregate_remote_operations,
+    compile_distributed,
+    ebit_cost,
+    estimate_entanglement_schedule,
+)
+from quport.pipeline import random_benchmark_circuit
+
+cfg = MultiQPUConfig(n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2)
+qc = random_benchmark_circuit(16, depth=20, seed=0)
+res = compile_distributed(qc, cfg, LatencyModel(), seed=0, strategy="ebit")
+
+print(res.ebits.ebits, "e-bits with unlimited ports")
+print(res.aggregation.epr_pairs, "EPR pairs under the real port budget")
+print(res.aggregation.baseline_epr_pairs, "EPR pairs without aggregation")
+print(f"{res.aggregation.reduction:.1%} saved")
+print(res.entanglement_schedule.makespan)
+
+for block in res.aggregation.blocks[:3]:
+    print(block.protocol, block.root_phys, "->", block.remote_qpu, block.gate_indices)
+```
+
+Score an alternative partition without recompiling, then re-plan and re-schedule
+against a different port budget — a plan and its schedule must share that budget:
+
+```python
+arch = MultiQPUArchitecture(cfg)
+print(ebit_cost(res.packets, res.partition, cfg.n_qpus))
+
+plan = aggregate_remote_operations(res.physical_circuit, arch, ports_per_qpu=6)
+summary = estimate_entanglement_schedule(
+    res.physical_circuit,
+    arch,
+    LatencyModel(epr_success_prob=0.5),
+    plan=plan,
+    ports_per_qpu=6,
+)
+print(summary.makespan, summary.peak_ports_in_use)
+```
+
+## What moving qubits between QPUs would save
+
+```python
+from quport import MultiQPUConfig, compile_distributed
+from quport.pipeline import random_benchmark_circuit
+from quport.temporal import optimize_temporal_partition, split_windows
+
+cfg = MultiQPUConfig(
+    n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2, optimization_level=0
+)
+res = compile_distributed(
+    random_benchmark_circuit(16, depth=20, seed=0), cfg, seed=0, strategy="ebit"
+)
+
+windows = split_windows(res.packets, 4)
+plan = optimize_temporal_partition(
+    res.packets,
+    res.partition,
+    cfg.n_qpus,
+    cfg.capacity_per_qpu(),
+    windows,
+    seed=0,
+)
+
+# Three costs, because two effects contribute: the seed placement, the best the
+# search reaches without moving anything, and the best with migration allowed.
+print(plan.static_cost, plan.stationary_cost, plan.cost.total)
+print(f"{plan.migration_reduction:.1%} of that came from moving qubits")
+
+for qubit, boundary, source, target in plan.partition.migrations():
+    print(f"qubit {qubit}: QPU {source} -> {target} after window {boundary}")
+```
+
+`cost.total <= stationary_cost <= static_cost` holds by construction, so a plan
+that moved qubits never loses to one that did not. Price a teleport out of reach
+with `migration_cost=` and the plan collapses to pure re-placement:
+
+```python
+held = optimize_temporal_partition(
+    res.packets, res.partition, cfg.n_qpus, cfg.capacity_per_qpu(), windows,
+    migration_cost=10_000, seed=0,
+)
+assert held.cost.moves == 0
+assert held.cost.total == held.stationary_cost
+```
+
+## Scoring a partition against the exact optimum
+
+```python
+from quport import MultiQPUConfig, compile_distributed
+from quport.exact import optimal_partition, partition_gap
+from quport.interaction import extract_twoq_weights
+from quport.pipeline import random_benchmark_circuit
+
+cfg = MultiQPUConfig(
+    n_qpus=3, compute_qubits_per_qpu=3, comm_qubits_per_qpu=2, optimization_level=0
+)
+qc = random_benchmark_circuit(9, depth=10, seed=0)
+res = compile_distributed(qc, cfg, seed=0, strategy="ebit")
+capacity = cfg.capacity_per_qpu()
+
+# `partition` and `packets` are indexed by the basis-translated circuit, so any
+# re-derived partitioning input has to come from `res.basis_circuit`.
+weights = extract_twoq_weights(res.basis_circuit)
+
+best = optimal_partition(
+    res.basis_circuit.num_qubits,
+    cfg.n_qpus,
+    capacity,
+    objective="ebits",
+    packets=res.packets,
+)
+print(best.objective, "e-bits is optimal" if best.proved_optimal else "(unproved)")
+print(best.nodes, "nodes explored")
+
+for objective, kwargs in (("cut", {"weights": weights}), ("ebits", {"packets": res.packets})):
+    gap = partition_gap(res.partition, cfg.n_qpus, capacity, objective=objective, **kwargs)
+    print(f"{objective}: {gap.heuristic} vs {gap.optimal} optimal ({gap.relative:.1%})")
+```
+
+`partition_gap` raises if the partition is infeasible, or if it scores below a
+proved optimum — that would mean one of the two implementations is wrong, which is
+worth failing over rather than reporting as a negative gap. Keep instances small:
+the search enumerates set partitions.
+
 ## Detailed schedule trace
 
 ```python

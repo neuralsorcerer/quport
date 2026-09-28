@@ -6,18 +6,21 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import SupportsFloat, SupportsIndex, cast
+from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit
 
+from quport.aggregation import AggregationPlan, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
-from quport.config import LatencyModel, MultiQPUConfig
+from quport.config import LatencyModel, MultiQPUConfig, validate_epr_success_prob
 from quport.distributed import RemoteOp, split_into_qpus
-from quport.network import UNREACHABLE_DISTANCE
+from quport.entanglement import is_directive
+from quport.network import UNREACHABLE_DISTANCE, QpuEdge, path_edges
 
 UNSCHEDULABLE_PENALTY: float = float(UNREACHABLE_DISTANCE)
 
@@ -390,6 +393,19 @@ class RemoteRoundTrace:
     ``start_time`` and ``end_time`` are absolute offsets in the schedule plan.
     They make the trace directly consumable by simulators and visualization tools
     without re-integrating layer and round durations from the summary.
+
+    A round is one of two kinds, and ``unschedulable_ops`` tells them apart:
+
+    ``unschedulable_ops == 0``
+        A real round. ``qpu_pairs`` lists the operations placed in it, one entry
+        each, and ``qpu_ports_used`` and ``link_utilization`` are exactly what
+        those operations consume.
+    ``unschedulable_ops > 0``
+        A penalty round for operations no port, link, or route could serve.
+        ``qpu_pairs`` still names them, one entry each, so the count of
+        operations a round accounts for is ``unschedulable_ops or
+        len(qpu_pairs)`` -- never their sum, which would count a penalty
+        operation twice.
     """
 
     layer_index: int
@@ -552,11 +568,7 @@ def _topology_schedule_plan(
     The public summary function projects this plan down to the historical
     :class:`TopologyScheduleSummary` return type.
     """
-    from collections import defaultdict
-
     from qiskit.converters import circuit_to_dag
-
-    from .network import path_edges
 
     lat = _validate_schedule_inputs(arch, model)
 
@@ -612,10 +624,18 @@ def _topology_schedule_plan(
         return hop_cache[key]
 
     def edges_for(a: int, b: int) -> tuple[tuple[int, int], ...]:
+        # Route the canonical orientation, not the one the caller happened to
+        # pass. A BFS next-hop table need not be reversal-symmetric, so
+        # `path_edges(sp, a, b)` and `path_edges(sp, b, a)` can name different
+        # links of the same length; caching either under an unordered key would
+        # make an operation's route depend on the orientation it was first seen
+        # with, and disagree with every other reader of the same pair.
         key = pair_key(a, b)
-        if key not in edge_cache:
-            edge_cache[key] = tuple(path_edges(sp, a, b))
-        return edge_cache[key]
+        cached = edge_cache.get(key)
+        if cached is None:
+            cached = tuple(path_edges(sp, key[0], key[1]))
+            edge_cache[key] = cached
+        return cached
 
     def is_reachable(a: int, b: int) -> bool:
         return hops_for(a, b) < UNREACHABLE_DISTANCE
@@ -800,9 +820,11 @@ def _topology_schedule_plan(
 
         while remaining:
             used_ports = [0] * n_qpus
-            used_link: defaultdict[tuple[int, int], int] = defaultdict(
-                int
-            )  # edge->count
+            # A plain dict, not a defaultdict: the feasibility probe below reads
+            # an edge that may never be used, and a defaultdict would insert it
+            # at zero. Those phantom entries reach `link_utilization`, which is
+            # supposed to say what the round's placed operations consume.
+            used_link: dict[tuple[int, int], int] = {}  # edge->count
             used_pairs: set[tuple[int, int]] = set()
             placed_pairs: list[tuple[int, int]] = []
             placed_any = False
@@ -827,7 +849,7 @@ def _topology_schedule_plan(
                 edges = edges_for(a, b)
                 feasible = True
                 for e in edges:
-                    if used_link[e] >= link_cap:
+                    if used_link.get(e, 0) >= link_cap:
                         feasible = False
                         break
                 if not feasible:
@@ -841,8 +863,9 @@ def _topology_schedule_plan(
                 peak_ports = max(peak_ports, used_ports[a], used_ports[b])
                 used_pairs.add(key)
                 for e in edges:
-                    used_link[e] += 1
-                    peak_link = max(peak_link, used_link[e])
+                    carried = used_link.get(e, 0) + 1
+                    used_link[e] = carried
+                    peak_link = max(peak_link, carried)
 
                 placed_any = True
                 round_max_cost = max(round_max_cost, remote_cost(a, b))
@@ -931,3 +954,901 @@ def estimate_topology_schedule_plan(
     per-QPU port usage, per-link utilization, and unschedulable penalty rounds.
     """
     return _topology_schedule_plan(mapped, arch, model)
+
+
+def audit_topology_schedule_plan(
+    plan: TopologySchedulePlan,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+    mapped: QuantumCircuit | None = None,
+) -> tuple[str, ...]:
+    """Re-derive a schedule plan's numbers from the outside, and report mismatches.
+
+    The estimator computes the summary and the trace in one pass, which means
+    nothing in it cross-checks the two, or checks either against the resource
+    budgets the plan claims to respect. A downstream consumer of
+    ``schedule_trace.json`` has no way to tell a sound manifest from a
+    self-consistent-looking wrong one. This walks the finished plan and rebuilds
+    each figure independently:
+
+    - layer and round intervals chain, and every ``end_time`` is its
+      ``start_time`` plus its duration;
+    - a layer lasts ``max(local_duration, sum of its round durations)``;
+    - each round's ``qpu_ports_used`` and ``link_utilization`` are exactly what
+      routing its ``qpu_pairs`` over shortest paths consumes, and neither exceeds
+      ``comm_qubits_per_qpu`` or ``link_capacity``;
+    - each round lasts as long as its slowest placed operation;
+    - the six summary fields agree with the trace they summarise.
+
+    Passing ``mapped`` adds the one check that needs the circuit: that the plan
+    accounts for exactly the operations that actually span QPUs, counted the way
+    :func:`quport.distributed.split_into_qpus` counts them.
+
+    What this does *not* re-derive is the cost model itself -- per-hop EPR time,
+    classical-RTT overlap, and the round-packing policy are taken as given, since
+    they are modelling choices rather than claims. It checks that the plan is a
+    faithful, feasible account of those choices.
+
+    Returns
+    -------
+    tuple[str, ...]
+        One description per inconsistency, in the order found. Empty means every
+        figure was reproduced.
+    """
+    lat = _validate_schedule_inputs(arch, model)
+    cfg = arch.cfg
+    n_qpus = cfg.n_qpus
+    sp = arch.qpu_shortest_paths()
+    ports = _validated_nonnegative_int(
+        cfg.comm_qubits_per_qpu, label="comm_qubits_per_qpu"
+    )
+    link_cap = _validated_nonnegative_int(
+        getattr(cfg, "link_capacity", 1), label="link_capacity"
+    )
+    is_switch_like = cfg.inter_topology in ("switch", "mesh") or (
+        cfg.inter_topology == "clos" and cfg.comm_qubits_per_qpu >= 2
+    )
+    reconfig = (
+        _validated_nonnegative_finite(
+            getattr(cfg, "switch_reconfig_delay", 0.0), label="switch_reconfig_delay"
+        )
+        if is_switch_like
+        else 0.0
+    )
+    classical_eff = _effective_classical_rtt(cfg, lat)
+
+    problems: list[str] = []
+
+    def close(left: float, right: float) -> bool:
+        return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-9)
+
+    summary = plan.summary
+    elapsed = 0.0
+    seen_rounds = 0
+    seen_remote = 0
+    peak_link = 0
+    peak_ports = 0
+
+    for index, layer in enumerate(plan.layers):
+        where = f"layer {index}"
+        if layer.layer_index != index:
+            problems.append(f"{where}: layer_index is {layer.layer_index}")
+        if not close(layer.start_time, elapsed):
+            problems.append(
+                f"{where}: starts at {layer.start_time}, but the layers before it "
+                f"end at {elapsed}"
+            )
+        if not close(layer.end_time, layer.start_time + layer.duration):
+            problems.append(
+                f"{where}: ends at {layer.end_time}, not start + duration "
+                f"({layer.start_time + layer.duration})"
+            )
+
+        rounds_time = 0.0
+        for r_index, rnd in enumerate(layer.remote_rounds):
+            spot = f"{where} round {r_index}"
+            if rnd.layer_index != index:
+                problems.append(f"{spot}: layer_index is {rnd.layer_index}")
+            if rnd.round_index != r_index:
+                problems.append(f"{spot}: round_index is {rnd.round_index}")
+            if not close(rnd.start_time, layer.start_time + rounds_time):
+                problems.append(
+                    f"{spot}: starts at {rnd.start_time}, but the rounds before it "
+                    f"end at {layer.start_time + rounds_time}"
+                )
+            if not close(rnd.end_time, rnd.start_time + rnd.duration):
+                problems.append(
+                    f"{spot}: ends at {rnd.end_time}, not start + duration "
+                    f"({rnd.start_time + rnd.duration})"
+                )
+            rounds_time += rnd.duration
+
+            if len(rnd.qpu_ports_used) != n_qpus:
+                problems.append(
+                    f"{spot}: qpu_ports_used has {len(rnd.qpu_ports_used)} entries "
+                    f"for {n_qpus} QPUs"
+                )
+            for qpu, used in enumerate(rnd.qpu_ports_used):
+                if used > ports:
+                    problems.append(
+                        f"{spot}: QPU {qpu} holds {used} ports, budget is {ports}"
+                    )
+                peak_ports = max(peak_ports, used)
+            for edge, count in rnd.link_utilization:
+                if count > link_cap:
+                    problems.append(
+                        f"{spot}: link {edge} carries {count}, capacity is {link_cap}"
+                    )
+                peak_link = max(peak_link, count)
+
+            if rnd.unschedulable_ops:
+                # A penalty round stands for operations that could not be
+                # placed. It still lists the pair it was going to serve, for
+                # diagnostics, so its operands are named twice and count once.
+                if not close(rnd.duration, UNSCHEDULABLE_PENALTY):
+                    problems.append(
+                        f"{spot}: penalty round lasts {rnd.duration}, "
+                        f"not {UNSCHEDULABLE_PENALTY}"
+                    )
+                if len(rnd.qpu_pairs) != rnd.unschedulable_ops:
+                    problems.append(
+                        f"{spot}: names {len(rnd.qpu_pairs)} pairs for "
+                        f"{rnd.unschedulable_ops} unschedulable operations"
+                    )
+            else:
+                expected_ports = [0] * n_qpus
+                expected_link: dict[QpuEdge, int] = {}
+                worst = 0.0
+                for a, b in rnd.qpu_pairs:
+                    expected_ports[a] += 1
+                    expected_ports[b] += 1
+                    for edge in path_edges(sp, a, b):
+                        expected_link[edge] = expected_link.get(edge, 0) + 1
+                    worst = max(
+                        worst,
+                        sp.dist[a][b] * lat.epr_gen
+                        + classical_eff
+                        + lat.remote_gate_overhead,
+                    )
+                if tuple(expected_ports) != tuple(rnd.qpu_ports_used):
+                    problems.append(
+                        f"{spot}: reports ports {list(rnd.qpu_ports_used)}, but its "
+                        f"pairs consume {expected_ports}"
+                    )
+                if tuple(sorted(expected_link.items())) != tuple(rnd.link_utilization):
+                    problems.append(
+                        f"{spot}: reports links {list(rnd.link_utilization)}, but its "
+                        f"pairs consume {sorted(expected_link.items())}"
+                    )
+                if rnd.qpu_pairs and not close(rnd.duration, worst + reconfig):
+                    problems.append(
+                        f"{spot}: lasts {rnd.duration}, but its slowest operation "
+                        f"takes {worst + reconfig}"
+                    )
+
+            seen_rounds += 1
+            seen_remote += rnd.unschedulable_ops or len(rnd.qpu_pairs)
+
+        if not close(layer.duration, max(layer.local_duration, rounds_time)):
+            problems.append(
+                f"{where}: lasts {layer.duration}, not max(local {layer.local_duration},"
+                f" rounds {rounds_time})"
+            )
+        counted = sum(
+            rnd.unschedulable_ops or len(rnd.qpu_pairs) for rnd in layer.remote_rounds
+        )
+        if layer.remote_ops != counted:
+            problems.append(
+                f"{where}: claims {layer.remote_ops} remote ops, its rounds hold "
+                f"{counted}"
+            )
+        elapsed += layer.duration
+
+    if summary.layers != len(plan.layers):
+        problems.append(
+            f"summary: claims {summary.layers} layers, the trace has "
+            f"{len(plan.layers)}"
+        )
+    if not close(summary.makespan, elapsed):
+        problems.append(
+            f"summary: makespan {summary.makespan}, layer durations sum to {elapsed}"
+        )
+    if summary.remote_ops != seen_remote:
+        problems.append(
+            f"summary: claims {summary.remote_ops} remote ops, the trace holds "
+            f"{seen_remote}"
+        )
+    if summary.remote_rounds != seen_rounds:
+        problems.append(
+            f"summary: claims {summary.remote_rounds} rounds, the trace has "
+            f"{seen_rounds}"
+        )
+    if summary.peak_link_util != peak_link:
+        problems.append(
+            f"summary: peak_link_util {summary.peak_link_util}, the trace peaks at "
+            f"{peak_link}"
+        )
+    if summary.peak_qpu_ports_used != peak_ports:
+        problems.append(
+            f"summary: peak_qpu_ports_used {summary.peak_qpu_ports_used}, the trace "
+            f"peaks at {peak_ports}"
+        )
+
+    if mapped is not None:
+        actual = _count_cross_qpu_operations(mapped, arch)
+        if summary.remote_ops != actual:
+            problems.append(
+                f"summary: accounts for {summary.remote_ops} remote ops, the circuit "
+                f"has {actual} operations spanning more than one QPU"
+            )
+
+    return tuple(problems)
+
+
+def _count_cross_qpu_operations(
+    mapped: QuantumCircuit, arch: MultiQPUArchitecture
+) -> int:
+    """Count operations spanning more than one QPU, as one remote event each.
+
+    A wide operation is charged once, between its leading QPU and the first
+    operand elsewhere, matching :func:`quport.distributed.split_into_qpus` and
+    every schedule estimator.
+    """
+    qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
+    count = 0
+    for instruction in mapped.data:
+        if getattr(instruction.operation, "_directive", False):
+            continue
+        qpus = _instruction_qpus(instruction.qubits, qindex, phys_to_qpu)
+        if len(qpus) >= 2 and _first_remote_partner(qpus) is not None:
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Entanglement-aware event-driven scheduling
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EntanglementScheduleSummary:
+    """Makespan and resource usage under an aggregated entanglement plan.
+
+    Attributes
+    ----------
+    makespan:
+        End of the last activity on any qubit, comm port, or link.
+    epr_pairs:
+        EPR pairs the plan consumes, counting two per teleport block.
+    entanglement_time:
+        Total wall time links spend distributing entanglement, summed over
+        links. Divided by ``makespan`` it gives average interconnect occupancy.
+    unschedulable_gates:
+        Cross-QPU gates that no port/link budget could serve. Each is charged
+        :data:`UNSCHEDULABLE_PENALTY` so infeasible designs stay comparable
+        rather than raising.
+    peak_ports_in_use:
+        Per QPU, the largest number of comm ports occupied at any instant. Never
+        exceeds the QPU's port budget.
+    port_busy_time / qpu_busy_time:
+        Per QPU, total comm-port occupancy and total local gate time. Both are
+        summed over transactions and gates respectively, so either can exceed the
+        makespan: a QPU holds several ports at once and runs gates on disjoint
+        qubits concurrently, and every one of those is counted.
+    link_busy_time:
+        Per inter-QPU link, total occupancy, sorted by link.
+    """
+
+    makespan: float
+    blocks: int
+    epr_pairs: int
+    remote_gates: int
+    unschedulable_gates: int
+    entanglement_time: float
+    peak_ports_in_use: tuple[int, ...]
+    port_busy_time: tuple[float, ...]
+    qpu_busy_time: tuple[float, ...]
+    link_busy_time: tuple[tuple[QpuEdge, float], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a stable JSON-ready representation of the summary."""
+        return {
+            "makespan": _json_ready_nonnegative_float(
+                self.makespan, label="entanglement.makespan"
+            ),
+            "blocks": _json_ready_nonnegative_int(
+                self.blocks, label="entanglement.blocks"
+            ),
+            "epr_pairs": _json_ready_nonnegative_int(
+                self.epr_pairs, label="entanglement.epr_pairs"
+            ),
+            "remote_gates": _json_ready_nonnegative_int(
+                self.remote_gates, label="entanglement.remote_gates"
+            ),
+            "unschedulable_gates": _json_ready_nonnegative_int(
+                self.unschedulable_gates, label="entanglement.unschedulable_gates"
+            ),
+            "entanglement_time": _json_ready_nonnegative_float(
+                self.entanglement_time, label="entanglement.entanglement_time"
+            ),
+            "peak_ports_in_use": [
+                _json_ready_nonnegative_int(
+                    value, label=f"entanglement.peak_ports_in_use[{index}]"
+                )
+                for index, value in enumerate(self.peak_ports_in_use)
+            ],
+            "port_busy_time": [
+                _json_ready_nonnegative_float(
+                    value, label=f"entanglement.port_busy_time[{index}]"
+                )
+                for index, value in enumerate(self.port_busy_time)
+            ],
+            "qpu_busy_time": [
+                _json_ready_nonnegative_float(
+                    value, label=f"entanglement.qpu_busy_time[{index}]"
+                )
+                for index, value in enumerate(self.qpu_busy_time)
+            ],
+            "link_busy_time": [
+                {
+                    "edge": _json_ready_pair(
+                        edge, label=f"entanglement.link_busy_time[{index}].edge"
+                    ),
+                    "busy": _json_ready_nonnegative_float(
+                        busy, label=f"entanglement.link_busy_time[{index}].busy"
+                    ),
+                }
+                for index, (edge, busy) in enumerate(self.link_busy_time)
+            ],
+        }
+
+
+class _ResourcePool:
+    """A fixed set of interchangeable servers tracked by next-free time.
+
+    ``acquire`` returns the earliest time any server frees up and removes it
+    from the pool; ``release`` returns it with a new free time. Holding a server
+    across many instructions is what lets a cat copy pin a comm port for its
+    whole window.
+    """
+
+    __slots__ = ("_free", "capacity")
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._free: list[float] = [0.0] * capacity
+
+    def available(self) -> bool:
+        return bool(self._free)
+
+    def acquire(self) -> float:
+        return heapq.heappop(self._free)
+
+    def release(self, free_at: float) -> None:
+        heapq.heappush(self._free, free_at)
+
+    def horizon(self) -> float:
+        return max(self._free, default=0.0)
+
+
+@dataclass
+class _BlockRuntime:
+    """Mutable schedule state for one in-flight communication block."""
+
+    ready: float = 0.0
+    port_start: float = 0.0
+    hops: int = 0
+    edges: tuple[QpuEdge, ...] = ()
+    holds_port: bool = False
+    feasible: bool = True
+
+
+def estimate_entanglement_schedule(
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+    *,
+    plan: AggregationPlan | None = None,
+    ports_per_qpu: int | Sequence[int] | None = None,
+) -> EntanglementScheduleSummary:
+    """Schedule a mapped circuit as an entanglement-resource-constrained system.
+
+    How this differs from the other estimators
+    ------------------------------------------
+    :func:`estimate_parallel_makespan_layered` and
+    :func:`estimate_parallel_makespan_topology` slice the circuit into DAG layers
+    and charge each layer its slowest operation. That imposes a global barrier
+    between layers, which over-serialises a machine whose QPUs only ever
+    synchronise on shared qubits, and it charges one entanglement transaction per
+    cross-QPU gate.
+
+    This estimator instead runs an as-soon-as-possible list schedule in program
+    order against explicit resources:
+
+    - one timeline per physical qubit, so independent QPUs drift apart freely;
+    - a pool of ``comm_qubits_per_qpu`` ports per QPU, each **held for a whole
+      block** rather than for a single gate, which is what makes port scarcity
+      bite;
+    - ``link_capacity`` channels on every inter-QPU link along the routed path;
+    - hop-scaled, probabilistic entanglement distribution
+      (:meth:`quport.config.LatencyModel.expected_epr_time`).
+
+    Gates are grouped by :func:`quport.aggregation.aggregate_remote_operations`,
+    so a run of gates sharing one root and one remote QPU costs a single EPR pair
+    and a single protocol setup.
+
+    Parameters
+    ----------
+    plan:
+        A pre-computed aggregation plan. When omitted, one is built with the
+        architecture's own port budget. A supplied plan must have been built with
+        the same budget the schedule uses, otherwise it asks for ports that do
+        not exist and the call raises.
+    ports_per_qpu:
+        Override the comm-port budget, matching the parameter of
+        :func:`quport.aggregation.aggregate_remote_operations`. Passing a large
+        value measures the port-unconstrained makespan.
+
+    Raises
+    ------
+    ValueError
+        If ``plan`` holds more concurrent cat copies on some QPU than the
+        schedule's port budget allows.
+
+    Returns
+    -------
+    EntanglementScheduleSummary
+    """
+    lat = _validate_schedule_inputs(arch, model)
+    success = validate_epr_success_prob(model.epr_success_prob)
+
+    cfg = arch.cfg
+    n_qpus = cfg.n_qpus
+    qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
+    n_phys = len(mapped.qubits)
+
+    ports = _normalized_port_budget(ports_per_qpu, arch)
+    link_cap = _validated_nonnegative_int(
+        getattr(cfg, "link_capacity", 1), label="link_capacity"
+    )
+
+    if plan is None:
+        plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=ports)
+    elif not isinstance(plan, AggregationPlan):
+        raise ValueError("plan must be an AggregationPlan")
+    else:
+        # A plan built against a larger budget would silently exhaust the port
+        # pools here and be reported as unschedulable; say so instead.
+        for qpu, peak in enumerate(plan.peak_cat_copies[:n_qpus]):
+            if peak > ports[qpu]:
+                raise ValueError(
+                    "aggregation plan exceeds the schedule's comm-port budget "
+                    f"(QPU {qpu} holds {peak} cat copies, budget is {ports[qpu]}); "
+                    "build the plan with the same ports_per_qpu"
+                )
+
+    sp = arch.qpu_shortest_paths()
+    classical_eff = _effective_classical_rtt(cfg, lat)
+
+    blocks = plan.blocks
+    runtime = [_BlockRuntime() for _ in blocks]
+    starts: dict[int, list[int]] = {}
+    members: dict[int, list[int]] = {}
+    ends: dict[int, list[int]] = {}
+    for ordinal, block in enumerate(blocks):
+        starts.setdefault(block.start_index, []).append(ordinal)
+        ends.setdefault(block.end_index, []).append(ordinal)
+        for gate_index in block.gate_indices:
+            members.setdefault(gate_index, []).append(ordinal)
+
+    qubit_ready = [0.0] * n_phys
+    port_pools = [_ResourcePool(ports[qpu]) for qpu in range(n_qpus)]
+    link_pools: dict[QpuEdge, _ResourcePool] = {}
+    link_busy: dict[QpuEdge, float] = {}
+    port_intervals: list[list[tuple[float, float]]] = [[] for _ in range(n_qpus)]
+    port_busy = [0.0] * n_qpus
+    qpu_busy = [0.0] * n_qpus
+    entanglement_time = 0.0
+    unschedulable = 0
+    remote_gates = 0
+
+    def link_pool(edge: QpuEdge) -> _ResourcePool:
+        pool = link_pools.get(edge)
+        if pool is None:
+            pool = _ResourcePool(link_cap)
+            link_pools[edge] = pool
+        return pool
+
+    def reserve_links(
+        edges: tuple[QpuEdge, ...], earliest: float, duration: float
+    ) -> tuple[float, float]:
+        """Occupy one channel per edge for ``duration``.
+
+        Returns the ``(start, finish)`` window actually granted, which can begin
+        later than ``earliest`` when a link along the path is saturated.
+        """
+        nonlocal entanglement_time
+        held: list[tuple[QpuEdge, _ResourcePool]] = []
+        start = earliest
+        for edge in edges:
+            pool = link_pool(edge)
+            start = max(start, pool.acquire())
+            held.append((edge, pool))
+        finish = start + duration
+        for edge, pool in held:
+            pool.release(finish)
+            link_busy[edge] = link_busy.get(edge, 0.0) + duration
+            entanglement_time += duration
+        return start, finish
+
+    def establish(ordinal: int) -> None:
+        block = blocks[ordinal]
+        state = runtime[ordinal]
+        source = block.root_qpu
+        host = block.remote_qpu
+        hops = sp.dist[source][host]
+
+        if (
+            hops >= UNREACHABLE_DISTANCE
+            or link_cap == 0
+            or not port_pools[host].available()
+            or not port_pools[source].available()
+        ):
+            state.feasible = False
+            state.ready = qubit_ready[block.root_phys] + UNSCHEDULABLE_PENALTY
+            qubit_ready[block.root_phys] = state.ready
+            # The gates this block would have served are counted where they are
+            # reached, so an operation gathered by several blocks -- a wide gate
+            # needing one teleport per foreign operand -- counts once, not once
+            # per block.
+            return
+
+        state.hops = hops
+        state.edges = tuple(path_edges(sp, source, host))
+
+        host_port = port_pools[host].acquire()
+        source_port = port_pools[source].acquire()
+        earliest = max(qubit_ready[block.root_phys], host_port, source_port)
+
+        # Distribute the pair, then run the entangler (a local CX, a Z-basis
+        # measurement, and one classical message) plus the protocol overhead.
+        distribute = model.expected_epr_time(hops)
+        start, distributed = reserve_links(state.edges, earliest, distribute)
+        ready = distributed + classical_eff + lat.remote_gate_overhead
+
+        state.ready = ready
+        state.port_start = start
+        state.holds_port = True
+        # The root's own port is only needed until the entangler completes.
+        port_pools[source].release(ready)
+        port_intervals[source].append((start, ready))
+        port_busy[source] += ready - start
+        qubit_ready[block.root_phys] = ready
+
+    def release(ordinal: int) -> None:
+        block = blocks[ordinal]
+        state = runtime[ordinal]
+        host = block.remote_qpu
+
+        if not state.feasible:
+            qubit_ready[block.root_phys] = max(
+                qubit_ready[block.root_phys], state.ready
+            )
+            return
+
+        if block.protocol == "teleport":
+            # The return trip is a second EPR pair back to the root's QPU.
+            _start, distributed = reserve_links(
+                state.edges, state.ready, model.expected_epr_time(state.hops)
+            )
+            finish = distributed + classical_eff
+        else:
+            # Cat-disentangler: an X-basis measurement plus one classical message.
+            finish = state.ready + classical_eff
+
+        qubit_ready[block.root_phys] = max(qubit_ready[block.root_phys], finish)
+        if state.holds_port:
+            port_pools[host].release(finish)
+            port_intervals[host].append((state.port_start, finish))
+            port_busy[host] += finish - state.port_start
+            state.holds_port = False
+
+    for index, instruction in enumerate(mapped.data):
+        operation = instruction.operation
+        qubits = [qindex[qubit] for qubit in instruction.qubits]
+
+        if is_directive(operation):
+            targets = qubits if qubits else list(range(n_phys))
+            if targets:
+                sync = max(qubit_ready[qubit] for qubit in targets)
+                for qubit in targets:
+                    qubit_ready[qubit] = sync
+            continue
+
+        if not qubits:
+            continue
+
+        for ordinal in starts.get(index, ()):
+            establish(ordinal)
+
+        ordinals = members.get(index)
+        if ordinals is not None:
+            remote_gates += 1
+            if any(not runtime[ordinal].feasible for ordinal in ordinals):
+                unschedulable += 1
+            host = blocks[ordinals[0]].remote_qpu
+            roots = {blocks[ordinal].root_phys for ordinal in ordinals}
+            duration = lat.swap if operation.name == "swap" else lat.twoq
+            start = max(
+                [runtime[ordinal].ready for ordinal in ordinals]
+                + [qubit_ready[qubit] for qubit in qubits if qubit not in roots]
+            )
+            finish = start + duration
+            for ordinal in ordinals:
+                runtime[ordinal].ready = finish
+            for qubit in qubits:
+                if qubit not in roots:
+                    qubit_ready[qubit] = finish
+            qpu_busy[host] += duration
+
+            for ordinal in ends.get(index, ()):
+                release(ordinal)
+            continue
+
+        qpus = {phys_to_qpu[qubit] for qubit in qubits}
+        if len(qpus) > 1:
+            # A cross-QPU gate the aggregator could not serve at all.
+            remote_gates += 1
+            unschedulable += 1
+            start = max(qubit_ready[qubit] for qubit in qubits)
+            finish = start + UNSCHEDULABLE_PENALTY
+            for qubit in qubits:
+                qubit_ready[qubit] = finish
+            continue
+
+        qpu = phys_to_qpu[qubits[0]]
+        if len(qubits) == 1:
+            duration = lat.oneq
+        elif operation.name == "swap":
+            duration = lat.swap
+        else:
+            duration = lat.twoq
+        start = max(qubit_ready[qubit] for qubit in qubits)
+        finish = start + duration
+        for qubit in qubits:
+            qubit_ready[qubit] = finish
+        qpu_busy[qpu] += duration
+
+    # Any block still holding a port ran past the end of the instruction list.
+    for ordinal, state in enumerate(runtime):
+        if state.holds_port:
+            release(ordinal)
+
+    makespan = max(qubit_ready, default=0.0)
+    for pool in port_pools:
+        makespan = max(makespan, pool.horizon())
+    for pool in link_pools.values():
+        makespan = max(makespan, pool.horizon())
+
+    return EntanglementScheduleSummary(
+        makespan=makespan,
+        blocks=len(blocks),
+        epr_pairs=plan.epr_pairs,
+        remote_gates=remote_gates,
+        unschedulable_gates=unschedulable,
+        entanglement_time=entanglement_time,
+        peak_ports_in_use=tuple(
+            _peak_overlap(intervals) for intervals in port_intervals
+        ),
+        port_busy_time=tuple(port_busy),
+        qpu_busy_time=tuple(qpu_busy),
+        link_busy_time=tuple(sorted(link_busy.items())),
+    )
+
+
+def _serialised_qubit_time(
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    lat: _ValidatedLatencyValues,
+) -> float:
+    """Longest total duration of the gates serialised on any single qubit.
+
+    Every gate touching a qubit occupies that qubit's timeline, so no schedule
+    can finish sooner than the busiest qubit's own work. Cross-QPU gates are
+    excluded: they run against a cat copy on the host QPU, on that copy's
+    timeline rather than the root's, which is exactly the parallelism the
+    entanglement model buys.
+    """
+    qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
+    load = [0.0] * len(mapped.qubits)
+    for instruction in mapped.data:
+        if is_directive(instruction.operation):
+            continue
+        qubits = [qindex[qubit] for qubit in instruction.qubits]
+        if not qubits:
+            continue
+        if len({phys_to_qpu[qubit] for qubit in qubits}) > 1:
+            continue
+        if len(qubits) == 1:
+            duration = lat.oneq
+        elif instruction.operation.name == "swap":
+            duration = lat.swap
+        else:
+            duration = lat.twoq
+        for qubit in qubits:
+            load[qubit] += duration
+    return max(load, default=0.0)
+
+
+def audit_entanglement_schedule(
+    summary: EntanglementScheduleSummary,
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+    *,
+    plan: AggregationPlan | None = None,
+    ports_per_qpu: int | Sequence[int] | None = None,
+) -> tuple[str, ...]:
+    """Check an entanglement schedule against the properties it must satisfy.
+
+    :func:`estimate_entanglement_schedule` returns aggregates and no trace, so
+    unlike :func:`audit_topology_schedule_plan` there is no event log to replay.
+    What can still be checked from the outside is everything the aggregates are
+    related by *theorem* rather than by convention:
+
+    - a QPU with ``P`` ports cannot hold more than ``P`` cat copies at once, nor
+      accrue more than ``P * makespan`` of port-busy time; a link with ``C``
+      channels cannot accrue more than ``C * makespan``;
+    - ``entanglement_time`` is by definition the total link occupancy, so it
+      equals the sum of ``link_busy_time``;
+    - every gate on a qubit occupies that qubit's timeline, so the busiest
+      qubit's own work is a lower bound on the makespan;
+    - ``remote_gates`` is the number of operations in the circuit that span more
+      than one QPU, counted as :func:`quport.distributed.split_into_qpus` counts
+      them, and no more gates can be unschedulable than there are remote ones;
+    - with ``plan``, the summary describes that plan's blocks and EPR pairs.
+
+    ``ports_per_qpu`` must be whatever the schedule was produced with; the
+    default reads the architecture's own budget, matching the estimator.
+
+    A caller who wants monotonicity instead -- that widening a resource never
+    lengthens a schedule -- can get it by scheduling one fixed ``plan`` twice and
+    comparing, which is a property of the estimator rather than of one result.
+
+    Returns
+    -------
+    tuple[str, ...]
+        One description per violated property, in the order found. Empty means
+        the summary is consistent and feasible.
+    """
+    lat = _validate_schedule_inputs(arch, model)
+    n_qpus = arch.cfg.n_qpus
+    ports = _normalized_port_budget(ports_per_qpu, arch)
+    link_cap = _validated_nonnegative_int(
+        getattr(arch.cfg, "link_capacity", 1), label="link_capacity"
+    )
+    makespan = summary.makespan
+    problems: list[str] = []
+
+    for label, values in (
+        ("peak_ports_in_use", summary.peak_ports_in_use),
+        ("port_busy_time", summary.port_busy_time),
+        ("qpu_busy_time", summary.qpu_busy_time),
+    ):
+        if len(values) != n_qpus:
+            problems.append(f"{label} has {len(values)} entries for {n_qpus} QPUs")
+
+    for qpu, peak in enumerate(summary.peak_ports_in_use[:n_qpus]):
+        if peak > ports[qpu]:
+            problems.append(
+                f"QPU {qpu} holds {peak} cat copies at once, budget is {ports[qpu]}"
+            )
+    for qpu, busy in enumerate(summary.port_busy_time[:n_qpus]):
+        if busy > ports[qpu] * makespan + 1e-6:
+            problems.append(
+                f"QPU {qpu} accrues {busy} port-busy time, but {ports[qpu]} ports "
+                f"over a {makespan} makespan allow at most {ports[qpu] * makespan}"
+            )
+    for edge, busy in summary.link_busy_time:
+        if busy > link_cap * makespan + 1e-6:
+            problems.append(
+                f"link {edge} accrues {busy} busy time, but {link_cap} channels "
+                f"over a {makespan} makespan allow at most {link_cap * makespan}"
+            )
+
+    total_link = math.fsum(busy for _edge, busy in summary.link_busy_time)
+    if not math.isclose(
+        summary.entanglement_time, total_link, rel_tol=1e-9, abs_tol=1e-6
+    ):
+        problems.append(
+            f"entanglement_time is {summary.entanglement_time}, but the per-link "
+            f"busy times sum to {total_link}"
+        )
+
+    floor = _serialised_qubit_time(mapped, arch, lat)
+    if makespan < floor - 1e-6:
+        problems.append(
+            f"makespan is {makespan}, below the {floor} of work serialised on the "
+            f"busiest single qubit"
+        )
+
+    if summary.unschedulable_gates > summary.remote_gates:
+        problems.append(
+            f"{summary.unschedulable_gates} gates unschedulable, but only "
+            f"{summary.remote_gates} are remote"
+        )
+
+    actual = _count_cross_qpu_operations(mapped, arch)
+    if summary.remote_gates != actual:
+        problems.append(
+            f"accounts for {summary.remote_gates} remote gates, the circuit has "
+            f"{actual} operations spanning more than one QPU"
+        )
+
+    if plan is not None:
+        if summary.blocks != len(plan.blocks):
+            problems.append(
+                f"reports {summary.blocks} blocks, the plan has {len(plan.blocks)}"
+            )
+        if summary.epr_pairs != plan.epr_pairs:
+            problems.append(
+                f"reports {summary.epr_pairs} EPR pairs, the plan spends "
+                f"{plan.epr_pairs}"
+            )
+
+    return tuple(problems)
+
+
+def _normalized_port_budget(
+    ports_per_qpu: int | Sequence[int] | None, arch: MultiQPUArchitecture
+) -> list[int]:
+    """Resolve the comm-port budget to one non-negative integer per QPU."""
+    n_qpus = arch.cfg.n_qpus
+    if ports_per_qpu is None:
+        return [
+            _validated_nonnegative_int(
+                arch.cfg.comm_qubits_per_qpu, label="comm_qubits_per_qpu"
+            )
+        ] * n_qpus
+    if not isinstance(ports_per_qpu, bool) and isinstance(ports_per_qpu, Integral):
+        return [
+            _validated_nonnegative_int(ports_per_qpu, label="ports_per_qpu")
+        ] * n_qpus
+    if isinstance(ports_per_qpu, str | bytes | bytearray) or not isinstance(
+        ports_per_qpu, Sequence
+    ):
+        raise ValueError("ports_per_qpu must be an integer or a sequence of integers")
+    if len(ports_per_qpu) != n_qpus:
+        raise ValueError("ports_per_qpu length must match n_qpus")
+    return [
+        _validated_nonnegative_int(value, label=f"ports_per_qpu[{index}]")
+        for index, value in enumerate(ports_per_qpu)
+    ]
+
+
+def _peak_overlap(intervals: Sequence[tuple[float, float]]) -> int:
+    """Return the largest number of intervals that overlap at one instant.
+
+    A half-open convention is used: an interval that ends exactly when another
+    begins does not count as concurrent, which matches a port being handed
+    straight from one block to the next.
+    """
+    if not intervals:
+        return 0
+    events: list[tuple[float, int]] = []
+    for start, end in intervals:
+        if end <= start:
+            continue
+        events.append((start, 1))
+        events.append((end, -1))
+    if not events:
+        return 0
+    # Releases at a shared timestamp are applied before acquisitions.
+    events.sort(key=lambda event: (event[0], event[1]))
+    live = 0
+    peak = 0
+    for _time, delta in events:
+        live += delta
+        if live > peak:
+            peak = live
+    return peak

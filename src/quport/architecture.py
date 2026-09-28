@@ -63,6 +63,16 @@ def _validate_architecture_config(cfg: MultiQPUConfig) -> None:
         raise ValueError(f"Unknown inter_topology: {cfg.inter_topology}")
 
 
+def validate_architecture_config(cfg: MultiQPUConfig) -> None:
+    """Check a config describes a buildable architecture, without building one.
+
+    ``MultiQPUArchitecture`` runs the same checks in its constructor. Callers
+    that only read the inter-QPU graph never reach that, so this gives them the
+    invariants without the cost of deriving every coupling map.
+    """
+    _validate_architecture_config(cfg)
+
+
 def _add_bidir(edges: list[tuple[int, int]], a: int, b: int) -> None:
     """Add a symmetric (bidirectional) connection to a directed CouplingMap."""
     if a == b:

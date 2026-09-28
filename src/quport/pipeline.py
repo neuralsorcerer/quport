@@ -10,7 +10,8 @@ import csv
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TypeAlias, TypeVar
+from pathlib import Path
+from typing import TextIO, TypeAlias, TypeVar
 
 from qiskit import QuantumCircuit, transpile
 from qiskit.circuit.random import random_circuit
@@ -19,6 +20,7 @@ from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
+from quport.hypergraph import build_distributable_packets
 from quport.interaction import (
     extract_temporal_twoq_weights,
     extract_twoq_weights,
@@ -44,10 +46,25 @@ _BENCHMARK_METHOD_IDS = {
     "tpccap": 2.0,
     "tpccap_sa": 3.0,
     "cluster": 4.0,
+    "ebit": 5.0,
 }
 _BENCHMARK_METHOD_LABELS = {
     method_id: strategy for strategy, method_id in _BENCHMARK_METHOD_IDS.items()
 }
+
+
+def _open_csv_for_write(out_csv: str) -> TextIO:
+    """Open ``out_csv`` for writing, creating the directory it names.
+
+    A sweep can run for minutes before it reaches this line. Leaving the
+    directory to the caller meant the whole run was lost to a FileNotFoundError
+    once it finished, so the parent is created here as the bundle writers and
+    the ``--out-dir`` commands already do.
+    """
+    parent = Path(out_csv).parent
+    if parent != Path(""):
+        parent.mkdir(parents=True, exist_ok=True)
+    return open(out_csv, "w", newline="", encoding="utf-8")
 
 
 def benchmark_method_labels() -> dict[float, str]:
@@ -177,6 +194,8 @@ def map_and_transpile(
         - "cluster" : heavy-edge clustering baseline
         - "tpccap"    : topology+port+congestion aware partitioner (novel)
         - "tpccap_sa" : TPCCAP + simulated annealing refinement (best)
+        - "ebit"      : TPCCAP-SA minimising hop-scaled e-bit demand instead of
+          cut weight, i.e. the EPR pairs left after communication aggregation
     temporal_decay:
         Interaction weighting for the topology-aware strategies, matching the
         argument of the same name on :func:`quport.compiler.compile_distributed`.
@@ -284,6 +303,27 @@ def map_and_transpile(
         partition_diag = diag
         comm_mode = "diverse"
 
+    elif strategy == "ebit":
+        sp = arch.qpu_shortest_paths()
+        pres, diag, _anneal = tpccap_sa_partition(
+            n=qc_basis.num_qubits,
+            weights=topology_weights(0.98),
+            n_qpus=cfg.n_qpus,
+            capacity=capacity,
+            comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
+            sp=sp,
+            seed=seed,
+            # Communication volume is measured in e-bits, so the cut-distance
+            # term is switched off rather than added on top of it.
+            w_dist=0.0,
+            packets=build_distributable_packets(qc_basis),
+            w_ebit=1.0,
+        )
+        part = pres.part
+        cut = pres.cut
+        partition_diag = diag
+        comm_mode = "diverse"
+
     elif strategy == "cluster":
         part = heavy_edge_clustering_partition(
             n=qc_basis.num_qubits,
@@ -299,7 +339,8 @@ def map_and_transpile(
 
     else:
         raise ValueError(
-            "Unknown strategy. Use 'balanced', 'cluster', 'tpccap', or 'tpccap_sa'."
+            "Unknown strategy. Use 'balanced', 'cluster', 'ebit', 'tpccap', "
+            "or 'tpccap_sa'."
         )
 
     hints = compute_layout_hints(qc_basis, arch, part, comm_mode=comm_mode)
@@ -429,11 +470,12 @@ def benchmark_random_circuits(
         - "cluster": heavy-edge clustering partitioner
         - "tpccap": QuPort novel partitioner (topology+port+congestion aware)
         - "tpccap_sa": TPCCAP plus simulated-annealing refinement
+        - "ebit": TPCCAP-SA driven by e-bit demand after aggregation
 
     Notes
     -----
     The CSV is deliberately numeric-friendly. The column `method` encodes:
-        baseline=0, balanced=1, tpccap=2, tpccap_sa=3, cluster=4
+        baseline=0, balanced=1, tpccap=2, tpccap_sa=3, cluster=4, ebit=5
     and the column `strategy` stores the string name for readability.
     """
     latency = latency or LatencyModel()
@@ -498,7 +540,7 @@ def benchmark_random_circuits(
             )
 
     if out_csv:
-        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        with _open_csv_for_write(out_csv) as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -632,7 +674,7 @@ def sweep_topologies(
         "cost_median",
         "transpile_time_mean",
     ]
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    with _open_csv_for_write(out_csv) as f:
         writer = csv.DictWriter(f, fieldnames=sweep_fieldnames)
         writer.writeheader()
         writer.writerows(summary)
