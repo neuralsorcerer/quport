@@ -404,9 +404,11 @@ def verify_telegate_equivalence(
     The coherent expansion is run on a pseudo-random product input, the
     ancillas are traced out, and the resulting state of the data qubits is
     compared with the mapped circuit's state on the same input. Returning
-    ``True`` therefore certifies two things at once: the data come out right,
-    **and** the ancillas are left unentangled from them -- residual entanglement
-    would show up as a mixed reduced state and drive the fidelity below one.
+    ``True`` therefore establishes two things at once for that input: the data
+    come out right, **and** the ancillas are left unentangled from them --
+    residual entanglement would show up as a mixed reduced state and drive the
+    fidelity below one. One generic input is strong evidence for every input,
+    not a proof of it; see :func:`_random_product_state`.
 
     This is the empirical counterpart of :mod:`quport.entanglement`'s
     diagonality rule. Aggregating across an operation that breaks the rule sends
@@ -562,11 +564,13 @@ def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
 
 
 def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:
-    """Deterministic single-qubit rotations covering the whole Bloch sphere.
+    """Deterministic single-qubit rotations giving every qubit a generic state.
 
-    A product state is enough: the protocol is linear, so agreeing on a
-    spanning set of inputs is agreement everywhere, and the angles below give
-    every qubit a generic state with non-zero amplitude on both basis vectors.
+    The angles give each qubit non-zero amplitude on both basis vectors, so the
+    input overlaps every computational basis state. That makes agreement on it
+    a strong check rather than a proof: one input is not a spanning set, and two
+    circuits can agree on a particular state while differing elsewhere. A wrong
+    protocol passes only if it happens to map this one generic input correctly.
     """
     if type(seed) is bool or not isinstance(seed, int):
         raise ValueError("seed must be an integer")

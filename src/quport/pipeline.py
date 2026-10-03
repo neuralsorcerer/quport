@@ -32,6 +32,7 @@ from quport.partition import (
     PartitionDiagnostics,
     PartitionResult,
     balanced_greedy_partition,
+    ebit_partition,
     heavy_edge_clustering_partition,
     tpccap_partition,
     tpccap_sa_partition,
@@ -305,19 +306,18 @@ def map_and_transpile(
 
     elif strategy == "ebit":
         sp = arch.qpu_shortest_paths()
-        pres, diag, _anneal = tpccap_sa_partition(
+        # The same objective `compile_distributed` uses for this strategy,
+        # penalty rescaling included, so `quport map/bench/sweep --strategy ebit`
+        # measure the strategy the rest of QuPort calls by that name.
+        pres, diag, _anneal = ebit_partition(
             n=qc_basis.num_qubits,
             weights=topology_weights(0.98),
             n_qpus=cfg.n_qpus,
             capacity=capacity,
             comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
             sp=sp,
-            seed=seed,
-            # Communication volume is measured in e-bits, so the cut-distance
-            # term is switched off rather than added on top of it.
-            w_dist=0.0,
             packets=build_distributable_packets(qc_basis),
-            w_ebit=1.0,
+            seed=seed,
         )
         part = pres.part
         cut = pres.cut

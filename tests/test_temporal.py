@@ -118,7 +118,7 @@ def test_a_single_window_is_the_static_model():
 
 
 def test_a_moved_root_loses_its_cat_copies():
-    """Teleporting a root invalidates every copy of it, so the copy is re-paid.
+    """Teleporting a root starts a new epoch, so its copy is re-paid.
 
     Two `cz` from one control into one remote QPU share a copy and cost one
     e-bit. Move the control between them and the second gate needs a fresh copy,

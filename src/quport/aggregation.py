@@ -183,8 +183,8 @@ class AggregationPlan:
         """Map every served instruction index to the blocks that serve it.
 
         Cross-QPU two-qubit gates always map to exactly one block. An operation
-        on three or more qubits spanning ``k`` QPUs maps to the ``k - 1``
-        teleport blocks that gather its operands, so the value is a tuple.
+        on three or more qubits maps to one teleport block per operand sitting
+        off its host QPU, the blocks that gather it, so the value is a tuple.
         """
         out: dict[int, list[RemoteBlock]] = {}
         for block in self.blocks:
@@ -463,12 +463,14 @@ def aggregate_remote_operations(
             for qubit in qubits:
                 close_root(qubit)
             host = qpus[0]
-            seen = {host}
-            foreign: list[tuple[int, int]] = []
-            for qubit, qpu in zip(qubits[1:], qpus[1:], strict=True):
-                if qpu not in seen:
-                    seen.add(qpu)
-                    foreign.append((qubit, qpu))
+            # Every operand off the host is teleported, including two that share
+            # a QPU: one EPR pair moves one qubit, so gathering only one of them
+            # would leave the gate spanning QPUs still.
+            foreign = [
+                (qubit, qpu)
+                for qubit, qpu in zip(qubits[1:], qpus[1:], strict=True)
+                if qpu != host
+            ]
             if foreign:
                 remote_gates += 1
                 # Every foreign operand has to sit on the host at the same time,

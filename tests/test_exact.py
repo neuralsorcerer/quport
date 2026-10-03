@@ -139,6 +139,28 @@ def test_ebit_objective_matches_exhaustive_search():
     assert checked >= 30
 
 
+def test_a_wide_gate_is_cheapest_with_its_host_kept_company():
+    """Two operands off the host cost two round trips, so the search avoids it.
+
+    A Toffoli on three qubits over two QPUs of capacity two must leave one
+    operand behind. Stranding a guest costs one round trip; stranding the host,
+    which sends both guests travelling, costs two.
+    """
+    qc = QuantumCircuit(3)
+    qc.ccx(0, 1, 2)
+    packets = build_distributable_packets(qc)
+
+    best = optimal_partition(3, 2, 2, objective="ebits", packets=packets)
+
+    assert best.proved_optimal
+    assert best.objective == 2.0
+    assert best.part[0] in (best.part[1], best.part[2])
+
+    stranded_host = partition_gap([0, 1, 1], 2, 2, objective="ebits", packets=packets)
+    assert stranded_host.heuristic == 4.0
+    assert stranded_host.absolute == 2.0
+
+
 def test_incremental_cost_is_rolled_back_exactly():
     """A stale incremental cost would show up as a wrong second answer."""
     rng = random.Random(7)

@@ -278,6 +278,35 @@ def test_summary_serializes_to_standards_compliant_json() -> None:
     assert restored["link_busy_time"][0]["edge"] == [0, 1]
 
 
+def test_plan_short_of_an_entangler_port_is_rejected() -> None:
+    """Fitting the copies is not enough: the root's QPU needs a port too.
+
+    With two ports, QPU0 can host a copy of qubit 4 and still lend a port to
+    the entangler of a block rooted at qubit 1. With one, that port is taken.
+    The plan never holds more than one copy per QPU, so a check on peak copies
+    alone let it through, and the schedule reported a gate unschedulable
+    instead of saying the plan did not fit.
+    """
+    arch = _arch(comm_qubits_per_qpu=1)  # QPU0 holds 0..3, QPU1 holds 4..7
+    qc = QuantumCircuit(arch.n_phys)
+    qc.cx(4, 0)  # copy of 4 on QPU0
+    qc.cx(1, 5)  # entangler for a copy of 1 needs a port on QPU0
+    qc.cx(4, 2)  # keeps the copy of 4 live across it
+
+    roomy_plan = aggregate_remote_operations(qc, arch, ports_per_qpu=2)
+    assert roomy_plan.peak_cat_copies == (1, 1)
+
+    with pytest.raises(ValueError, match="needs a root port on QPU 0"):
+        estimate_entanglement_schedule(qc, arch, LatencyModel(), plan=roomy_plan)
+
+    # The matching budget evicts instead: the copy of 4 to free QPU0 for the
+    # entangler, then the copy of 1 to free QPU1 for the next one.
+    matched = aggregate_remote_operations(qc, arch)
+    summary = estimate_entanglement_schedule(qc, arch, LatencyModel(), plan=matched)
+    assert summary.unschedulable_gates == 0
+    assert matched.evictions == 2
+
+
 def test_plan_built_for_a_larger_port_budget_is_rejected() -> None:
     """A mismatched plan is a clear error, not a silent unschedulable penalty."""
     arch = _arch(comm_qubits_per_qpu=1)

@@ -235,6 +235,27 @@ def test_ebit_strategy_is_available_end_to_end() -> None:
     assert len(result.partition) == 8
 
 
+def test_ebit_strategy_means_the_same_objective_in_both_pipelines() -> None:
+    """``map_and_transpile`` and ``compile_distributed`` must run one ``ebit``.
+
+    Both translate the circuit the same way, decay its weights the same way and
+    build the same packets, so with the same objective they reach the same
+    partition. ``map_and_transpile`` used to keep the pre-rescaling penalties --
+    a squared boundary-qubit port term that dwarfs an e-bit count, and gate
+    congestion annealed at four times the seed's weight -- so ``quport map``,
+    ``bench`` and ``sweep`` measured a different strategy under the same name.
+    """
+    cfg = _cfg(n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2)
+    for seed in range(4):
+        qc = random_benchmark_circuit(n_logical=16, depth=12, seed=seed)
+
+        mapped = map_and_transpile(qc, cfg, seed=seed, strategy="ebit")
+        compiled = compile_distributed(qc, cfg, seed=seed, strategy="ebit")
+
+        assert mapped.partition == compiled.partition
+        assert mapped.partition_diagnostics == compiled.partition_diagnostics
+
+
 def test_unknown_strategy_message_lists_ebit() -> None:
     cfg = _cfg()
     with pytest.raises(ValueError, match="'ebit'"):

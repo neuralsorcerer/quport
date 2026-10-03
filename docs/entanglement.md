@@ -70,9 +70,10 @@ hypergraph partitioning: one e-bit per packet per *distinct remote QPU* its part
 occupy.
 
 Two kinds of gate cannot be served by one bipartite copy: two-qubit gates with no
-diagonal operand, and operations on three or more qubits. A gate of either kind
-spanning `k` QPUs is charged `2 * (k - 1)` e-bits — teleport each foreign operand to
-one host and back.
+diagonal operand, and operations on three or more qubits. A gate of either kind runs
+on the QPU of its first operand, and each operand sitting anywhere else is teleported
+there and back, so a gate with `f` operands off that QPU is charged `2 * f` e-bits.
+The count is per operand: two operands on the same foreign QPU cost two round trips.
 
 Each gate is charged to exactly one root, so the count is exact for that assignment
 and an upper bound over all assignments. Gates with two diagonal operands (`cz`,
@@ -288,7 +289,9 @@ stays put, so cost is counted over **root epochs** — maximal runs of a packet'
 gates during which the root's QPU does not change. Within an epoch, one e-bit is
 charged per distinct remote QPU the partners occupy *at the time their own gates
 run*, so a partner that migrates mid-packet correctly costs a second copy, and
-teleporting the root correctly invalidates every copy of it.
+teleporting the root starts a new epoch whose copies are paid for afresh. That is
+conservative rather than forced -- teleportation carries the root's entanglement
+along, so an old copy would still be valid -- and keeps the count an upper bound.
 
 That is what makes the generalisation faithful: with one window, or with the same
 assignment in every window, the cost is *identically* `ebit_cost`. A saving can

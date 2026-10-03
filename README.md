@@ -479,10 +479,12 @@ one control into one QPU cost ten units of cut weight and one e-bit.
 
 Two kinds of gate cannot be served by a single cat copy: two-qubit gates with no
 diagonal operand (`swap`, `iswap`, `ecr`, `rxx`), and operations on three or more
-qubits, which a bipartite copy cannot bring together. A gate of either kind spanning
-$k$ QPUs is charged $2(k-1)$ e-bits, the cost of teleporting every foreign operand to
-one host and back, which is also the standard cost of an arbitrary non-local
-two-qubit unitary.
+qubits, which a bipartite copy cannot bring together. A gate of either kind runs on
+the QPU of its first operand, and every operand sitting anywhere else is teleported
+there and back, so a gate with $f$ operands off that QPU is charged $2f$ e-bits. The
+count is per operand, not per QPU: one EPR pair teleports one qubit, so two operands
+on the same foreign QPU cost two round trips. For a two-qubit gate that is $2$, the
+standard cost of an arbitrary non-local two-qubit unitary.
 
 Because each gate is charged to exactly one root, $E(\pi)$ is exact for the chosen
 root assignment and an upper bound over all assignments. Gates whose *both* operands
@@ -700,7 +702,10 @@ stays put, so the count runs over **root epochs** — maximal runs of a packet's
 gates during which the root's QPU does not change — and within an epoch one e-bit
 is charged per distinct remote QPU the partners occupy *at the time their own
 gates run*. A partner that migrates mid-packet therefore costs a second copy, and
-teleporting the root correctly kills every copy of it.
+teleporting the root starts a new epoch whose copies are paid for afresh. That is a
+conservative choice, not a physical necessity: teleportation carries the root's
+entanglement along, so an old copy would still be valid. It keeps the count an
+upper bound.
 
 That makes the generalisation faithful in the strong sense: with one window, or
 with the same assignment in every window, the cost is *identically* $E(\pi)$. A

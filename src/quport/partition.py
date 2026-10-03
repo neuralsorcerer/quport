@@ -1100,9 +1100,11 @@ def tpccap_sa_partition(
 
     Objective
     ---------
-    Same three terms as TPCCAP (distance + port overflow + congestion), with soft
-    penalties for capacity overflow (kept very large so feasible solutions dominate)
-    -- but by default **not the same weighting**. The seed is built with ``w_cong``
+    The same terms as TPCCAP (distance + port overflow + congestion, plus the
+    optional e-bit term) -- but by default **not the same weighting**. Capacity is
+    not one of the terms: it is a hard constraint, because a move only ever targets
+    a QPU with a free slot and a swap leaves every load unchanged, so every state
+    the annealing visits is feasible. The seed is built with ``w_cong``
     (default ``0.05``, matching :func:`tpccap_partition`); the annealing stage then
     optimizes ``anneal_w_cong`` (default ``0.2``), four times the congestion penalty.
     Pass ``anneal_w_cong=None`` to anneal on exactly the objective the seed was built
@@ -1128,14 +1130,15 @@ def tpccap_sa_partition(
     every cut gate. Switching the volume term to e-bits shrinks it by the
     aggregation factor -- often an order of magnitude -- and a penalty left at
     its old scale then dominates the objective it was meant to bias. Whichever
-    terms are combined, they have to be commensurate; QuPort's ``"ebit"``
-    compile strategy sets the penalties accordingly.
+    terms are combined, they have to be commensurate; :func:`ebit_partition`, which
+    is QuPort's ``"ebit"`` strategy, sets the penalties accordingly.
 
     Notes
     -----
     - This is designed for research workloads where n_qpus is small (e.g., 10).
-    - For speed, objective is recomputed each accepted move. This is still fast for
-      typical random circuits (<= few thousand unique 2Q pairs).
+    - The objective is recomputed in full for every proposal, accepted or not.
+      This is still fast for typical random circuits (<= few thousand unique 2Q
+      pairs).
 
     Returns
     -------
@@ -1419,4 +1422,63 @@ def tpccap_sa_partition(
         AnnealDiagnostics(
             steps=steps, accepted=accepted, improved=improved, best_objective=best_obj
         ),
+    )
+
+
+def ebit_partition(
+    n: int,
+    weights: Mapping[tuple[int, int], float],
+    n_qpus: int,
+    capacity: int,
+    comm_ports_per_qpu: int,
+    sp: QpuShortestPaths,
+    packets: PacketDecomposition,
+    seed: int | None = None,
+) -> tuple[PartitionResult, PartitionDiagnostics, AnnealDiagnostics]:
+    """QuPort's ``"ebit"`` strategy: TPCCAP-SA priced in EPR pairs.
+
+    Every entry point that accepts ``strategy="ebit"`` partitions through this
+    function, so the name means one objective wherever it appears rather than
+    one per caller.
+
+    Relative to :func:`tpccap_sa_partition`'s defaults it changes four things:
+
+    - Communication volume is measured in e-bits, so the cut-distance term is
+      switched off (``w_dist=0``) rather than added on top of hop-scaled e-bit
+      demand (``w_ebit=1``).
+    - The boundary-qubit port penalty is dropped (``w_port=0``). Its squared
+      overflow is one to two orders of magnitude larger than an e-bit count, and
+      it measures the wrong resource anyway: what a cat-entanglement compiler
+      needs a port for is a live cat copy, not every boundary qubit. Under
+      aggregation a port shortage is already priced -- it costs an eviction and
+      a fresh EPR pair -- so the penalty would be double-counted.
+    - Congestion is kept, but routed from EPR demand rather than gate demand
+      (``congestion_source="ebits"``), so it describes the same traffic the
+      e-bit term prices.
+    - Both stages use the same congestion weight (``w_cong=anneal_w_cong=0.05``),
+      because the default fourfold annealing asymmetry was tuned against the
+      larger gate-traffic scale.
+
+    Parameters
+    ----------
+    packets:
+        Packet decomposition of the same circuit the weights came from. The
+        weights still seed the TPCCAP search and rank candidate QPUs, but the
+        objective itself is priced from the packets.
+    """
+    return tpccap_sa_partition(
+        n=n,
+        weights=weights,
+        n_qpus=n_qpus,
+        capacity=capacity,
+        comm_ports_per_qpu=comm_ports_per_qpu,
+        sp=sp,
+        seed=seed,
+        w_dist=0.0,
+        w_port=0.0,
+        w_cong=0.05,
+        anneal_w_cong=0.05,
+        packets=packets,
+        w_ebit=1.0,
+        congestion_source="ebits",
     )

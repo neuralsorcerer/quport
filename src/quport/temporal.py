@@ -35,8 +35,11 @@ root stays put, so the cost is counted over **root epochs** -- maximal runs of a
 packet's gates during which the root's QPU does not change. Within an epoch, one
 e-bit is charged per distinct remote QPU the partners occupy *at the time their
 own gates run*, so a partner that migrates mid-packet correctly costs a second
-copy. Teleporting the root invalidates every copy of it, which is exactly what
-starting a new epoch expresses.
+copy. Teleporting the root starts a new epoch whose copies are paid for afresh.
+That is a conservative choice rather than a physical necessity -- teleportation
+carries the root's entanglement with it, so a copy made before the move would
+still be valid after it -- and it keeps the count an upper bound on what the
+plan needs.
 
 Scope
 -----
@@ -380,7 +383,8 @@ def _cost(
             window = window_of(gate_index)
             root_qpu = assignments[window][root]
             if root_qpu != epoch_root:
-                # The root moved, so every copy of it died with the teleport.
+                # The root moved: pay for its copies afresh. Conservative, since
+                # teleportation would carry the entanglement along.
                 epoch_root = root_qpu
                 charged = set()
             partner_qpu = assignments[window][partner]
@@ -392,8 +396,12 @@ def _cost(
     for gate in decomposition.unpackable_gates:
         window = window_of(gate.index)
         assignment = assignments[window]
-        spanned = {assignment[qubit] for qubit in gate.qubits}
-        unpackable_ebits += 2 * (len(spanned) - 1)
+        # A round trip for every operand off the host, the first operand's QPU,
+        # exactly as quport.hypergraph charges it.
+        host = assignment[gate.qubits[0]]
+        unpackable_ebits += 2 * sum(
+            1 for qubit in gate.qubits[1:] if assignment[qubit] != host
+        )
 
     moves = 0
     for boundary in range(len(assignments) - 1):

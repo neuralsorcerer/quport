@@ -462,6 +462,12 @@ leave their historical objectives unchanged and only fill in the `ebits` and
 rather than gate demand through the congestion term, and requires `packets`; gate
 demand upper-bounds EPR demand, because aggregation only ever removes transactions.
 
+`ebit_partition(n, weights, n_qpus, capacity, comm_ports_per_qpu, sp, packets, seed=None)`
+is the `ebit` strategy itself: `tpccap_sa_partition` with `w_dist=0`, `w_ebit=1`,
+`w_port=0`, `w_cong=anneal_w_cong=0.05`, and `congestion_source="ebits"`. Both
+`map_and_transpile` and `compile_distributed` partition through it, so
+`strategy="ebit"` names one objective in either pipeline.
+
 `compile_distributed` returns `packets`, `ebits`, `aggregation`, and
 `entanglement_schedule` alongside its existing fields.
 

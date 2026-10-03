@@ -15,7 +15,11 @@ from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit
 
-from quport.aggregation import AggregationPlan, aggregate_remote_operations
+from quport.aggregation import (
+    AggregationPlan,
+    RemoteBlock,
+    aggregate_remote_operations,
+)
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig, validate_epr_success_prob
 from quport.distributed import RemoteOp, split_into_qpus
@@ -245,8 +249,13 @@ def estimate_parallel_makespan_layered(
     - Within a layer, local ops on different QPUs are assumed to proceed in parallel.
     - Remote ops in the same layer are executed in parallel **up to comm port capacity**.
 
-    Remote ops are grouped into "rounds" so that each QPU participates in at most
-    `arch.cfg.comm_qubits_per_qpu` remote ops per round.
+    Remote ops are charged in "rounds", each QPU taking part in at most
+    `arch.cfg.comm_qubits_per_qpu` remote ops per round. The round count is the
+    per-QPU lower bound ``ceil(max remote ops on one QPU / comm ports)``, not
+    the result of packing the ops: three QPUs exchanging pairwise with one port
+    each need three rounds and are charged two. That optimism is of a piece with
+    the best-case model below; :func:`estimate_parallel_makespan_topology`
+    packs the rounds explicitly.
 
     The per-layer duration is computed as:
         max(local_layer_duration, remote_rounds * remote_cost)
@@ -1381,9 +1390,9 @@ def estimate_entanglement_schedule(
     ----------
     plan:
         A pre-computed aggregation plan. When omitted, one is built with the
-        architecture's own port budget. A supplied plan must have been built with
-        the same budget the schedule uses, otherwise it asks for ports that do
-        not exist and the call raises.
+        architecture's own port budget. A supplied plan must fit the budget the
+        schedule uses -- as one built with that same budget always does --
+        otherwise it asks for ports that do not exist and the call raises.
     ports_per_qpu:
         Override the comm-port budget, matching the parameter of
         :func:`quport.aggregation.aggregate_remote_operations`. Passing a large
@@ -1392,8 +1401,9 @@ def estimate_entanglement_schedule(
     Raises
     ------
     ValueError
-        If ``plan`` holds more concurrent cat copies on some QPU than the
-        schedule's port budget allows.
+        If ``plan`` needs more comm ports on some QPU at once than the
+        schedule's budget allows: more live cat copies than it has ports, or no
+        port left over for the entangler of a block rooted there.
 
     Returns
     -------
@@ -1426,6 +1436,14 @@ def estimate_entanglement_schedule(
                     f"(QPU {qpu} holds {peak} cat copies, budget is {ports[qpu]}); "
                     "build the plan with the same ports_per_qpu"
                 )
+        # Fitting the copies is not the whole budget: a block's entangler also
+        # needs a port on the root's QPU while it runs.
+        shortfall = _plan_port_shortfall(plan, ports)
+        if shortfall is not None:
+            raise ValueError(
+                f"aggregation plan exceeds the schedule's comm-port budget "
+                f"({shortfall}); build the plan with the same ports_per_qpu"
+            )
 
     sp = arch.qpu_shortest_paths()
     classical_eff = _effective_classical_rtt(cfg, lat)
@@ -1824,6 +1842,51 @@ def _normalized_port_budget(
         _validated_nonnegative_int(value, label=f"ports_per_qpu[{index}]")
         for index, value in enumerate(ports_per_qpu)
     ]
+
+
+def _plan_port_shortfall(plan: AggregationPlan, ports: Sequence[int]) -> str | None:
+    """Replay a plan's port holds in the order the scheduler takes them.
+
+    :func:`estimate_entanglement_schedule` establishes every block starting at
+    an instruction before running it, and releases the blocks ending there
+    after. Establishing needs a free port on both ends: the host keeps its port
+    until the block is released, the root's QPU only while the entangler runs.
+    A plan that ever asks for a port when none is free would drain a pool and be
+    reported as unschedulable gates, so it is described here instead.
+
+    A port is counted for every block, including ones the scheduler later finds
+    unreachable and never actually acquires for. That never rejects a plan built
+    with the same budget: :func:`quport.aggregation.aggregate_remote_operations`
+    reserves those ports the same way, without knowing about reachability, and
+    keeps a copy live at least until its last gate, which is when the scheduler
+    releases it.
+
+    Returns ``None`` when the plan fits, otherwise a description of the first
+    shortfall.
+    """
+    n_qpus = len(ports)
+    starts: dict[int, list[RemoteBlock]] = {}
+    ends: dict[int, list[RemoteBlock]] = {}
+    for block in plan.blocks:
+        for qpu in (block.root_qpu, block.remote_qpu):
+            if qpu < 0 or qpu >= n_qpus:
+                return f"a block names QPU {qpu}, the architecture has {n_qpus}"
+        starts.setdefault(block.start_index, []).append(block)
+        ends.setdefault(block.end_index, []).append(block)
+
+    held = [0] * n_qpus
+    for index in sorted(starts.keys() | ends.keys()):
+        for block in starts.get(index, ()):
+            for qpu, role in ((block.remote_qpu, "host"), (block.root_qpu, "root")):
+                if held[qpu] >= ports[qpu]:
+                    return (
+                        f"instruction {index} needs a {role} port on QPU {qpu}, "
+                        f"which has all {ports[qpu]} in use"
+                    )
+            held[block.remote_qpu] += 1
+        for block in ends.get(index, ()):
+            held[block.remote_qpu] -= 1
+    return None
 
 
 def _peak_overlap(intervals: Sequence[tuple[float, float]]) -> int:
