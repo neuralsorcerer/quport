@@ -536,6 +536,17 @@ class EbitReport:
         consumes.
     reduction:
         ``1 - ebits / baseline_ebits``, or ``0.0`` when no e-bits are needed.
+    packets / active_packets:
+        Distributable packets in the circuit, and how many of them reach at
+        least one remote QPU under this partition.
+    packed_gates:
+        Two-qubit gates covered by some packet, local or cross-QPU.
+    cut_gates:
+        Packet gates whose partner sits off the root's QPU, i.e. the cross-QPU
+        gates cat copies serve. Unpackable gates are not included; their cost
+        is ``unpackable_ebits``.
+    unpackable_ebits:
+        E-bits spent teleporting the operands of unpackable gates.
     peak_cat_copies:
         Per QPU, the largest number of cat copies that are simultaneously live.
         A value above the QPU's comm-port count means the unconstrained plan is

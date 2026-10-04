@@ -758,7 +758,14 @@ without a scale. `quport.exact` solves the same two partitioning problems exactl
 by branch and bound, on instances small enough for that to terminate:
 
 ```python
+from quport import MultiQPUConfig, compile_distributed
 from quport.exact import optimal_partition, partition_gap
+from quport.pipeline import random_benchmark_circuit
+
+# 9 qubits on 3 QPUs of capacity 3.
+cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+result = compile_distributed(random_benchmark_circuit(9, 10, 0), cfg, seed=0, strategy="ebit")
+packets = result.packets  # built from the circuit the partitioner actually saw
 
 best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
 gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
@@ -1390,13 +1397,22 @@ print(ebit_cost(build_distributable_packets(qc), [0] * qc.num_qubits, cfg.n_qpus
 ### Emitting and verifying the protocol
 
 ```python
-from quport import (
-    MultiQPUArchitecture,
-    build_telegate_circuit,
-    verify_telegate_equivalence,
-)
 from qiskit import qasm3
 
+from quport import (
+    MultiQPUArchitecture,
+    MultiQPUConfig,
+    build_telegate_circuit,
+    compile_distributed,
+    verify_telegate_equivalence,
+)
+from quport.pipeline import random_benchmark_circuit
+
+# Small on purpose: verification simulates the data qubits *and* the protocol
+# ancillas, and the 24-qubit architecture above would not fit.
+cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=3, comm_qubits_per_qpu=2)
+qc = random_benchmark_circuit(n_logical=6, depth=6, seed=0)
+result = compile_distributed(qc, cfg, seed=0, strategy="ebit")
 arch = MultiQPUArchitecture(cfg)
 
 # Unitary form: checkable by simulation.
@@ -1412,7 +1428,8 @@ qasm3.dumps(runnable.circuit)
 ```
 
 Verification is a state-vector simulation, so keep the circuit small — it is
-refused above 24 qubits.
+refused above 24 qubits, counting the protocol ancillas as well as the
+architecture's physical qubits.
 
 ### Custom architecture inspection
 

@@ -55,6 +55,7 @@ import random
 from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
+from numbers import Integral
 
 from quport.hypergraph import PacketDecomposition, ebit_cost
 
@@ -455,7 +456,16 @@ def temporal_ebit_cost(
 def static_temporal_partition(
     part: Sequence[int], windows: Sequence[TemporalWindow]
 ) -> TemporalPartition:
-    """Hold one assignment for every window, i.e. today's static placement."""
+    """Hold one assignment for every window, i.e. today's static placement.
+
+    Entries are checked before they are converted, as every other placement
+    input in QuPort is: ``int()`` alone would quietly turn ``0.7`` into QPU 0
+    and ``True`` into QPU 1, and the cost would then describe a placement the
+    caller never gave.
+    """
+    for index, qpu in enumerate(part):
+        if type(qpu) is bool or not isinstance(qpu, Integral):
+            raise ValueError(f"part[{index}] must be an integer QPU index")
     assignment = tuple(int(qpu) for qpu in part)
     if not windows:
         raise ValueError("windows must not be empty")

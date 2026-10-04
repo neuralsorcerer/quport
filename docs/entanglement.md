@@ -272,7 +272,12 @@ instruction stream into contiguous **windows**, give each its own assignment, an
 charge a teleport for each qubit whose QPU changes between neighbouring windows.
 
 ```python
+from quport import MultiQPUConfig, compile_distributed
+from quport.pipeline import random_benchmark_circuit
 from quport.temporal import optimize_temporal_partition, split_windows
+
+cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=3, comm_qubits_per_qpu=1)
+result = compile_distributed(random_benchmark_circuit(12, 20, 0), cfg, seed=0, strategy="ebit")
 
 windows = split_windows(result.packets, 3)
 plan = optimize_temporal_partition(
@@ -353,7 +358,14 @@ same two problems exactly, by branch and bound, on instances small enough for th
 to terminate:
 
 ```python
+from quport import MultiQPUConfig, compile_distributed
 from quport.exact import optimal_partition, partition_gap
+from quport.pipeline import random_benchmark_circuit
+
+# 9 qubits on 3 QPUs of capacity 3.
+cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+result = compile_distributed(random_benchmark_circuit(9, 10, 0), cfg, seed=0, strategy="ebit")
+packets = result.packets  # built from the circuit the partitioner actually saw
 
 best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
 gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
@@ -400,7 +412,7 @@ quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
 
 | Field | Where | Meaning |
 |---|---|---|
-| `ebits` | `EbitReport` | EPR pairs with unlimited ports — a lower bound on the plan |
+| `ebits` | `EbitReport` | EPR pairs with unlimited ports — a lower bound on the plan when every remote gate's root is forced (the default `cx` basis); symmetric gates can put either figure lower |
 | `epr_pairs` | `AggregationPlan` | EPR pairs under the real port budget |
 | `baseline_epr_pairs` | `AggregationPlan` | what a per-gate telegate compiler would spend |
 | `reduction` | both | fraction saved against that baseline |

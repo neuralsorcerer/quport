@@ -10,8 +10,9 @@ custom workflows, use the Python API documented in [API reference](api-reference
 - Strategy values use the Python strategy names, for example `tpccap_sa`.
 - Config paths may be JSON or YAML; YAML requires the `yaml` extra.
 - Output directories are created when possible by artifact-writing commands.
-- Commands that operate on one circuit (`map`, `schedule`, `split`, and
-  `compile-dist`) can either generate a random benchmark with `--n-logical` or
+- Commands that operate on one circuit (`map`, `schedule`, `split`, `ebits`,
+  `optimal`, `migrate`, and `compile-dist`) can either generate a random
+  benchmark with `--n-logical` or
   load a user OpenQASM 2/3 circuit with `--input-qasm path/to/circuit.qasm`.
   OpenQASM 2 loads with Qiskit's built-in parser; OpenQASM 3 requires Qiskit's
   optional `qiskit_qasm3_import` package.
@@ -92,8 +93,9 @@ quport sweep --n-logical 8 --depth 20 --trials 5 --out sweep.csv --plot sweep.pn
 ```
 
 Sweeps built-in topology and port settings. `--plot` requires `quport[viz]`. The
-CSV contains aggregate means rather than one row per random circuit. Use `bench`
-when you need raw per-trial rows.
+CSV contains one aggregate row per setting and strategy -- means, plus a median of
+the cost -- rather than one row per random circuit. Use `bench` when you need raw
+per-trial rows.
 
 ## `quport schedule`
 

@@ -31,7 +31,13 @@ UNSCHEDULABLE_PENALTY: float = float(UNREACHABLE_DISTANCE)
 
 @dataclass(frozen=True)
 class ScheduleSummary:
-    """A coarse schedule summary (research metric)."""
+    """A coarse schedule summary (research metric).
+
+    ``steps`` means something different for each estimator that returns this:
+    the number of remote synchronisations for :func:`estimate_parallel_makespan`,
+    and the number of DAG layers -- with or without remote operations -- for
+    :func:`estimate_parallel_makespan_layered`.
+    """
 
     makespan: float
     steps: int

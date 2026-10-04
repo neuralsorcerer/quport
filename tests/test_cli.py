@@ -544,6 +544,43 @@ def test_sweep_writes_a_plot_when_asked(
     assert set(series) <= set(benchmark_method_labels().values())
 
 
+def test_sweep_creates_the_directory_its_plot_path_names(tmp_path: Path) -> None:
+    """`--plot` gets the same treatment as every other output path.
+
+    The plot is written last, after the whole sweep has run, so a missing
+    directory used to throw that work away with a FileNotFoundError.
+    """
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("pandas")
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    out_png = tmp_path / "plots" / "nested" / "sweep.png"
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--depth",
+            "1",
+            "--trials",
+            "1",
+            "--strategies",
+            "tpccap",
+            "--out",
+            str(tmp_path / "sweep.csv"),
+            "--plot",
+            str(out_png),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert out_png.read_bytes().startswith(b"\x89PNG")
+
+
 def test_sweep_reports_missing_viz_extra_as_a_cli_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

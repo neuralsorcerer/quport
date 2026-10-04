@@ -52,7 +52,10 @@ What to inspect:
 
 - `result.partition` tells you which QPU each logical qubit was assigned to.
 - `result.mapped_circuit` is the globally routed physical Qiskit circuit.
-- `result.metrics.swaps` shows local/global routing overhead from Qiskit.
+- `result.metrics.swaps` counts instructions named `swap`. Under the default
+  `basis_gates`, which contain no `swap`, Qiskit rewrites every routing SWAP into
+  CX gates, so this reads `0` and the routing overhead shows up in
+  `result.metrics.n_2q` instead; add `"swap"` to `basis_gates` to count them.
 - `result.metrics.remote_2q` counts two-qubit operations whose endpoints are on different QPUs.
 - `result.cost` combines local operations, remote operations, SWAPs, and depth into a scalar proxy.
 
@@ -85,6 +88,7 @@ Inspect `compile_out/`:
 - `remote_ops.json` is the ordered list of remote operations.
 - `schedule.json` is a strict JSON topology-aware summary produced by `TopologyScheduleSummary.to_dict()`.
 - `schedule_trace.json` is the strict JSON layer/round trace produced by `TopologySchedulePlan.to_dict()`, including absolute `start_time` and `end_time` offsets for timeline inspection.
+- `entanglement_plan.json` holds the aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary.
 
 Both schedule exports reject non-finite timings and malformed resource fields before
 writing JSON, which keeps generated artifacts compatible with `python -m json.tool`

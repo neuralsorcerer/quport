@@ -497,6 +497,20 @@ def test_assignment_shape_is_validated():
         )
 
 
+@pytest.mark.parametrize("part", [[0, 0, 0.7, 1, 1, 1], [0, 0, True, 1, 1, 1]])
+def test_static_partition_rejects_non_integer_placements(part):
+    """``0.7`` and ``True`` are not QPU indices, here or anywhere else.
+
+    They used to be passed through ``int()``, so a fractional placement was
+    silently costed as QPU 0 and a boolean as QPU 1.
+    """
+    decomposition = build_distributable_packets(_shifting_neighbourhood(2))
+    windows = split_windows(decomposition, 2)
+
+    with pytest.raises(ValueError, match=r"part\[2\] must be an integer QPU index"):
+        static_temporal_partition(part, windows)
+
+
 def test_optimizer_rejects_an_infeasible_seed():
     decomposition = build_distributable_packets(_shifting_neighbourhood(2))
     windows = split_windows(decomposition, 2)

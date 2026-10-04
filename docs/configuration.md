@@ -21,8 +21,8 @@ files beside benchmark outputs.
 | `inter_topology` | `"switch"` | one of `switch`, `mesh`, `ring`, `degree_d`, `clos`, `fat_tree` | invalid topology names are rejected by graph/architecture construction |
 | `inter_degree` | `2` | degree target for `degree_d` topology | clamped/validated by QPU graph helpers depending on context |
 | `link_capacity` | `1` | max simultaneous remote ops per inter-QPU link per topology-scheduler round | topology scheduler uses this as a per-round resource limit |
-| `switch_parallel_links` | `1_000_000` | max distinct QPU pairs per round for switch/mesh scheduling | use smaller values to model limited switch fanout |
-| `switch_reconfig_delay` | `0.0` | additional delay per communication round | added by topology-aware scheduling |
+| `switch_parallel_links` | `1_000_000` | max distinct QPU pairs per round on a switched fabric | use smaller values to model limited switch fanout; read only for `switch`, `mesh`, and `clos` with at least two comm ports, ignored elsewhere |
+| `switch_reconfig_delay` | `0.0` | additional delay per communication round on a switched fabric | added by topology-aware scheduling for `switch`, `mesh`, and `clos` with at least two comm ports; ignored elsewhere |
 | `async_classical` | `True` | enables asynchronous classical-latency hiding in topology scheduling | must be boolean |
 | `async_overlap` | `0.5` | fraction of classical RTT that can be hidden | finite numeric value in `[0, 1]` |
 | `grid_rows` | `None` | optional rows for `grid2d` | inferred if omitted; explicit rows/cols must cover local qubits |
