@@ -622,8 +622,16 @@ than a runtime -- the point of distributed compilation is that these programs ru
 on separate devices.
 
 Both verifiers compare state vectors, so they speak about the state a circuit
-prepares. Measurements that come last are dropped, since they read that state out
-without changing it; a measurement or reset that later operations depend on
+prepares. `verify_telegate_equivalence` drops measurements that come last, since
+they read that state out without changing it. `verify_distributed_program`
+compares what those measurements record instead: each is swapped into an ancilla
+standing for its classical bit, and the ancillas are dephased before the
+comparison. Local routing at `optimization_level` 2 or 3 may drop a diagonal gate
+right before a measurement, or re-target the classical bit of a measurement that
+follows a `swap`; neither changes an outcome, and neither now fails verification.
+Comparing per classical bit also checks which bit each measurement writes, and
+each measured bit counts toward the 24-qubit simulation limit. A measurement or
+reset that later operations depend on
 genuinely changes what the circuit computes and is refused rather than quietly
 ignored. So is classical control -- an `if` block or other control-flow
 operation -- which has no state-vector evolution to compare.

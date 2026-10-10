@@ -500,6 +500,17 @@ def verify_distributed_program(
     remote gates are physically realised; it checks the splitting, the local
     routing, and the manifest that ties them together.
 
+    Terminating measurements are compared by what they record, not by the
+    state they read: each one is swapped into an ancilla standing for its
+    classical bit, and those ancillas are dephased before the comparison. The
+    pre-measurement state is not something the programs promise to keep --
+    from ``optimization_level`` 2 Qiskit drops diagonal gates right before a
+    measurement and re-targets the classical bit of a measurement that follows
+    a ``swap`` -- and either would fail a comparison of raw state vectors
+    although no outcome changes. Comparing outcomes per classical bit also
+    checks which bit each measurement writes, which dropping the measurements
+    could not.
+
     Parameters
     ----------
     remote_ops:
@@ -509,39 +520,49 @@ def verify_distributed_program(
     Raises
     ------
     ValueError
-        If the circuit is too wide to simulate
-        (:data:`MAX_VERIFIABLE_QUBITS`), or if the artifacts are inconsistent
-        enough that they cannot be merged at all.
+        If the circuit is too wide to simulate -- its qubits plus one ancilla
+        per measured classical bit exceed :data:`MAX_VERIFIABLE_QUBITS` -- or if
+        the artifacts are inconsistent enough that they cannot be merged at all.
     """
-    from qiskit.quantum_info import Statevector, state_fidelity
+    from qiskit.quantum_info import Statevector
 
     merged = reassemble_distributed_program(
         mapped, local_routed, remote_ops, arch, restore_layout=True
     )
-    unitary_mapped = _unitary_part(mapped, label="the mapped circuit")
-    merged = _drop_measurements(merged)
+    # Refuses mid-circuit measurement, reset and classical control, so every
+    # measurement left in `mapped` -- and so in `merged` -- is terminating.
+    _unitary_part(mapped, label="the mapped circuit")
 
     width = len(merged.qubits)
-    if width > MAX_VERIFIABLE_QUBITS:
+    outcome_slots = _outcome_slots(width, mapped, merged)
+    total = width + len(outcome_slots)
+    if total > MAX_VERIFIABLE_QUBITS:
         raise ValueError(
-            f"circuit has {width} qubits, above the {MAX_VERIFIABLE_QUBITS}-qubit "
-            "state-vector verification limit"
+            f"circuit has {width} qubits and {len(outcome_slots)} measured classical "
+            f"bits, above the {MAX_VERIFIABLE_QUBITS}-qubit state-vector "
+            "verification limit"
         )
 
-    preparation = _random_product_state(width, seed)
+    preparation = _widen(_random_product_state(width, seed), total)
 
     actual = preparation.copy()
-    actual.compose(merged, qubits=range(width), inplace=True)
+    actual.compose(
+        _measurements_into_ancillas(merged, total, outcome_slots),
+        qubits=range(total),
+        inplace=True,
+    )
 
-    expected = _widen(preparation.copy(), width)
+    expected = preparation.copy()
     expected.compose(
-        unitary_mapped, qubits=range(len(unitary_mapped.qubits)), inplace=True
+        _measurements_into_ancillas(mapped, total, outcome_slots),
+        qubits=range(total),
+        inplace=True,
     )
 
-    return bool(
-        state_fidelity(Statevector(actual), Statevector(expected), validate=False)
-        >= 1.0 - atol
+    fidelity = _dephased_fidelity(
+        Statevector(actual).data, Statevector(expected).data, n_data=width
     )
+    return bool(fidelity >= 1.0 - atol)
 
 
 _NON_UNITARY_OPS = frozenset({"measure", "reset", "initialize"})
@@ -605,22 +626,74 @@ def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:
     return circuit
 
 
-def _drop_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
-    """Return ``circuit`` with read-out instructions removed.
+def _outcome_slots(width: int, *circuits: QuantumCircuit) -> dict[Any, int]:
+    """Give every classical bit any of ``circuits`` measures into an ancilla.
 
-    The merged circuit ends with the swaps that undo routing, so its
-    measurements are no longer literally final and
-    :meth:`~qiskit.circuit.QuantumCircuit.remove_final_measurements` will not
-    touch them. They were final in the circuit that was split -- which
-    :func:`_unitary_part` checks on that circuit -- so dropping them here
-    compares the same pre-measurement state.
+    The ancillas follow the ``width`` data qubits, in the order of the first
+    circuit's classical bits, so the circuits being compared -- which share
+    their classical bits -- assign every bit the same ancilla.
     """
-    out = QuantumCircuit(*circuit.qregs)
+    measured = {
+        clbit
+        for circuit in circuits
+        for instruction in circuit.data
+        if instruction.operation.name == "measure"
+        for clbit in instruction.clbits
+    }
+    order = [clbit for circuit in circuits for clbit in circuit.clbits]
+    slots: dict[Any, int] = {}
+    for clbit in order:
+        if clbit in measured and clbit not in slots:
+            slots[clbit] = width + len(slots)
+    return slots
+
+
+def _measurements_into_ancillas(
+    circuit: QuantumCircuit, total: int, outcome_slots: Mapping[Any, int]
+) -> QuantumCircuit:
+    """Return ``circuit`` with each measurement swapped into its bit's ancilla.
+
+    A terminating measurement only records its qubit's computational-basis
+    value, so moving the qubit into an ancilla that is dephased afterwards
+    keeps exactly what the measurement observes and nothing it does not. The
+    qubit is left in ``|0>`` -- the same in every circuit compared -- so
+    whatever moves it afterwards, such as the swaps undoing routing in a merged
+    circuit, cannot make two equivalent programs differ.
+    """
+    out = QuantumCircuit(QuantumRegister(total, "q"))
+    position = {qubit: index for index, qubit in enumerate(circuit.qubits)}
     for instruction in circuit.data:
-        if instruction.operation.name in _NON_UNITARY_OPS:
+        operation = instruction.operation
+        qubits = [position[qubit] for qubit in instruction.qubits]
+        if operation.name == "measure":
+            out.swap(qubits[0], outcome_slots[instruction.clbits[0]])
             continue
-        out.append(instruction.operation, instruction.qubits, [])
+        if operation.name in _NON_UNITARY_OPS or instruction.clbits:
+            raise ValueError(
+                f"cannot verify a program containing {operation.name}, which "
+                "state-vector comparison cannot represent"
+            )
+        out.append(operation, [out.qubits[qubit] for qubit in qubits])
     return out
+
+
+def _dephased_fidelity(actual: Any, expected: Any, *, n_data: int) -> float:
+    """Fidelity of two states once the qubits above ``n_data`` are measured.
+
+    Qubits are little-endian, so a row of the reshaped vector fixes the
+    measured ancillas and runs over the data qubits. Measuring the ancillas
+    leaves one conditional data state per outcome, and the fidelity of the
+    two resulting block-diagonal states is the squared sum of the conditional
+    overlaps' magnitudes: one exactly when every outcome is equally likely and
+    leaves the data in the same state, up to a phase per outcome.
+    """
+    import numpy as np
+
+    rows = actual.size >> n_data
+    by_outcome_actual = actual.reshape(rows, 2**n_data)
+    by_outcome_expected = expected.reshape(rows, 2**n_data)
+    overlaps = np.einsum("ij,ij->i", by_outcome_expected.conj(), by_outcome_actual)
+    return float(np.sum(np.abs(overlaps)) ** 2)
 
 
 def _widen(circuit: QuantumCircuit, total: int) -> QuantumCircuit:

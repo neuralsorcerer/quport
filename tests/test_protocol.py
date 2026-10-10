@@ -613,6 +613,136 @@ def test_terminating_measurements_and_classical_bits_round_trip() -> None:
     assert merged.count_ops()["measure"] == 5
 
 
+@pytest.mark.parametrize("optimization_level", [0, 1, 2, 3])
+@pytest.mark.parametrize(
+    "basis", [("rz", "sx", "x", "cx"), ("rz", "sx", "x", "cx", "swap")]
+)
+def test_measurement_aware_optimizations_still_verify(
+    optimization_level: int, basis: tuple[str, ...]
+) -> None:
+    """Local routing may change the state a measurement reads, not its outcome.
+
+    From level 2 Qiskit drops diagonal gates right before a measurement, and,
+    when ``swap`` is a basis gate, removes a ``swap`` before measurements by
+    re-targeting their classical bits. Both keep every outcome, so a correct
+    compile must verify; comparing raw pre-measurement state vectors rejected
+    it. No barrier precedes the measurements here -- one would block both
+    passes.
+    """
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        basis_gates=basis,
+        optimization_level=optimization_level,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    circuit = QuantumCircuit(4, 4)
+    circuit.h(0)
+    circuit.ry(0.4, 1)
+    circuit.cx(0, 1)
+    circuit.h(2)
+    circuit.cx(2, 3)
+    circuit.cx(1, 2)
+    circuit.swap(0, 1)  # directly before measurement: re-targeted at level 2+
+    circuit.rz(0.7, 2)  # diagonal directly before measurement: dropped at 2+
+    circuit.t(3)
+    circuit.measure(range(4), range(4))
+    result = compile_distributed(circuit, cfg, seed=1, strategy="balanced")
+    assert result.routed_remote_ops, "the fixture must span both QPUs"
+
+    assert verify_distributed_program(
+        result.physical_circuit, result.local_routed, result.routed_remote_ops, arch
+    )
+
+
+def test_verification_checks_which_classical_bit_a_measurement_writes() -> None:
+    """Outcomes are compared per classical bit, so swapped targets are caught.
+
+    Dropping the measurements before comparing states, as verification used
+    to, could not see a program that writes the right values to the wrong bits.
+    """
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 2)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.x(1)
+    mapped.measure(0, 0)
+    mapped.measure(1, 1)
+    program = split_into_qpus(mapped, arch)
+
+    original = program.local_circuits[0]
+    crossed = original.copy_empty_like()
+    for instruction in original.data:
+        clbits = instruction.clbits
+        if instruction.operation.name == "measure":
+            index = original.find_bit(clbits[0]).index
+            clbits = (crossed.clbits[1 - index],)
+        crossed.append(instruction.operation, instruction.qubits, clbits)
+
+    assert verify_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+    assert not verify_distributed_program(
+        mapped,
+        {0: crossed, 1: program.local_circuits[1]},
+        program.remote_ops,
+        arch,
+    )
+
+
+def test_verification_still_rejects_a_changed_outcome() -> None:
+    """Dephasing measured qubits forgives phases, never a flipped outcome."""
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.x(1)
+    mapped.measure(1, 0)
+    program = split_into_qpus(mapped, arch)
+
+    original = program.local_circuits[0]
+    without_x = original.copy_empty_like()
+    for instruction in original.data:
+        if instruction.operation.name != "x":
+            without_x.append(instruction)
+
+    assert not verify_distributed_program(
+        mapped,
+        {0: without_x, 1: program.local_circuits[1]},
+        program.remote_ops,
+        arch,
+    )
+
+
+def test_verification_width_counts_the_measured_classical_bits() -> None:
+    """Each measured bit costs one simulated ancilla, so it counts to the limit."""
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=MAX_VERIFIABLE_QUBITS // 2 - 1)
+    assert arch.n_phys == MAX_VERIFIABLE_QUBITS
+    measured = 1
+    mapped = QuantumCircuit(arch.n_phys, measured)
+    mapped.h(0)
+    mapped.measure(0, 0)
+    program = split_into_qpus(mapped, arch)
+
+    with pytest.raises(ValueError, match="1 measured classical bits"):
+        verify_distributed_program(
+            mapped, program.local_circuits, program.remote_ops, arch
+        )
+
+
 def test_verification_refuses_mid_circuit_measurement() -> None:
     """State-vector comparison cannot represent a measurement others depend on."""
     from quport.protocol import verify_distributed_program
