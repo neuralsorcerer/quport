@@ -184,11 +184,12 @@ QuPort exposes four schedule estimators:
 - `estimate_entanglement_schedule`: event-driven model over aggregated EPR blocks, with
   per-port hold times, per-link channels, and probabilistic entanglement distribution.
 
-The first three slice the circuit into DAG layers, which imposes a global barrier
-between layers and charges one entanglement transaction per cross-QPU gate. The
-fourth does neither, so its makespan is usually well below the others on the same
-circuit; the two families answer different questions and should not be mixed inside
-one comparison. See [Entanglement model](entanglement.md).
+The first three charge one entanglement transaction per cross-QPU gate, and the
+layered and topology-aware estimators also slice the circuit into DAG layers, which
+imposes a global barrier between layers. The fourth does neither, so its makespan is
+usually well below the others on the same circuit; the two families answer different
+questions and should not be mixed inside one comparison. See
+[Entanglement model](entanglement.md).
 
 Use `estimate_topology_schedule_plan` when you need the detailed layer and round trace.
 Its trace includes absolute `start_time` / `end_time` offsets for both layers and
