@@ -43,6 +43,7 @@ from quport.pipeline import (
 from quport.schedule import (
     audit_entanglement_schedule,
     audit_topology_schedule_plan,
+    validate_network_limits,
 )
 from quport.temporal import optimize_temporal_partition, split_windows
 
@@ -213,6 +214,12 @@ def _load_config_or_default(config: str | None) -> MultiQPUConfig:
     document that parses but does not describe a buildable architecture --
     ``topology-info`` reads the inter-QPU graph without constructing one, so it
     used to report a table for a config every other command rejects.
+
+    That includes the fields read lazily. The grid dimensions and
+    ``inter_degree`` are checked only when a coupling map is built, and the
+    link and switch limits only when a schedule is estimated -- for
+    ``compile-dist``, after partitioning and routing have already run -- so all
+    of them are checked here, by the same code that reads them later.
     ``load_config`` also raises
     ``RuntimeError`` when a YAML path is requested without the optional PyYAML
     dependency, whose message is the install hint, matching how the plotting
@@ -223,6 +230,8 @@ def _load_config_or_default(config: str | None) -> MultiQPUConfig:
     try:
         cfg = load_config(config)
         validate_architecture_config(cfg)
+        MultiQPUArchitecture(cfg).build_coupling_map()
+        validate_network_limits(cfg)
         return cfg
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -566,7 +575,7 @@ def ebits(
     table.add_row("port evictions", str(plan.evictions))
     table.add_row("peak cat copies per QPU", str(list(plan.peak_cat_copies)))
     table.add_row("e-bits (port-unconstrained)", str(report.ebits))
-    table.add_row("distributable packets", str(report.active_packets))
+    table.add_row("packets reaching another QPU", str(report.active_packets))
     table.add_row("makespan (entanglement-aware)", f"{sched.makespan:.2f}")
     table.add_row("makespan (topology-aware)", f"{res.schedule.makespan:.2f}")
     table.add_row("unschedulable gates", str(sched.unschedulable_gates))

@@ -568,6 +568,58 @@ class TopologySchedulePlan:
         }
 
 
+@dataclass(frozen=True)
+class _NetworkLimits:
+    """Interconnect limits the topology-aware estimator schedules against."""
+
+    link_capacity: int
+    switch_like: bool
+    switch_parallel_links: int
+    switch_reconfig_delay: float
+
+
+def _network_limits(cfg: MultiQPUConfig) -> _NetworkLimits:
+    """Validate and resolve the interconnect limits of ``cfg``.
+
+    The switch budgets only apply to a switch-like fabric, so they are read --
+    and validated -- only there. Clos counts as one only with the two ports its
+    2-level approximation needs; with one port it falls back to a ring.
+    """
+    link_capacity = _validated_nonnegative_int(
+        getattr(cfg, "link_capacity", 1), label="link_capacity"
+    )
+    switch_like = cfg.inter_topology in ("switch", "mesh") or (
+        cfg.inter_topology == "clos" and cfg.comm_qubits_per_qpu >= 2
+    )
+    switch_parallel_links = 1_000_000
+    switch_reconfig_delay = 0.0
+    if switch_like:
+        switch_parallel_links = _validated_nonnegative_int(
+            getattr(cfg, "switch_parallel_links", 1_000_000),
+            label="switch_parallel_links",
+        )
+        switch_reconfig_delay = _validated_nonnegative_finite(
+            getattr(cfg, "switch_reconfig_delay", 0.0), label="switch_reconfig_delay"
+        )
+    return _NetworkLimits(
+        link_capacity=link_capacity,
+        switch_like=switch_like,
+        switch_parallel_links=switch_parallel_links,
+        switch_reconfig_delay=switch_reconfig_delay,
+    )
+
+
+def validate_network_limits(cfg: MultiQPUConfig) -> None:
+    """Check the interconnect limits the schedule estimators read, up front.
+
+    The estimators read ``link_capacity`` -- and, on a switch-like fabric,
+    ``switch_parallel_links`` and ``switch_reconfig_delay`` -- only once they
+    reach the remote operations, which in a compile comes after partitioning
+    and routing. This runs the same checks without scheduling anything.
+    """
+    _network_limits(cfg)
+
+
 def _effective_classical_rtt(
     cfg: MultiQPUConfig, lat: _ValidatedLatencyValues
 ) -> float:
@@ -621,24 +673,11 @@ def _topology_schedule_plan(
     ports = _validated_nonnegative_int(
         cfg.comm_qubits_per_qpu, label="comm_qubits_per_qpu"
     )
-    link_cap = _validated_nonnegative_int(
-        getattr(cfg, "link_capacity", 1), label="link_capacity"
-    )
-    # Clos behaves like an all-to-all switched fabric only when there are enough
-    # ports for the 2-level approximation; with one port it falls back to a ring.
-    is_switch_like = cfg.inter_topology in ("switch", "mesh") or (
-        cfg.inter_topology == "clos" and cfg.comm_qubits_per_qpu >= 2
-    )
-    sw_pairs_cap = 1_000_000
-    sw_reconf = 0.0
-    if is_switch_like:
-        sw_pairs_cap = _validated_nonnegative_int(
-            getattr(cfg, "switch_parallel_links", 1_000_000),
-            label="switch_parallel_links",
-        )
-        sw_reconf = _validated_nonnegative_finite(
-            getattr(cfg, "switch_reconfig_delay", 0.0), label="switch_reconfig_delay"
-        )
+    limits = _network_limits(cfg)
+    link_cap = limits.link_capacity
+    is_switch_like = limits.switch_like
+    sw_pairs_cap = limits.switch_parallel_links
+    sw_reconf = limits.switch_reconfig_delay
 
     sp = arch.qpu_shortest_paths()
     classical_eff = _effective_classical_rtt(cfg, lat)
@@ -1043,19 +1082,9 @@ def audit_topology_schedule_plan(
     ports = _validated_nonnegative_int(
         cfg.comm_qubits_per_qpu, label="comm_qubits_per_qpu"
     )
-    link_cap = _validated_nonnegative_int(
-        getattr(cfg, "link_capacity", 1), label="link_capacity"
-    )
-    is_switch_like = cfg.inter_topology in ("switch", "mesh") or (
-        cfg.inter_topology == "clos" and cfg.comm_qubits_per_qpu >= 2
-    )
-    reconfig = (
-        _validated_nonnegative_finite(
-            getattr(cfg, "switch_reconfig_delay", 0.0), label="switch_reconfig_delay"
-        )
-        if is_switch_like
-        else 0.0
-    )
+    limits = _network_limits(cfg)
+    link_cap = limits.link_capacity
+    reconfig = limits.switch_reconfig_delay
     classical_eff = _effective_classical_rtt(cfg, lat)
 
     problems: list[str] = []

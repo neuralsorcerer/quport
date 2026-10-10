@@ -1237,6 +1237,20 @@ def test_a_bare_output_filename_still_writes_to_the_working_directory(
         ('{"n_qpus": 0}', "n_qpus must be positive"),
         ('{"n_qpus": -1}', "n_qpus must be positive"),
         ('{"n_qpus": 2, "inter_topology": "banana"}', "Unknown inter_topology"),
+        # Read lazily: only when a coupling map is built ...
+        (
+            '{"inter_topology": "degree_d", "inter_degree": "two"}',
+            "inter_degree must be an integer",
+        ),
+        ('{"intra_topology": "grid2d", "grid_rows": 0}', "grid_rows must be positive"),
+        (
+            '{"intra_topology": "grid2d", "grid_rows": 2, "grid_cols": 2}',
+            "grid_rows * grid_cols must cover",
+        ),
+        # ... or only when a schedule is estimated, after the compile has run.
+        ('{"link_capacity": -1}', "link_capacity must be non-negative"),
+        ('{"switch_parallel_links": 1.5}', "switch_parallel_links must be an integer"),
+        ('{"switch_reconfig_delay": "x"}', "switch_reconfig_delay must be numeric"),
     ],
 )
 def test_a_bad_config_file_is_reported_as_a_cli_error(
@@ -1258,6 +1272,29 @@ def test_a_bad_config_file_is_reported_as_a_cli_error(
 
     with pytest.raises(typer.BadParameter, match=re.escape(expected)):
         _load_config_or_default(str(config))
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        # Fields a topology never reads are not held against it ...
+        '{"intra_topology": "line", "grid_rows": 0}',
+        '{"inter_topology": "ring", "switch_reconfig_delay": "x"}',
+        '{"inter_topology": "switch", "inter_degree": "two"}',
+        # ... and a negative degree is clamped to zero by design.
+        '{"inter_topology": "degree_d", "inter_degree": -3}',
+    ],
+)
+def test_config_fields_are_checked_only_where_they_are_read(
+    tmp_path: Path, contents: str
+) -> None:
+    """Loading must not reject a config any command would accept."""
+    from quport.cli import _load_config_or_default
+
+    config = tmp_path / "cfg.json"
+    config.write_text(contents, encoding="utf-8")
+
+    _load_config_or_default(str(config))
 
 
 def test_an_unreadable_config_path_is_reported_as_a_cli_error(tmp_path: Path) -> None:
