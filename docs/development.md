@@ -20,7 +20,7 @@ Run these before committing:
 
 ```bash
 pytest -q
-mypy src tests
+mypy src
 python -m compileall -q src tests
 pre-commit run --all-files
 sphinx-build -W --keep-going -b dirhtml docs docs/_build/dirhtml
@@ -28,6 +28,11 @@ sphinx-build -W --keep-going -b dirhtml docs docs/_build/dirhtml
 
 The pre-commit configuration currently runs merge-conflict checks, YAML checks,
 end-of-file fixes, trailing whitespace trimming, isort, mypy on `src`, and black.
+
+Type checking covers `src`, as in CI and pre-commit. The tests are not held to it:
+many predate the annotation policy below, and validation tests pass deliberately
+mistyped values, so `mypy tests` reports errors. New tests should still be annotated
+and should wrap intentionally invalid arguments in `typing.cast(Any, ...)`.
 
 ## Documentation checklist
 
@@ -38,6 +43,10 @@ When changing public behavior, update docs in the same change:
 - New or changed CLI command/option/artifact: update [CLI reference](cli.md).
 - New workflow or recommended usage: update [Getting started](getting-started.md) or [Examples](examples.md).
 - Changed conceptual model: update [Concepts](concepts.md).
+- Change that can move a measured figure (a partitioner, an objective weight, the
+  aggregator, a scheduler): rerun `python examples/reproduce_readme_figures.py`
+  and update the README and [Entanglement model](entanglement.md) from its output.
+  A figure goes into the docs only with a section of that script behind it.
 
 Use [Index](index.md) as the navigation source of truth. If you add a new docs page,
 link it from the index and from the README documentation section.
@@ -137,11 +146,12 @@ When changing either half, keep two properties:
 
 The objective terms are not independent knobs. `w_port` and `w_cong` were tuned
 against a `w_dist` term that charges every cut gate; an e-bit count is smaller by
-the aggregation factor, so a penalty left at its old scale stops biasing the
-objective and becomes it. That is not hypothetical -- it is what made the `ebit`
-strategy score worse than plain balanced partitioning at the objective it is named
-for. When adding or reweighting a term, check the terms are commensurate on a real
-instance, not just that the code runs.
+the aggregation factor, so a penalty left at its old scale stops merely biasing
+the objective and competes with it. That is not hypothetical -- before its terms
+were rescaled, the `ebit` strategy left 12.6% of the e-bits it is named for above the
+proved optimum, against 1.6% after (`examples/reproduce_readme_figures.py
+calibration`). When adding or reweighting a term, check the terms are commensurate
+on a real instance, not just that the code runs.
 
 `quport.exact` is the tool for that check. `optimal_partition` gives the number a
 strategy should be compared against, and `partition_gap` raises outright if a

@@ -153,6 +153,29 @@ def test_multi_qubit_gate_spanning_three_qpus_costs_two_round_trips() -> None:
     assert ebit_cost(decomposition, [0, 0, 0], 3) == 0
 
 
+def test_multi_qubit_gate_pays_one_round_trip_per_foreign_operand() -> None:
+    """Two operands on the same foreign QPU are two teleports, not one.
+
+    One EPR pair moves one qubit, so gathering a Toffoli whose two controls sit
+    together on another QPU takes two round trips. Charging per distinct QPU
+    instead under-counted it at two e-bits.
+    """
+    qc = QuantumCircuit(3)
+    qc.ccx(0, 1, 2)
+    part = [0, 1, 1]
+
+    decomposition = build_distributable_packets(qc)
+
+    assert ebit_cost(decomposition, part, 2) == 4
+    report = ebit_report(decomposition, part, 2)
+    assert report.unpackable_ebits == 4
+    assert report.pair_ebits == (((0, 1), 4),)
+    # Both teleported operands sit on the host while the gate runs.
+    assert report.peak_cat_copies == (2, 0)
+    assert ebit_traffic_matrix(decomposition, part, 2) == [[0.0, 4.0], [4.0, 0.0]]
+    assert ebit_objective(decomposition, part, 2, [[0, 3], [3, 0]]) == (4, 12.0)
+
+
 def test_report_counts_baseline_and_reduction() -> None:
     qc = QuantumCircuit(4)
     for target in range(1, 4):

@@ -1258,6 +1258,28 @@ def test_estimators_agree_on_remote_count_for_multi_qubit_cross_qpu_gates() -> N
     assert summary.remote_rounds >= 1
 
 
+def test_linear_makespan_waits_for_every_qpu_a_wide_remote_gate_touches() -> None:
+    """A gate on three QPUs cannot start while any of its qubits is busy.
+
+    The manifest names only two endpoints of a wide remote operation, and
+    synchronising just those let the gate run while the third QPU was still
+    working on the qubit it needs -- reporting a makespan shorter than that
+    QPU's own work plus the gate.
+    """
+    arch = _three_qpu_arch()
+    latency = LatencyModel()
+    circuit = QuantumCircuit(arch.n_phys)
+    for _ in range(1000):
+        circuit.x(4)  # QPU2, the operand the manifest does not name
+    circuit.ccx(0, 2, 4)
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    remote = latency.epr_gen + latency.classical_rtt + latency.remote_gate_overhead
+    assert summary.remote_ops == 1
+    assert summary.makespan == pytest.approx(1000 * latency.oneq + remote)
+
+
 def test_multi_qubit_gate_inside_one_qpu_is_still_billed_as_local() -> None:
     """Operands sharing a QPU stay local and cost one local two-qubit slot."""
     from quport.distributed import split_into_qpus
@@ -2162,3 +2184,190 @@ def test_schedule_plans_stay_consistent_at_interconnect_scale(inter: str) -> Non
         )
         == ()
     )
+
+
+def _feedforward_circuit(
+    arch: MultiQPUArchitecture, conditioned: str
+) -> QuantumCircuit:
+    """QPU 1 works, measures, and QPU 0 acts on the result and keeps working.
+
+    QPU 0 holds qubits 0-2 and QPU 1 holds 3-5. The measurement and the
+    conditional share no qubit, only the classical bit.
+    """
+    from qiskit import ClassicalRegister, QuantumRegister
+
+    creg = ClassicalRegister(1, "c")
+    circuit = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), creg)
+    for _ in range(50):
+        circuit.x(3)
+    circuit.measure(3, 0)
+    with circuit.if_test((creg, 1)):
+        if conditioned == "local":
+            circuit.x(0)
+        else:
+            circuit.cx(0, 4)
+    for _ in range(50):
+        circuit.x(0)
+    return circuit
+
+
+@pytest.mark.parametrize("conditioned", ["local", "remote"])
+def test_list_schedulers_wait_for_the_measurement_feedforward_reads(
+    conditioned: str,
+) -> None:
+    """A conditional cannot start before the measurement that decides it.
+
+    The two list schedulers track qubit and QPU timelines, which this
+    dependency does not touch: without following the classical bit they let
+    QPU 0 start its conditional at time zero and finish long before QPU 1 has
+    measured anything.
+    """
+    from quport.schedule import estimate_entanglement_schedule
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    # Cheap entanglement, so the remote case's own protocol time cannot hide
+    # the 50-gate wait for the measurement.
+    model = LatencyModel(epr_gen=1.0, classical_rtt=1.0, remote_gate_overhead=1.0)
+    circuit = _feedforward_circuit(arch, conditioned)
+
+    # QPU 1's 50 gates and the measurement, then the conditional, then QPU 0's
+    # 50 gates: no schedule can be shorter than that chain.
+    chain = 51 * model.oneq + 50 * model.oneq
+    assert estimate_parallel_makespan(circuit, arch, model).makespan >= chain
+    assert estimate_entanglement_schedule(circuit, arch, model).makespan >= chain
+    # The DAG-layer estimators see the classical wire already; all four agree
+    # on the dependency now.
+    assert estimate_parallel_makespan_layered(circuit, arch, model).makespan >= chain
+    assert estimate_parallel_makespan_topology(circuit, arch, model).makespan >= chain
+
+
+def test_linear_makespan_synchronises_the_qpus_a_barrier_spans() -> None:
+    """A barrier costs nothing but orders the work on every QPU it touches.
+
+    Here it holds QPU0's gate back until QPU1's has run. Skipping barriers
+    outright let the linear estimator overlap the two and report a makespan
+    shorter than that chain.
+    """
+    arch = _three_qpu_arch()
+    latency = LatencyModel()
+    circuit = QuantumCircuit(arch.n_phys)
+    circuit.cx(2, 3)  # QPU1
+    circuit.barrier(0, 2)
+    circuit.cx(0, 1)  # QPU0, after the barrier
+
+    summary = estimate_parallel_makespan(circuit, arch, latency)
+
+    assert summary.makespan == pytest.approx(2 * latency.twoq)
+
+
+def _critical_path_floor(
+    circuit: QuantumCircuit, arch: MultiQPUArchitecture, latency: LatencyModel
+) -> float:
+    """Longest dependency chain counting local gate time only.
+
+    Qubit wires, classical wires and barriers all order operations in the DAG.
+    Remote operations are counted as free, so the result bounds every
+    estimator from below whatever it charges for communication.
+    """
+    from qiskit.converters import circuit_to_dag
+
+    dag = circuit_to_dag(circuit)
+    index = {qubit: position for position, qubit in enumerate(circuit.qubits)}
+    finish: dict[object, float] = {}
+    for node in dag.topological_op_nodes():
+        start = max((finish[pred] for pred in dag.op_predecessors(node)), default=0.0)
+        qpus = {arch.qpu_of_phys(index[qubit]) for qubit in node.qargs}
+        if getattr(node.op, "_directive", False) or len(qpus) > 1:
+            duration = 0.0
+        elif len(node.qargs) == 1:
+            duration = latency.oneq
+        elif node.op.name == "swap":
+            duration = latency.swap
+        else:
+            duration = latency.twoq
+        finish[node] = start + duration
+    return max(finish.values(), default=0.0)
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_no_estimator_beats_the_circuit_critical_path(seed: int) -> None:
+    """Every makespan estimate is at least the circuit's own dependency chain.
+
+    Each estimator models communication differently, but none may let an
+    operation start before the qubits, classical bits and barriers it depends
+    on allow. The circuits are built as chains -- a long run of gates on one
+    qubit, a hand-off to a qubit elsewhere, a long run there -- with every
+    kind of hand-off: feedforward through a classical bit, a barrier, a
+    three-qubit gate, and a plain two-qubit gate. A hand-off an estimator
+    ignores lets the second run overlap the first and shows up as a makespan
+    below the chain.
+    """
+    import random
+
+    from qiskit import ClassicalRegister, QuantumRegister
+
+    from quport.schedule import estimate_entanglement_schedule
+
+    rng = random.Random(seed)
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=rng.randint(2, 4),
+            compute_qubits_per_qpu=rng.randint(1, 3),
+            comm_qubits_per_qpu=rng.randint(1, 3),
+            inter_topology=rng.choice(["switch", "ring", "degree_d"]),
+        )
+    )
+    latency = LatencyModel(epr_gen=rng.choice([0.0, 1.0, 200.0]))
+    n = arch.n_phys
+    creg = ClassicalRegister(1, "c")
+    circuit = QuantumCircuit(QuantumRegister(n, "q"), creg)
+
+    current = rng.randrange(n)
+    for _ in range(rng.randint(2, 6)):
+        for _ in range(rng.randint(10, 60)):
+            circuit.x(current)
+        others = [
+            qubit
+            for qubit in range(n)
+            if arch.qpu_of_phys(qubit) != arch.qpu_of_phys(current)
+        ]
+        target = rng.choice(others)
+        link = rng.choice(["feedforward", "barrier", "wide", "remote"])
+        if link == "feedforward":
+            circuit.measure(current, 0)
+            with circuit.if_test((creg[0], 1)):
+                circuit.x(target)
+        elif link == "barrier":
+            circuit.barrier(current, target)
+        elif link == "wide" and n >= 3:
+            third = rng.choice([q for q in range(n) if q not in (current, target)])
+            operands = [third, target, current]
+            rng.shuffle(operands)
+            circuit.ccx(*operands)
+        else:
+            circuit.cx(current, target)
+        # Unrelated local traffic, so the chain is not the only work. It stays
+        # inside one QPU: a remote gate would synchronise QPUs as a side effect
+        # and could mask a hand-off the estimator ignores.
+        for _ in range(rng.randint(0, 5)):
+            a = rng.randrange(n)
+            peers = [
+                q
+                for q in range(n)
+                if q != a and arch.qpu_of_phys(q) == arch.qpu_of_phys(a)
+            ]
+            if peers:
+                circuit.cz(a, rng.choice(peers))
+        current = target
+
+    floor = _critical_path_floor(circuit, arch, latency)
+    for estimator in (
+        estimate_parallel_makespan,
+        estimate_parallel_makespan_layered,
+        estimate_parallel_makespan_topology,
+        estimate_entanglement_schedule,
+    ):
+        makespan = estimator(circuit, arch, latency).makespan
+        assert makespan >= floor - 1e-9, estimator.__name__

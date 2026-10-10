@@ -65,6 +65,7 @@ from quport.partition import (
     AnnealDiagnostics,
     PartitionDiagnostics,
     balanced_greedy_partition,
+    ebit_partition,
     heavy_edge_clustering_partition,
     tpccap_partition,
     tpccap_sa_partition,
@@ -167,8 +168,10 @@ def compile_distributed(
     -----
     The ``"ebit"`` objective replaces the weighted-cut-distance term with
     hop-scaled e-bit demand, and rescales the rest of the objective to match.
-    The boundary-qubit port penalty is dropped: it runs one to two orders of
-    magnitude larger than an e-bit count, and it measures the wrong resource,
+    The boundary-qubit port penalty is dropped: at its old weight it is about as
+    large as the e-bit count with two comm ports per QPU and several times
+    larger with one, so it competes with the term it was meant to bias, and it
+    measures the wrong resource,
     because a cat-entanglement compiler needs a port for a live cat copy rather
     than for every boundary qubit -- and a port shortage is already priced by
     :func:`quport.aggregation.aggregate_remote_operations`, which pays for it
@@ -280,34 +283,15 @@ def compile_distributed(
 
     elif strategy == "ebit":
         sp = arch.qpu_shortest_paths()
-        pres, diag, ad = tpccap_sa_partition(
+        pres, diag, ad = ebit_partition(
             n=qc_basis.num_qubits,
             weights=partition_weights,
             n_qpus=cfg.n_qpus,
             capacity=capacity,
             comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
             sp=sp,
-            seed=seed,
-            # Communication volume is measured in e-bits, so the cut-distance
-            # term is switched off rather than added on top of it.
-            w_dist=0.0,
             packets=packets,
-            w_ebit=1.0,
-            # The remaining terms have to be rescaled to match. `w_port`'s
-            # squared boundary-qubit overflow is one to two orders of magnitude
-            # larger than an e-bit count, and it measures the wrong resource
-            # anyway: what a cat-entanglement compiler needs a port for is a
-            # live cat copy, not every boundary qubit. Under aggregation a port
-            # shortage is already priced -- it costs an eviction and a fresh EPR
-            # pair -- so the penalty is dropped rather than double-counted.
-            w_port=0.0,
-            # Congestion is kept, but routed from EPR demand rather than gate
-            # demand, so it describes the same traffic the e-bit term prices,
-            # and at the same weight in both stages because the 4x annealing
-            # asymmetry was tuned against the larger gate-traffic scale.
-            w_cong=0.05,
-            anneal_w_cong=0.05,
-            congestion_source="ebits",
+            seed=seed,
         )
         part = pres.part
         cut = pres.cut

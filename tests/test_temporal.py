@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import itertools
 import random
+from typing import Any, cast
 
 import pytest
 from qiskit import QuantumCircuit
@@ -118,7 +119,7 @@ def test_a_single_window_is_the_static_model():
 
 
 def test_a_moved_root_loses_its_cat_copies():
-    """Teleporting a root invalidates every copy of it, so the copy is re-paid.
+    """Teleporting a root starts a new epoch, so its copy is re-paid.
 
     Two `cz` from one control into one remote QPU share a copy and cost one
     e-bit. Move the control between them and the second gate needs a fresh copy,
@@ -495,6 +496,20 @@ def test_assignment_shape_is_validated():
             TemporalPartition(windows=windows, assignments=((0, 0, 0, 0, 0, 9),)),
             2,
         )
+
+
+@pytest.mark.parametrize("part", [[0, 0, 0.7, 1, 1, 1], [0, 0, True, 1, 1, 1]])
+def test_static_partition_rejects_non_integer_placements(part: object) -> None:
+    """``0.7`` and ``True`` are not QPU indices, here or anywhere else.
+
+    They used to be passed through ``int()``, so a fractional placement was
+    silently costed as QPU 0 and a boolean as QPU 1.
+    """
+    decomposition = build_distributable_packets(_shifting_neighbourhood(2))
+    windows = split_windows(decomposition, 2)
+
+    with pytest.raises(ValueError, match=r"part\[2\] must be an integer QPU index"):
+        static_temporal_partition(cast(Any, part), windows)
 
 
 def test_optimizer_rejects_an_infeasible_seed():

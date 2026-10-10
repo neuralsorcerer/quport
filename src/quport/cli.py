@@ -415,7 +415,7 @@ def sweep(
         plt.xlabel("comm ports per QPU")
         plt.ylabel("mean estimated cost")
         plt.legend()
-        fig.savefig(plot, dpi=180, bbox_inches="tight")
+        fig.savefig(_output_path(plot), dpi=180, bbox_inches="tight")
         _print_path(f"Wrote plot to {plot}")
 
 
@@ -449,7 +449,7 @@ def schedule(
     arch = MultiQPUArchitecture(cfg)
     summ = estimate_parallel_makespan_layered(res.mapped_circuit, arch, latency)
     console.print(
-        f"[bold]Makespan:[/bold] {summ.makespan:.2f}  [bold]RemoteOps:[/bold] {summ.remote_ops}  [bold]SyncSteps:[/bold] {summ.steps}"
+        f"[bold]Makespan:[/bold] {summ.makespan:.2f}  [bold]RemoteOps:[/bold] {summ.remote_ops}  [bold]Layers:[/bold] {summ.steps}"
     )
 
 

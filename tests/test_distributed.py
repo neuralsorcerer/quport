@@ -1753,3 +1753,125 @@ def test_reassembly_accepts_programs_read_back_from_qasm() -> None:
     assert verify_distributed_program(
         result.physical_circuit, reloaded, result.routed_remote_ops, arch
     )
+
+
+def _instruction_trace(
+    circuit: QuantumCircuit,
+) -> list[tuple[str, list[int], list[int]]]:
+    return [
+        (
+            instruction.operation.name,
+            [circuit.find_bit(q).index for q in instruction.qubits],
+            [circuit.find_bit(c).index for c in instruction.clbits],
+        )
+        for instruction in circuit.data
+    ]
+
+
+def test_reassembly_keeps_classical_feedforward_across_qpus_in_order() -> None:
+    """A bit measured on one QPU and read on another must keep its order.
+
+    Neither program records the other's accesses to a shared classical bit, so
+    qubit dataflow alone lets the merge emit the conditional on QPU 0 before
+    the measurement on QPU 1 that it reads -- and the later overwrite of that
+    bit on QPU 0 before the measurement as well, changing its final value.
+    """
+    from quport.distributed import reassemble_distributed_program
+
+    arch = _wide_gate_arch(2, 2)  # QPU 0 holds qubits 0-2, QPU 1 holds 3-5
+    creg = ClassicalRegister(1, "c")
+    mapped = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), creg)
+    mapped.h(3)
+    mapped.measure(3, 0)
+    with mapped.if_test((creg, 1)):
+        mapped.x(0)
+    mapped.measure(0, 0)
+
+    program = split_into_qpus(mapped, arch)
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, restore_layout=False
+    )
+
+    assert _instruction_trace(merged) == _instruction_trace(mapped)
+
+
+def test_reassembly_orders_remote_operations_by_their_classical_bits() -> None:
+    """A conditioned remote gate must sit between the accesses around it.
+
+    The measurement on QPU 0 that follows the remote gate shares no qubit with
+    its marker, so only the classical bit holds it back.
+    """
+    from quport.distributed import reassemble_distributed_program
+
+    arch = _wide_gate_arch(2, 2)
+    creg = ClassicalRegister(1, "c")
+    mapped = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), creg)
+    mapped.h(3)
+    mapped.measure(3, 0)
+    with mapped.if_test((creg, 1)):
+        mapped.cx(0, 4)
+    mapped.measure(1, 0)
+
+    program = split_into_qpus(mapped, arch)
+    assert len(program.remote_ops) == 1
+    assert program.remote_ops[0].clbits == (0,)
+
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, restore_layout=False
+    )
+
+    assert _instruction_trace(merged) == _instruction_trace(mapped)
+
+
+def test_routed_reassembly_keeps_classical_feedforward_in_order() -> None:
+    """The order survives local routing, which reorders each program freely."""
+    from quport.compiler import compile_distributed
+    from quport.distributed import reassemble_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        inter_topology="switch",
+        optimization_level=0,
+    )
+    creg = ClassicalRegister(1, "c")
+    circuit = QuantumCircuit(QuantumRegister(6, "q"), creg)
+    # Two tight clusters, which the cluster strategy puts on different QPUs,
+    # and one gate between them so there is a remote operation to route around.
+    for a, b, c in ((0, 1, 2), (3, 4, 5)):
+        circuit.h(a)
+        circuit.cx(a, b)
+        circuit.cx(b, c)
+        circuit.cx(a, c)
+    circuit.cx(2, 5)
+    circuit.measure(3, 0)
+    with circuit.if_test((creg, 1)):
+        circuit.x(1)
+    circuit.measure(1, 0)
+
+    result = compile_distributed(circuit, cfg, strategy="cluster", seed=0)
+    arch = MultiQPUArchitecture(cfg)
+    physical = result.physical_circuit
+    readers = [
+        arch.qpu_of_phys(physical.find_bit(instruction.qubits[0]).index)
+        for instruction in physical.data
+        if instruction.clbits
+    ]
+    assert readers[0] != readers[1], "the fixture must feed forward across QPUs"
+    assert result.routed_remote_ops, "the fixture must produce remote operations"
+    merged = reassemble_distributed_program(
+        result.physical_circuit,
+        result.local_routed,
+        result.routed_remote_ops,
+        arch,
+        restore_layout=False,
+    )
+
+    def classical(trace: list[tuple[str, list[int], list[int]]]) -> list[str]:
+        return [name for name, _qubits, clbits in trace if clbits]
+
+    expected = classical(_instruction_trace(result.physical_circuit))
+    assert expected == ["measure", "if_else", "measure"]
+    assert classical(_instruction_trace(merged)) == expected

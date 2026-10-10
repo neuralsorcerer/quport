@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from qiskit import QuantumCircuit, QuantumRegister
-from qiskit.circuit import ClassicalRegister
+from qiskit.circuit import ClassicalRegister, ControlFlowOp
 
 from quport.aggregation import AggregationPlan, RemoteBlock, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
@@ -80,7 +80,8 @@ __all__ = [
 ]
 
 #: Total qubit count above which state-vector verification is refused.
-#: 2**24 amplitudes is already a gigabyte of complex128.
+#: 2**24 amplitudes is 256 MiB of complex128 per state vector, and a check
+#: holds a few at once.
 MAX_VERIFIABLE_QUBITS: int = 24
 
 
@@ -404,9 +405,11 @@ def verify_telegate_equivalence(
     The coherent expansion is run on a pseudo-random product input, the
     ancillas are traced out, and the resulting state of the data qubits is
     compared with the mapped circuit's state on the same input. Returning
-    ``True`` therefore certifies two things at once: the data come out right,
-    **and** the ancillas are left unentangled from them -- residual entanglement
-    would show up as a mixed reduced state and drive the fidelity below one.
+    ``True`` therefore establishes two things at once for that input: the data
+    come out right, **and** the ancillas are left unentangled from them --
+    residual entanglement would show up as a mixed reduced state and drive the
+    fidelity below one. One generic input is strong evidence for every input,
+    not a proof of it; see :func:`_random_product_state`.
 
     This is the empirical counterpart of :mod:`quport.entanglement`'s
     diagonality rule. Aggregating across an operation that breaks the rule sends
@@ -427,7 +430,8 @@ def verify_telegate_equivalence(
         (:data:`MAX_VERIFIABLE_QUBITS`), or if the plan leaves gates
         unschedulable, which would make the comparison meaningless.
     """
-    from qiskit.quantum_info import Statevector, partial_trace, state_fidelity
+    import numpy as np
+    from qiskit.quantum_info import Statevector
 
     program = build_telegate_circuit(
         mapped, arch, plan, coherent=True, ports_per_qpu=ports_per_qpu
@@ -456,13 +460,20 @@ def verify_telegate_equivalence(
     reference = preparation.copy()
     reference.compose(unitary_mapped, qubits=range(program.n_data), inplace=True)
 
-    ancillas = list(range(program.n_data, total))
-    actual = Statevector(protocol)
-    expected = Statevector(reference)
-    if ancillas:
-        actual = partial_trace(actual, ancillas)  # type: ignore[assignment]
-
-    return bool(state_fidelity(actual, expected, validate=False) >= 1.0 - atol)
+    # Fidelity of the data qubits' reduced state with the expected one,
+    # <psi|rho|psi> = sum over ancilla basis states a of |<psi, a|phi>|^2.
+    # Summing the overlaps directly gives the same number as tracing the
+    # ancillas out, without building the reduced density matrix, whose
+    # 4**n_data entries outgrow memory long before the state vector does
+    # (16 GiB at 15 data qubits). Qubits are little-endian and the ancillas
+    # come after the data, so a row of the reshaped vector fixes the ancillas
+    # and runs over the data.
+    actual = Statevector(protocol).data
+    expected = Statevector(reference).data
+    by_ancilla = actual.reshape(2 ** (total - program.n_data), 2**program.n_data)
+    overlaps = by_ancilla @ expected.conj()
+    fidelity = float(np.vdot(overlaps, overlaps).real)
+    return bool(fidelity >= 1.0 - atol)
 
 
 def verify_distributed_program(
@@ -480,7 +491,8 @@ def verify_distributed_program(
     plus the remote-operation manifest, taken together, are the circuit they
     were split from. It is checked by
     :func:`quport.distributed.reassemble_distributed_program` -- which merges
-    them back under qubit dataflow and undoes each QPU's routing permutation --
+    them back under qubit and classical-bit dataflow and undoes each QPU's
+    routing permutation --
     and comparing the result against the mapped circuit on a pseudo-random
     product input.
 
@@ -542,7 +554,9 @@ def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
     circuit prepares. Measurements that come last are dropped -- they read that
     state out without changing it -- while a measurement or reset that other
     operations depend on genuinely changes what the circuit computes, and is
-    refused rather than quietly ignored.
+    refused rather than quietly ignored. So is classical control: an operation
+    conditioned on a classical bit, or any other control-flow block, has no
+    state-vector evolution to compare.
     """
     trimmed = circuit.remove_final_measurements(inplace=False)
     if trimmed is None:  # pragma: no cover - defensive across Qiskit versions
@@ -558,15 +572,28 @@ def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
             f"{', '.join(sorted(surviving))}, which state-vector comparison "
             "cannot represent"
         )
+    controlled = {
+        instruction.operation.name
+        for instruction in trimmed.data
+        if instruction.clbits or isinstance(instruction.operation, ControlFlowOp)
+    }
+    if controlled:
+        raise ValueError(
+            f"cannot verify {label}: it contains classically controlled "
+            f"{', '.join(sorted(controlled))}, which state-vector comparison "
+            "cannot represent"
+        )
     return trimmed
 
 
 def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:
-    """Deterministic single-qubit rotations covering the whole Bloch sphere.
+    """Deterministic single-qubit rotations giving every qubit a generic state.
 
-    A product state is enough: the protocol is linear, so agreeing on a
-    spanning set of inputs is agreement everywhere, and the angles below give
-    every qubit a generic state with non-zero amplitude on both basis vectors.
+    The angles give each qubit non-zero amplitude on both basis vectors, so the
+    input overlaps every computational basis state. That makes agreement on it
+    a strong check rather than a proof: one input is not a spanning set, and two
+    circuits can agree on a particular state while differing elsewhere. A wrong
+    protocol passes only if it happens to map this one generic input correctly.
     """
     if type(seed) is bool or not isinstance(seed, int):
         raise ValueError("seed must be an integer")

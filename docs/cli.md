@@ -10,8 +10,9 @@ custom workflows, use the Python API documented in [API reference](api-reference
 - Strategy values use the Python strategy names, for example `tpccap_sa`.
 - Config paths may be JSON or YAML; YAML requires the `yaml` extra.
 - Output directories are created when possible by artifact-writing commands.
-- Commands that operate on one circuit (`map`, `schedule`, `split`, and
-  `compile-dist`) can either generate a random benchmark with `--n-logical` or
+- Commands that operate on one circuit (`map`, `schedule`, `split`, `ebits`,
+  `optimal`, `migrate`, and `compile-dist`) can either generate a random
+  benchmark with `--n-logical` or
   load a user OpenQASM 2/3 circuit with `--input-qasm path/to/circuit.qasm`.
   OpenQASM 2 loads with Qiskit's built-in parser; OpenQASM 3 requires Qiskit's
   optional `qiskit_qasm3_import` package.
@@ -92,8 +93,9 @@ quport sweep --n-logical 8 --depth 20 --trials 5 --out sweep.csv --plot sweep.pn
 ```
 
 Sweeps built-in topology and port settings. `--plot` requires `quport[viz]`. The
-CSV contains aggregate means rather than one row per random circuit. Use `bench`
-when you need raw per-trial rows.
+CSV contains one aggregate row per setting and strategy -- means, plus a median of
+the cost -- rather than one row per random circuit. Use `bench` when you need raw
+per-trial rows.
 
 ## `quport schedule`
 
@@ -144,6 +146,17 @@ runnable, or when the circuit is too wide to simulate.
 See [Entanglement model](entanglement.md) for what these numbers mean.
 
 ## `quport optimal`
+
+This command and `quport migrate` below use a small architecture -- four QPUs of
+three qubits each -- saved as `small.json`:
+
+```json
+{
+  "n_qpus": 4,
+  "compute_qubits_per_qpu": 2,
+  "comm_qubits_per_qpu": 1
+}
+```
 
 ```bash
 quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit --out gap.json
@@ -202,6 +215,11 @@ benchmark. Output artifacts:
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
 - `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
 - `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary (audited before writing, like the schedule trace).
+
+The `Local SWAPs:` figure it prints counts instructions named `swap` in the routed
+programs, so under the default `basis_gates`, which contain no `swap`, it reads `0`
+even when local routing inserted SWAPs: Qiskit has rewritten them into CX gates.
+Add `"swap"` to `basis_gates` to count them.
 
 The schedule JSON writers use `allow_nan=False` and the schedule serializers
 validate timings, counts, QPU pairs, and link-utilization pairs before export.

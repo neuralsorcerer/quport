@@ -122,10 +122,10 @@ End-to-end global mapping flow:
 Supported strategies: `balanced`, `cluster`, `ebit`, `tpccap`, `tpccap_sa`.
 
 `temporal_decay` selects the interaction weighting for the topology-aware
-strategies and applies to `tpccap` and `tpccap_sa` alike, so a run isolates the
-annealing rather than also changing the objective's inputs. Leaving it `None`
-keeps the historical split, in which `tpccap` uses uniform counts and
-`tpccap_sa` uses a decay of `0.98`; that default is unchanged so existing
+strategies and applies to `tpccap`, `tpccap_sa`, and `ebit` alike, so a run isolates
+the annealing rather than also changing the objective's inputs. Leaving it `None`
+keeps the historical split, in which `tpccap` uses uniform counts while
+`tpccap_sa` and `ebit` use a decay of `0.98`; that default is unchanged so existing
 benchmark numbers do not move. See
 [Partitioning strategies](concepts.md#partitioning-strategies) for why this
 matters when interpreting benchmark output.
@@ -137,7 +137,7 @@ matters when interpreting benchmark output.
 | `mapped_circuit` | routed Qiskit `QuantumCircuit` on the global coupling map |
 | `cfg` | architecture config used for the run |
 | `partition` | logical-qubit-to-QPU assignment |
-| `partition_cut` | weighted cut value used by/derived from the partition |
+| `partition_cut` | cut of `partition` under the interaction weights the strategy partitioned with: gate counts for `balanced` and `cluster`, time-decayed weights for `tpccap_sa` and `ebit` (and for `tpccap` when `temporal_decay` is given), so it does not compare across strategies; `-1.0` for `transpile_baseline`, which has no partition |
 | `strategy` | partitioning strategy name |
 | `partition_diagnostics` | topology-aware diagnostics when available |
 | `mapping_time_s` | partition/layout-hint time |
@@ -183,7 +183,8 @@ sweep_topologies(n_logical, depth, trials, seed, out_csv,
 ```
 
 Sweeps topology and communication-port settings and writes a summary CSV with mean
-SWAPs, remote 2Q operations, depth, cost, and transpilation time. Configurations
+SWAPs, remote 2Q operations, depth, cost, and transpilation time, plus the median
+cost, which is skewed enough across random circuits to need both. Configurations
 whose physical capacity cannot fit `n_logical` are skipped.
 
 ## Distributed compilation
@@ -212,7 +213,7 @@ weights; smaller values emphasize earlier two-qubit interactions more strongly.
 | `cfg` | architecture config |
 | `strategy` | partitioning strategy |
 | `partition` | logical-qubit-to-QPU assignment |
-| `partition_cut` | weighted cut value |
+| `partition_cut` | cut of `partition` under the interaction weights the strategy partitioned with: gate counts for `balanced` and `cluster`, time-decayed weights (a decay of 0.98 by default) for `tpccap`, `tpccap_sa` and `ebit`, so it does not compare across strategies |
 | `partition_diagnostics` | topology-aware partition diagnostics when available |
 | `anneal_diagnostics` | simulated annealing diagnostics for `tpccap_sa` and `ebit` |
 | `program` | `DistributedProgram` containing local circuits and remote ops |
@@ -280,7 +281,8 @@ registers only.
 ### `RemoteOp`
 
 ```python
-RemoteOp(name, q0_phys, q1_phys, qpu0, qpu1, params, clbits, index)
+RemoteOp(name, q0_phys, q1_phys, qpu0, qpu1, params, clbits, index,
+         qpu0_marker=None, qpu1_marker=None)
 ```
 
 Represents one remote operation placeholder. `to_dict()` validates fields and
@@ -294,7 +296,9 @@ Field meanings:
 - `qpu0`, `qpu1`: owning QPUs for those physical qubits;
 - `params`: operation parameters converted through JSON-safe encoding;
 - `clbits`: classical bit indices associated with the source instruction;
-- `index`: source instruction index in the physical circuit.
+- `index`: source instruction index in the physical circuit;
+- `qpu0_marker`, `qpu1_marker`: position of the operation's synchronization
+  barrier among all barriers of each QPU's program (see `split_into_qpus` above).
 
 ### Writers
 
@@ -321,6 +325,8 @@ estimate_parallel_makespan(mapped, arch, model) -> ScheduleSummary
 
 Coarse synchronized QPU timeline estimator. It walks the circuit, accumulates local
 operation costs per QPU, and synchronizes timelines when remote operations occur.
+An operation that touches a classical bit also waits for the previous operation on
+that bit, on whichever QPU it ran.
 
 ### `estimate_parallel_makespan_layered`
 
@@ -361,15 +367,18 @@ estimate_entanglement_schedule(mapped, arch, model, *, plan=None,
 ```
 
 Event-driven as-soon-as-possible schedule over aggregated EPR blocks, with one
-timeline per physical qubit, a pool of comm ports held for a whole block, per-link
-channels, and hop-scaled probabilistic entanglement distribution. Unlike the
+timeline per physical qubit and per classical bit, a pool of comm ports held for a
+whole block, per-link channels, and hop-scaled probabilistic entanglement
+distribution. Unlike the
 layer-based estimators it imposes no global barrier between layers and charges one
 transaction per block rather than per gate, so its makespan is not comparable with
 theirs.
 
 `plan` defaults to `aggregate_remote_operations(mapped, arch, ports_per_qpu=...)`.
-A supplied plan must have been built with the same port budget; a larger one raises
-`ValueError` rather than silently reporting the work as unschedulable.
+A supplied plan has to fit the schedule's port budget, as one built with that same
+budget always does. A plan that needs more ports at once than exist -- more live cat
+copies than a QPU has, or no port left for an entangler -- raises `ValueError`
+rather than silently reporting the work as unschedulable.
 
 See [Entanglement model](entanglement.md).
 
@@ -453,14 +462,25 @@ aggregate_remote_operations(mapped, arch, *, ports_per_qpu=None,
   pair_ebits)`.
 - `aggregate_remote_operations` turns a mapped circuit into `RemoteBlock` objects
   under a real comm-port budget, evicting the least recently used cat copy when a
-  port is needed. With unlimited ports its `epr_pairs` equals `ebit_cost`.
+  port is needed. With unlimited ports its `epr_pairs` equals `ebit_cost` whenever
+  every cross-QPU gate's root is forced, as for `cx`; symmetric gates (`cz`, `cp`)
+  leave the root free, and the two models can then choose differently.
 
 `tpccap_partition` and `tpccap_sa_partition` accept `packets`, `w_ebit`, and
 `congestion_source`. `w_ebit=0.0` and `congestion_source="gates"` (the defaults)
 leave their historical objectives unchanged and only fill in the `ebits` and
 `weighted_ebit_distance` diagnostics. `congestion_source="ebits"` routes EPR demand
-rather than gate demand through the congestion term, and requires `packets`; gate
-demand upper-bounds EPR demand, because aggregation only ever removes transactions.
+rather than gate demand through the congestion term, and requires `packets`. With
+uniform weights and gates a cat copy can serve, gate demand upper-bounds EPR demand,
+because aggregation only ever removes transactions; a teleported gate costs two EPR
+pairs, and decayed weights shrink gate demand, so neither bounds the other in
+general.
+
+`ebit_partition(n, weights, n_qpus, capacity, comm_ports_per_qpu, sp, packets, seed=None)`
+is the `ebit` strategy itself: `tpccap_sa_partition` with `w_dist=0`, `w_ebit=1`,
+`w_port=0`, `w_cong=anneal_w_cong=0.05`, and `congestion_source="ebits"`. Both
+`map_and_transpile` and `compile_distributed` partition through it, so
+`strategy="ebit"` names one objective in either pipeline.
 
 `compile_distributed` returns `packets`, `ebits`, `aggregation`, and
 `entanglement_schedule` alongside its existing fields.
@@ -540,15 +560,18 @@ directly comparable with the mapped circuit. Classical bits and registers are
 carried across, so measurements and conditioned operations survive the round
 trip. `verify_distributed_program` does that comparison by state-vector
 simulation: terminating measurements are dropped, and a circuit with mid-circuit
-measurement or reset is refused.
+measurement, reset, or classical control is refused with `ValueError`.
 
 A distributed program is a **partial** order. Within a QPU the constraint is per
 qubit, so instructions on disjoint qubits may run in either order, and two QPUs
 can list the same remote operations in opposite orders. Merging follows qubit
 dataflow: an instruction runs once it leads on every qubit it touches, and a
-remote operation once its marker leads on both sides. Reading each program
-strictly linearly can deadlock; `reassemble_distributed_program` raises when the
-programs genuinely contradict each other.
+remote operation once its marker leads on both sides. Classical bits are shared
+across the programs, and the order of their accesses across QPUs is taken from
+`mapped`: an instruction that touches a classical bit also waits for every
+earlier access to that bit, on any QPU. Reading each program strictly linearly
+can deadlock; `reassemble_distributed_program` raises when the programs
+genuinely contradict each other.
 
 Pass `routed_remote_ops` with `local_routed`, or `program.remote_ops` with
 `program.local_circuits`.

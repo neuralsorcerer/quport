@@ -127,10 +127,13 @@ class UnpackableGate:
     more qubits, which QuPort treats conservatively because a single bipartite
     cat copy cannot bring three QPUs together.
 
-    When such a gate spans ``k`` QPUs it is costed at ``2 * (k - 1)`` e-bits:
-    teleport every foreign operand to one host QPU and teleport it back, at one
-    e-bit per direction. That is the standard cost of implementing an arbitrary
-    non-local two-qubit unitary and an upper bound for wider gates.
+    Such a gate runs on a host QPU, the QPU of its first operand, and every
+    operand sitting anywhere else is teleported there and back at one e-bit per
+    direction. A gate with ``f`` operands off the host QPU therefore costs
+    ``2 * f`` e-bits. The count is per *operand*, not per foreign QPU: one EPR
+    pair teleports one qubit, so two operands on the same foreign QPU need two
+    round trips. For a two-qubit gate this is the standard two e-bits of an
+    arbitrary non-local two-qubit unitary.
     """
 
     index: int
@@ -349,9 +352,10 @@ def ebit_cost(
 ) -> int:
     """Return the lambda-1 e-bit cost of ``part``.
 
-    One e-bit per (packet, distinct remote QPU) pair, plus ``2 * (k - 1)`` for
-    each unpackable gate spanning ``k`` QPUs. This is the exact number of EPR
-    pairs a cat-entanglement compiler consumes when comm ports are unconstrained.
+    One e-bit per (packet, distinct remote QPU) pair, plus ``2`` for every
+    operand of an unpackable gate that sits off that gate's host QPU. This is
+    the exact number of EPR pairs a cat-entanglement compiler consumes when comm
+    ports are unconstrained.
     """
     n_qpus_value = _validate_n_qpus(n_qpus)
     assignments = _validate_part(
@@ -461,12 +465,11 @@ def _ebit_objective_fast(
     for gate in decomposition.unpackable_gates:
         host = part[gate.qubits[0]]
         row = None if dist is None else dist[host]
-        stamp += 1
-        seen_stamp[host] = stamp
+        # One round trip per operand off the host, even when several share a
+        # QPU: each EPR pair teleports exactly one qubit.
         for qubit in gate.qubits[1:]:
             qpu = part[qubit]
-            if seen_stamp[qpu] != stamp:
-                seen_stamp[qpu] = stamp
+            if qpu != host:
                 count += 2
                 weighted += 2.0 * (1.0 if row is None else row[qpu])
                 if traffic is not None:
@@ -479,22 +482,19 @@ def _ebit_objective_fast(
 def _teleport_host_and_foreign(
     gate: UnpackableGate, part: Sequence[int]
 ) -> tuple[int, tuple[int, ...]]:
-    """Return the host QPU of an unpackable gate and the QPUs teleported into it.
+    """Return the host QPU of an unpackable gate and the QPU of each teleport.
 
     The host is the QPU of the gate's *first* operand, matching how
     :func:`quport.aggregation.aggregate_remote_operations` and the schedule
     estimators pick the leading QPU of a multi-QPU operation, so every view of a
     circuit charges the same links.
+
+    The second element has one entry per operand off the host -- the QPU that
+    operand is teleported from -- so a QPU holding two of them appears twice.
     """
     host = part[gate.qubits[0]]
-    foreign: list[int] = []
-    seen = {host}
-    for qubit in gate.qubits[1:]:
-        qpu = part[qubit]
-        if qpu not in seen:
-            seen.add(qpu)
-            foreign.append(qpu)
-    return host, tuple(foreign)
+    foreign = tuple(part[qubit] for qubit in gate.qubits[1:] if part[qubit] != host)
+    return host, foreign
 
 
 def ebit_traffic_matrix(
@@ -531,14 +531,34 @@ class EbitReport:
         Total EPR pairs required with aggregation (the lambda-1 cost).
     baseline_ebits:
         EPR pairs required without aggregation: one per cut two-qubit gate that
-        has a diagonal operand, and ``2 * (k - 1)`` per unpackable gate spanning
-        ``k`` QPUs. This is what a per-gate telegate compiler consumes.
+        has a diagonal operand, and ``2`` per operand of an unpackable gate that
+        sits off the gate's host QPU. This is what a per-gate telegate compiler
+        consumes.
     reduction:
         ``1 - ebits / baseline_ebits``, or ``0.0`` when no e-bits are needed.
+    packets / active_packets:
+        Distributable packets in the circuit, and how many of them reach at
+        least one remote QPU under this partition.
+    packed_gates:
+        Two-qubit gates covered by some packet, local or cross-QPU.
+    cut_gates:
+        Packet gates whose partner sits off the root's QPU, i.e. the cross-QPU
+        gates cat copies serve. Unpackable gates are not included; their cost
+        is ``unpackable_ebits``.
+    unpackable_ebits:
+        E-bits spent teleporting the operands of unpackable gates.
     peak_cat_copies:
-        Per QPU, the largest number of cat copies that are simultaneously live.
-        A value above the QPU's comm-port count means the unconstrained plan is
+        Per QPU, the largest number of comm-port slots held at once by the
+        unconstrained plan: each cat copy for the span from the first to the
+        last gate it serves, and each teleported operand for its one gate. A
+        value above the QPU's comm-port count means the unconstrained plan is
         not directly realisable and ports will serialise it.
+
+        This is not the figure
+        :attr:`quport.aggregation.AggregationPlan.peak_cat_copies` reports.
+        That one counts cat copies only, and holds each until its root is
+        disturbed or it is evicted rather than releasing it after its last
+        gate, so either can be the larger.
     pair_ebits:
         E-bits per unordered QPU pair, sorted by pair.
     """

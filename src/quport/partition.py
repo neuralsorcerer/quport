@@ -661,7 +661,8 @@ def _objective_tpccap(
         w_dist * sum_{cut edges} weight * dist(qpu_i, qpu_j)
       + w_port * sum_q max(0, boundary_q - comm_ports)^2
       + w_cong * sum_{links} load(link)^2
-      + w_ebit * sum_{packet, remote qpu} dist(root_qpu, remote_qpu)
+      + w_ebit * (sum_{packet, remote qpu} dist(root_qpu, remote_qpu)
+                  + sum_{unpackable gate, off-host operand} 2 * dist(host, qpu))
 
     Notes
     -----
@@ -673,8 +674,11 @@ def _objective_tpccap(
       one root and one destination cost one e-bit, not one each.
     - ``congestion_source="ebits"`` routes EPR-pair demand instead of gate
       demand, so the congestion term describes the same traffic the e-bit term
-      is priced from. Gate demand upper-bounds it, sometimes by a large factor,
-      because aggregation is exactly the business of removing transactions.
+      is priced from. The two differ: with uniform weights and gates a cat
+      copy can serve, gate demand upper-bounds EPR demand, often by a large
+      factor, because aggregation is exactly the business of removing
+      transactions; but a teleported gate costs two EPR pairs for one unit of
+      gate demand, and decayed weights shrink gate demand below one per gate.
     """
     # Weighted cut distance
     wcd = 0.0
@@ -992,8 +996,9 @@ def tpccap_partition(
         Which demand the congestion term routes. ``"gates"`` (the default, and
         the historical behaviour) charges one transaction per cut two-qubit
         gate; ``"ebits"`` charges one per EPR pair that survives aggregation,
-        and requires ``packets``. Gate demand upper-bounds e-bit demand, so on
-        an aggregating machine it reports congestion that never happens.
+        and requires ``packets``. With uniform weights and cat-servable gates,
+        gate demand upper-bounds e-bit demand, so on an aggregating machine it
+        reports congestion that never happens.
 
     Returns
     -------
@@ -1100,9 +1105,11 @@ def tpccap_sa_partition(
 
     Objective
     ---------
-    Same three terms as TPCCAP (distance + port overflow + congestion), with soft
-    penalties for capacity overflow (kept very large so feasible solutions dominate)
-    -- but by default **not the same weighting**. The seed is built with ``w_cong``
+    The same terms as TPCCAP (distance + port overflow + congestion, plus the
+    optional e-bit term) -- but by default **not the same weighting**. Capacity is
+    not one of the terms: it is a hard constraint, because a move only ever targets
+    a QPU with a free slot and a swap leaves every load unchanged, so every state
+    the annealing visits is feasible. The seed is built with ``w_cong``
     (default ``0.05``, matching :func:`tpccap_partition`); the annealing stage then
     optimizes ``anneal_w_cong`` (default ``0.2``), four times the congestion penalty.
     Pass ``anneal_w_cong=None`` to anneal on exactly the objective the seed was built
@@ -1110,8 +1117,10 @@ def tpccap_sa_partition(
 
     That asymmetry decides how results compare. Annealing returns the best state it
     saw under its own objective, so it never loses ground there, but the partition it
-    returns can score worse than its seed when measured with the seed's weighting --
-    on random instances that happens for roughly 40% of them. Any comparison between
+    returns can score worse than its seed when measured with the seed's weighting.
+    That is uncommon on random circuits -- 3 of 240 instances across 2 to 6 QPUs and
+    every interconnect, 3 of 72 at the default 10-QPU configuration with 80 logical
+    qubits -- but it happens. Any comparison between
     ``tpccap`` and ``tpccap_sa`` therefore has to say which weighting it scored with,
     or the two are being ranked on different scales.
 
@@ -1126,16 +1135,18 @@ def tpccap_sa_partition(
     -----------------
     ``w_port`` and ``w_cong`` were tuned against a ``w_dist`` term that counts
     every cut gate. Switching the volume term to e-bits shrinks it by the
-    aggregation factor -- often an order of magnitude -- and a penalty left at
-    its old scale then dominates the objective it was meant to bias. Whichever
-    terms are combined, they have to be commensurate; QuPort's ``"ebit"``
-    compile strategy sets the penalties accordingly.
+    aggregation factor -- about 1.6x on random circuits, more on structured ones
+    such as a QFT or a GHZ fan-out -- and a penalty left at its old scale then
+    weighs correspondingly more against the term it was meant to bias. Whichever
+    terms are combined, they have to be commensurate; :func:`ebit_partition`, which
+    is QuPort's ``"ebit"`` strategy, sets the penalties accordingly.
 
     Notes
     -----
     - This is designed for research workloads where n_qpus is small (e.g., 10).
-    - For speed, objective is recomputed each accepted move. This is still fast for
-      typical random circuits (<= few thousand unique 2Q pairs).
+    - The objective is recomputed in full for every proposal, accepted or not.
+      This is still fast for typical random circuits (<= few thousand unique 2Q
+      pairs).
 
     Returns
     -------
@@ -1419,4 +1430,66 @@ def tpccap_sa_partition(
         AnnealDiagnostics(
             steps=steps, accepted=accepted, improved=improved, best_objective=best_obj
         ),
+    )
+
+
+def ebit_partition(
+    n: int,
+    weights: Mapping[tuple[int, int], float],
+    n_qpus: int,
+    capacity: int,
+    comm_ports_per_qpu: int,
+    sp: QpuShortestPaths,
+    packets: PacketDecomposition,
+    seed: int | None = None,
+) -> tuple[PartitionResult, PartitionDiagnostics, AnnealDiagnostics]:
+    """QuPort's ``"ebit"`` strategy: TPCCAP-SA priced in EPR pairs.
+
+    Every entry point that accepts ``strategy="ebit"`` partitions through this
+    function, so the name means one objective wherever it appears rather than
+    one per caller.
+
+    Relative to :func:`tpccap_sa_partition`'s defaults it changes four things:
+
+    - Communication volume is measured in e-bits, so the cut-distance term is
+      switched off (``w_dist=0``) rather than added on top of hop-scaled e-bit
+      demand (``w_ebit=1``).
+    - The boundary-qubit port penalty is dropped (``w_port=0``). At its old
+      weight it is about as large as the e-bit count with two comm ports per
+      QPU and several times larger with one -- a median of 0.8x and 4x on
+      random partitions, up to 11x -- so it competes with the term it was meant
+      to bias rather than nudging it. It measures the wrong resource anyway:
+      what a cat-entanglement compiler needs a port for is a live cat copy, not
+      every boundary qubit. Under aggregation a port shortage is already priced
+      -- it costs an eviction and a fresh EPR pair -- so the penalty would be
+      double-counted.
+    - Congestion is kept, but routed from EPR demand rather than gate demand
+      (``congestion_source="ebits"``), so it describes the same traffic the
+      e-bit term prices.
+    - Both stages use the same congestion weight (``w_cong=anneal_w_cong=0.05``),
+      because the default fourfold annealing asymmetry was tuned against the
+      larger gate-traffic scale.
+
+    Parameters
+    ----------
+    packets:
+        Packet decomposition of the same circuit the weights came from. The
+        weights still seed the TPCCAP search and rank candidate QPUs, but the
+        objective itself is priced from the packets.
+    """
+    return tpccap_sa_partition(
+        n=n,
+        weights=weights,
+        n_qpus=n_qpus,
+        capacity=capacity,
+        comm_ports_per_qpu=comm_ports_per_qpu,
+        sp=sp,
+        seed=seed,
+        w_dist=0.0,
+        w_port=0.0,
+        w_cong=0.05,
+        anneal_w_cong=0.05,
+        packets=packets,
+        w_ebit=1.0,
+        congestion_source="ebits",
     )

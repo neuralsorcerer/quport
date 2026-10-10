@@ -318,7 +318,7 @@ def test_verification_seed_must_be_an_integer() -> None:
 
 
 @pytest.mark.parametrize("intra", ["clique", "line", "ring", "grid2d"])
-@pytest.mark.parametrize("optimization_level", [0, 3])
+@pytest.mark.parametrize("optimization_level", [0, 1, 2, 3])
 def test_compiled_artifacts_still_compute_their_circuit(
     intra: str, optimization_level: int
 ) -> None:
@@ -633,6 +633,37 @@ def test_verification_refuses_mid_circuit_measurement() -> None:
         )
 
 
+def test_verification_refuses_classical_control_with_a_clear_error() -> None:
+    """An ``if`` block has no state vector; say so instead of crashing in Qiskit.
+
+    The condition here reads a bit nothing has measured yet, so the mid-circuit
+    measurement check does not fire. Without a check of its own the control-flow
+    block reached the simulator and surfaced as a Qiskit error that callers
+    catching ``ValueError`` -- the command line among them -- do not expect.
+    """
+    from qiskit import ClassicalRegister, QuantumRegister
+
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    creg = ClassicalRegister(1, "c")
+    circuit = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), creg)
+    circuit.h(0)
+    circuit.cx(0, 3)
+    with circuit.if_test((creg, 0)):
+        circuit.x(1)
+    circuit.measure(0, 0)
+    program = split_into_qpus(circuit, arch)
+
+    with pytest.raises(ValueError, match="classically controlled if_else"):
+        verify_distributed_program(
+            circuit, program.local_circuits, program.remote_ops, arch
+        )
+    with pytest.raises(ValueError, match="classically controlled if_else"):
+        verify_telegate_equivalence(circuit, arch)
+
+
 def test_symmetric_cz_across_qpus_is_served_and_correct() -> None:
     """Both operands of a CZ are diagonal, so the aggregator picks a root."""
     arch = _arch(compute=2)
@@ -649,4 +680,95 @@ def test_symmetric_cz_across_qpus_is_served_and_correct() -> None:
     assert plan.blocks[0].protocol == "cat"
     assert plan.epr_pairs == 1
     assert plan.baseline_epr_pairs == 2
+    assert verify_telegate_equivalence(qc, arch, plan)
+
+
+_ONE_QUBIT = ("h", "x", "y", "z", "s", "sdg", "t", "sx")
+_ONE_QUBIT_ROTATIONS = ("rz", "rx", "ry", "p")
+_TWO_QUBIT = (
+    "cx",
+    "cy",
+    "cz",
+    "ch",
+    "csx",
+    "cs",
+    "csdg",
+    "swap",
+    "iswap",
+    "ecr",
+    "dcx",
+)
+_TWO_QUBIT_ROTATIONS = ("cp", "crz", "crx", "cry", "rzz", "rzx", "rxx", "ryy")
+_THREE_QUBIT = ("ccx", "cswap", "ccz")
+
+
+@pytest.mark.parametrize("seed", range(16))
+def test_plans_over_the_full_standard_gate_set_compute_their_circuit(
+    seed: int,
+) -> None:
+    """Aggregation is only as sound as the diagonality rule under it.
+
+    Compiled circuits reach the aggregator in the ``cx`` basis, which never
+    exercises a gate diagonal on one operand only (``rzx``, ``ch``), a
+    symmetric one with a free root (``cp``, ``rzz``), a gate diagonal on
+    neither (``iswap``, ``ecr``) or a three-qubit gate. Here random physical
+    circuits drawn from all of them are aggregated under several port budgets
+    and every plan is checked by simulation: a cat copy kept alive across an
+    operation that disturbs its root sends the fidelity to zero.
+    """
+    import math
+    import random
+
+    rng = random.Random(seed)
+    arch = _arch(
+        n_qpus=rng.randint(2, 3), compute=rng.randint(1, 2), comm=rng.randint(2, 3)
+    )
+    n = arch.n_phys
+    qc = QuantumCircuit(n)
+    for _ in range(rng.randint(6, 20)):
+        kind = rng.random()
+        if kind < 0.3:
+            if rng.random() < 0.5:
+                getattr(qc, rng.choice(_ONE_QUBIT))(rng.randrange(n))
+            else:
+                angle = rng.uniform(0.0, 2 * math.pi)
+                getattr(qc, rng.choice(_ONE_QUBIT_ROTATIONS))(angle, rng.randrange(n))
+        elif kind < 0.9:
+            a, b = rng.sample(range(n), 2)
+            if rng.random() < 0.5:
+                getattr(qc, rng.choice(_TWO_QUBIT))(a, b)
+            else:
+                angle = rng.uniform(0.0, 2 * math.pi)
+                getattr(qc, rng.choice(_TWO_QUBIT_ROTATIONS))(angle, a, b)
+        else:
+            getattr(qc, rng.choice(_THREE_QUBIT))(*rng.sample(range(n), 3))
+
+    verified = 0
+    for ports in (None, 2, 1):
+        plan = aggregate_remote_operations(qc, arch, ports_per_qpu=ports)
+        if plan.unschedulable_gates:
+            # Too few ports for this plan to run at all; nothing to check.
+            continue
+        assert verify_telegate_equivalence(qc, arch, plan, seed=seed), ports
+        verified += 1
+    assert verified, "the fixture must produce at least one runnable plan"
+
+
+def test_verification_fits_in_memory_well_below_the_width_limit() -> None:
+    """Sixteen data qubits must verify; the state vector is only 2**18 long.
+
+    Tracing the ancillas out into a reduced density matrix would need 4**16
+    entries -- 64 GiB -- for the data alone, which ran out of memory long
+    before the advertised 24-qubit limit. The fidelity is summed from the
+    state vector instead.
+    """
+    arch = _arch(n_qpus=2, compute=7, comm=1)
+    assert arch.n_phys == 16
+    qc = QuantumCircuit(arch.n_phys)
+    qc.h(0)
+    qc.cx(0, 8)
+    qc.cx(0, 9)
+
+    plan = aggregate_remote_operations(qc, arch)
+    assert plan.blocks, "the fixture must cross QPUs"
     assert verify_telegate_equivalence(qc, arch, plan)

@@ -162,6 +162,55 @@ def test_three_qubit_gate_spanning_three_qpus_gathers_both_operands() -> None:
     assert plan.blocks_by_gate_index()[0] == plan.blocks
 
 
+def test_three_qubit_gate_teleports_both_operands_sharing_a_foreign_qpu() -> None:
+    """Every operand off the host travels, even two from the same QPU.
+
+    Gathering only the first of them -- one teleport per foreign *QPU* -- left
+    the emitted gate acting on a qubit that never left its QPU, so the
+    "executable" protocol still contained a cross-QPU Toffoli, and the plan
+    charged two EPR pairs for what needs four.
+    """
+    from quport.protocol import build_telegate_circuit, verify_telegate_equivalence
+
+    arch = _arch(comm=2)  # QPU0 holds 0..4, QPU1 holds 5..9
+    qc = QuantumCircuit(arch.n_phys)
+    qc.h(0)
+    qc.h(5)
+    qc.h(6)
+    qc.ccx(0, 5, 6)
+
+    plan = aggregate_remote_operations(qc, arch)
+
+    assert [block.protocol for block in plan.blocks] == ["teleport", "teleport"]
+    assert sorted(block.root_phys for block in plan.blocks) == [5, 6]
+    assert {block.remote_qpu for block in plan.blocks} == {0}
+    assert plan.epr_pairs == plan.baseline_epr_pairs == 4
+    assert plan.remote_gates == 1
+    assert plan.unschedulable_gates == 0
+
+    # The partition-time model prices the same gate identically.
+    part = [arch.qpu_of_phys(phys) for phys in range(arch.n_phys)]
+    assert ebit_cost(build_distributable_packets(qc), part, arch.cfg.n_qpus) == 4
+
+    # In the emitted protocol the Toffoli touches only QPU0's own qubits and
+    # the ancillas the operands were teleported into -- nothing left on QPU1.
+    program = build_telegate_circuit(qc, arch, plan)
+    index_of = {q: i for i, q in enumerate(program.circuit.qubits)}
+    (toffoli,) = [inst for inst in program.circuit.data if inst.operation.name == "ccx"]
+    operands = [index_of[q] for q in toffoli.qubits]
+    assert all(
+        position in program.ancillas or arch.qpu_of_phys(position) == 0
+        for position in operands
+    )
+    assert verify_telegate_equivalence(qc, arch, plan)
+
+    # Same qubit layout with one port: the host has to hold both operands at
+    # once, so a single port serves neither.
+    narrow = aggregate_remote_operations(qc, _arch(compute=4, comm=1))
+    assert narrow.unschedulable_gates == 1
+    assert narrow.blocks == ()
+
+
 def test_zero_ports_makes_every_remote_gate_unschedulable() -> None:
     arch = _arch(comm=0)
     qc = QuantumCircuit(arch.n_phys)

@@ -15,10 +15,14 @@ from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit
 
-from quport.aggregation import AggregationPlan, aggregate_remote_operations
+from quport.aggregation import (
+    AggregationPlan,
+    RemoteBlock,
+    aggregate_remote_operations,
+)
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig, validate_epr_success_prob
-from quport.distributed import RemoteOp, split_into_qpus
+from quport.distributed import split_into_qpus
 from quport.entanglement import is_directive
 from quport.network import UNREACHABLE_DISTANCE, QpuEdge, path_edges
 
@@ -27,7 +31,13 @@ UNSCHEDULABLE_PENALTY: float = float(UNREACHABLE_DISTANCE)
 
 @dataclass(frozen=True)
 class ScheduleSummary:
-    """A coarse schedule summary (research metric)."""
+    """A coarse schedule summary (research metric).
+
+    ``steps`` means something different for each estimator that returns this:
+    the number of remote synchronisations for :func:`estimate_parallel_makespan`,
+    and the number of DAG layers -- with or without remote operations -- for
+    :func:`estimate_parallel_makespan_layered`.
+    """
 
     makespan: float
     steps: int
@@ -167,9 +177,14 @@ def estimate_parallel_makespan(
     - Each QPU has its own timeline.
     - Local gates add (oneq/twoq/swap) to that QPU's time.
     - Remote ops require:
-        * both involved QPUs to reach a synchronization point
-        * add remote cost to both timelines (EPR + RTT + overhead)
-    - Barriers produced by `split_into_qpus()` are used only implicitly (remote ops).
+        * every involved QPU to reach a synchronization point -- for an
+          operation on three or more qubits that is each QPU holding an
+          operand, not only the two endpoints its manifest entry names
+        * add remote cost to each of those timelines (EPR + RTT + overhead)
+    - An operation that touches a classical bit waits for the previous
+      operation on that bit, whichever QPU ran it, so feedforward cannot start
+      before the measurement it reads.
+    - A barrier consumes no time but synchronizes the QPUs it spans.
 
     This is intended for *comparative* studies across mappings/topologies.
     """
@@ -183,23 +198,40 @@ def estimate_parallel_makespan(
 
     # Build a simplified linear scan over original circuit instructions, applying costs.
 
-    remote_by_index: dict[int, RemoteOp] = {op.index: op for op in program.remote_ops}
+    remote_indices = {op.index for op in program.remote_ops}
     steps = 0
+    # When each classical bit was last touched. A measurement on one QPU and
+    # the conditional on another that reads it share no qubit, so the QPU
+    # timelines alone would let the conditional run first.
+    cindex = {clbit: index for index, clbit in enumerate(mapped.clbits)}
+    clbit_ready = [0.0] * len(mapped.clbits)
 
     for idx, inst in enumerate(mapped.data):
         # Compiler directives (barriers) synchronize but consume no time; they
-        # are never RemoteOps (split_into_qpus handles them separately).
+        # are never RemoteOps (split_into_qpus handles them separately). A
+        # barrier with no qubits spans the whole machine.
         if getattr(inst.operation, "_directive", False):
+            spanned = set(_instruction_qpus(inst.qubits, qindex, phys_to_qpu))
+            if not inst.qubits:
+                spanned = set(range(len(t)))
+            if spanned:
+                sync_time = max(t[qpu] for qpu in spanned)
+                for qpu in spanned:
+                    t[qpu] = sync_time
             continue
         qpus = _instruction_qpus(inst.qubits, qindex, phys_to_qpu)
         name = inst.operation.name
-        if idx in remote_by_index:
-            rop = remote_by_index[idx]
-            q0, q1 = rop.qpu0, rop.qpu1
-            # sync
-            sync_time = max(t[q0], t[q1])
-            t[q0] = sync_time + remote_cost
-            t[q1] = sync_time + remote_cost
+        bits = [cindex[clbit] for clbit in inst.clbits]
+        after = max((clbit_ready[bit] for bit in bits), default=0.0)
+        if idx in remote_indices:
+            # Still one remote event, as split_into_qpus counts it, but every
+            # QPU holding an operand takes part: a wide operation cannot start
+            # while one of its qubits is still busy elsewhere.
+            participants = tuple(dict.fromkeys(qpus))
+            sync_time = max([t[qpu] for qpu in participants] + [after])
+            finish = sync_time + remote_cost
+            for qpu in participants:
+                t[qpu] = finish
             steps += 1
         else:
             if len(qpus) == 0:
@@ -207,23 +239,27 @@ def estimate_parallel_makespan(
                 continue
             if len(qpus) == 1:
                 qpu = qpus[0]
-                t[qpu] += lat.oneq
+                t[qpu] = max(t[qpu], after) + lat.oneq
+                finish = t[qpu]
             elif len(qpus) == 2:
                 qpu0, qpu1 = qpus
                 if qpu0 == qpu1:
-                    if name == "swap":
-                        t[qpu0] += lat.swap
-                    else:
-                        t[qpu0] += lat.twoq
+                    duration = lat.swap if name == "swap" else lat.twoq
+                    t[qpu0] = max(t[qpu0], after) + duration
+                    finish = t[qpu0]
                 else:
                     # should have been remote op; be safe
-                    sync_time = max(t[qpu0], t[qpu1])
+                    sync_time = max(t[qpu0], t[qpu1], after)
                     t[qpu0] = sync_time + remote_cost
                     t[qpu1] = sync_time + remote_cost
+                    finish = t[qpu0]
                     steps += 1
             else:
                 # conservative: serialize on first qpu
-                t[qpus[0]] += lat.twoq
+                t[qpus[0]] = max(t[qpus[0]], after) + lat.twoq
+                finish = t[qpus[0]]
+        for bit in bits:
+            clbit_ready[bit] = finish
 
     return ScheduleSummary(
         makespan=max(t), steps=steps, remote_ops=len(program.remote_ops)
@@ -245,8 +281,13 @@ def estimate_parallel_makespan_layered(
     - Within a layer, local ops on different QPUs are assumed to proceed in parallel.
     - Remote ops in the same layer are executed in parallel **up to comm port capacity**.
 
-    Remote ops are grouped into "rounds" so that each QPU participates in at most
-    `arch.cfg.comm_qubits_per_qpu` remote ops per round.
+    Remote ops are charged in "rounds", each QPU taking part in at most
+    `arch.cfg.comm_qubits_per_qpu` remote ops per round. The round count is the
+    per-QPU lower bound ``ceil(max remote ops on one QPU / comm ports)``, not
+    the result of packing the ops: three QPUs exchanging pairwise with one port
+    each need three rounds and are charged two. That optimism is of a piece with
+    the best-case model below; :func:`estimate_parallel_makespan_topology`
+    packs the rounds explicitly.
 
     The per-layer duration is computed as:
         max(local_layer_duration, remote_rounds * remote_cost)
@@ -1366,6 +1407,8 @@ def estimate_entanglement_schedule(
     order against explicit resources:
 
     - one timeline per physical qubit, so independent QPUs drift apart freely;
+    - one per classical bit, so feedforward waits for the measurement it reads
+      even when that measurement ran on another QPU;
     - a pool of ``comm_qubits_per_qpu`` ports per QPU, each **held for a whole
       block** rather than for a single gate, which is what makes port scarcity
       bite;
@@ -1381,9 +1424,9 @@ def estimate_entanglement_schedule(
     ----------
     plan:
         A pre-computed aggregation plan. When omitted, one is built with the
-        architecture's own port budget. A supplied plan must have been built with
-        the same budget the schedule uses, otherwise it asks for ports that do
-        not exist and the call raises.
+        architecture's own port budget. A supplied plan must fit the budget the
+        schedule uses -- as one built with that same budget always does --
+        otherwise it asks for ports that do not exist and the call raises.
     ports_per_qpu:
         Override the comm-port budget, matching the parameter of
         :func:`quport.aggregation.aggregate_remote_operations`. Passing a large
@@ -1392,8 +1435,9 @@ def estimate_entanglement_schedule(
     Raises
     ------
     ValueError
-        If ``plan`` holds more concurrent cat copies on some QPU than the
-        schedule's port budget allows.
+        If ``plan`` needs more comm ports on some QPU at once than the
+        schedule's budget allows: more live cat copies than it has ports, or no
+        port left over for the entangler of a block rooted there.
 
     Returns
     -------
@@ -1426,6 +1470,14 @@ def estimate_entanglement_schedule(
                     f"(QPU {qpu} holds {peak} cat copies, budget is {ports[qpu]}); "
                     "build the plan with the same ports_per_qpu"
                 )
+        # Fitting the copies is not the whole budget: a block's entangler also
+        # needs a port on the root's QPU while it runs.
+        shortfall = _plan_port_shortfall(plan, ports)
+        if shortfall is not None:
+            raise ValueError(
+                f"aggregation plan exceeds the schedule's comm-port budget "
+                f"({shortfall}); build the plan with the same ports_per_qpu"
+            )
 
     sp = arch.qpu_shortest_paths()
     classical_eff = _effective_classical_rtt(cfg, lat)
@@ -1442,6 +1494,8 @@ def estimate_entanglement_schedule(
             members.setdefault(gate_index, []).append(ordinal)
 
     qubit_ready = [0.0] * n_phys
+    cindex = {clbit: index for index, clbit in enumerate(mapped.clbits)}
+    clbit_ready = [0.0] * len(mapped.clbits)
     port_pools = [_ResourcePool(ports[qpu]) for qpu in range(n_qpus)]
     link_pools: dict[QpuEdge, _ResourcePool] = {}
     link_busy: dict[QpuEdge, float] = {}
@@ -1568,6 +1622,9 @@ def estimate_entanglement_schedule(
         if not qubits:
             continue
 
+        bits = [cindex[clbit] for clbit in instruction.clbits]
+        after = max((clbit_ready[bit] for bit in bits), default=0.0)
+
         for ordinal in starts.get(index, ()):
             establish(ordinal)
 
@@ -1582,6 +1639,7 @@ def estimate_entanglement_schedule(
             start = max(
                 [runtime[ordinal].ready for ordinal in ordinals]
                 + [qubit_ready[qubit] for qubit in qubits if qubit not in roots]
+                + [after]
             )
             finish = start + duration
             for ordinal in ordinals:
@@ -1589,6 +1647,8 @@ def estimate_entanglement_schedule(
             for qubit in qubits:
                 if qubit not in roots:
                     qubit_ready[qubit] = finish
+            for bit in bits:
+                clbit_ready[bit] = finish
             qpu_busy[host] += duration
 
             for ordinal in ends.get(index, ()):
@@ -1600,10 +1660,12 @@ def estimate_entanglement_schedule(
             # A cross-QPU gate the aggregator could not serve at all.
             remote_gates += 1
             unschedulable += 1
-            start = max(qubit_ready[qubit] for qubit in qubits)
+            start = max([qubit_ready[qubit] for qubit in qubits] + [after])
             finish = start + UNSCHEDULABLE_PENALTY
             for qubit in qubits:
                 qubit_ready[qubit] = finish
+            for bit in bits:
+                clbit_ready[bit] = finish
             continue
 
         qpu = phys_to_qpu[qubits[0]]
@@ -1613,10 +1675,12 @@ def estimate_entanglement_schedule(
             duration = lat.swap
         else:
             duration = lat.twoq
-        start = max(qubit_ready[qubit] for qubit in qubits)
+        start = max([qubit_ready[qubit] for qubit in qubits] + [after])
         finish = start + duration
         for qubit in qubits:
             qubit_ready[qubit] = finish
+        for bit in bits:
+            clbit_ready[bit] = finish
         qpu_busy[qpu] += duration
 
     # Any block still holding a port ran past the end of the instruction list.
@@ -1824,6 +1888,51 @@ def _normalized_port_budget(
         _validated_nonnegative_int(value, label=f"ports_per_qpu[{index}]")
         for index, value in enumerate(ports_per_qpu)
     ]
+
+
+def _plan_port_shortfall(plan: AggregationPlan, ports: Sequence[int]) -> str | None:
+    """Replay a plan's port holds in the order the scheduler takes them.
+
+    :func:`estimate_entanglement_schedule` establishes every block starting at
+    an instruction before running it, and releases the blocks ending there
+    after. Establishing needs a free port on both ends: the host keeps its port
+    until the block is released, the root's QPU only while the entangler runs.
+    A plan that ever asks for a port when none is free would drain a pool and be
+    reported as unschedulable gates, so it is described here instead.
+
+    A port is counted for every block, including ones the scheduler later finds
+    unreachable and never actually acquires for. That never rejects a plan built
+    with the same budget: :func:`quport.aggregation.aggregate_remote_operations`
+    reserves those ports the same way, without knowing about reachability, and
+    keeps a copy live at least until its last gate, which is when the scheduler
+    releases it.
+
+    Returns ``None`` when the plan fits, otherwise a description of the first
+    shortfall.
+    """
+    n_qpus = len(ports)
+    starts: dict[int, list[RemoteBlock]] = {}
+    ends: dict[int, list[RemoteBlock]] = {}
+    for block in plan.blocks:
+        for qpu in (block.root_qpu, block.remote_qpu):
+            if qpu < 0 or qpu >= n_qpus:
+                return f"a block names QPU {qpu}, the architecture has {n_qpus}"
+        starts.setdefault(block.start_index, []).append(block)
+        ends.setdefault(block.end_index, []).append(block)
+
+    held = [0] * n_qpus
+    for index in sorted(starts.keys() | ends.keys()):
+        for block in starts.get(index, ()):
+            for qpu, role in ((block.remote_qpu, "host"), (block.root_qpu, "root")):
+                if held[qpu] >= ports[qpu]:
+                    return (
+                        f"instruction {index} needs a {role} port on QPU {qpu}, "
+                        f"which has all {ports[qpu]} in use"
+                    )
+            held[block.remote_qpu] += 1
+        for block in ends.get(index, ()):
+            held[block.remote_qpu] -= 1
+    return None
 
 
 def _peak_overlap(intervals: Sequence[tuple[float, float]]) -> int:

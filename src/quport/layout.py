@@ -192,7 +192,9 @@ def choose_comm_logicals_diverse(
     where overlap(i) is the maximum ext[i][q] over remote QPUs already covered by
     previously selected comm logicals in the same QPU.
 
-    This is still heuristic, but empirically improves robustness on random circuits.
+    This is a heuristic, and not a measured improvement: on random circuits
+    mapped globally with two or three ports per QPU it does not consistently
+    beat :func:`choose_comm_logicals`.
     """
     n_logical_value, n_qpus_value = _validate_layout_inputs(
         n_logical, qpu_of_logical, n_qpus

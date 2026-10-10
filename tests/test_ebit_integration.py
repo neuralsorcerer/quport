@@ -235,6 +235,27 @@ def test_ebit_strategy_is_available_end_to_end() -> None:
     assert len(result.partition) == 8
 
 
+def test_ebit_strategy_means_the_same_objective_in_both_pipelines() -> None:
+    """``map_and_transpile`` and ``compile_distributed`` must run one ``ebit``.
+
+    Both translate the circuit the same way, decay its weights the same way and
+    build the same packets, so with the same objective they reach the same
+    partition. ``map_and_transpile`` used to keep the pre-rescaling penalties --
+    a squared boundary-qubit port term that dwarfs an e-bit count, and gate
+    congestion annealed at four times the seed's weight -- so ``quport map``,
+    ``bench`` and ``sweep`` measured a different strategy under the same name.
+    """
+    cfg = _cfg(n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2)
+    for seed in range(4):
+        qc = random_benchmark_circuit(n_logical=16, depth=12, seed=seed)
+
+        mapped = map_and_transpile(qc, cfg, seed=seed, strategy="ebit")
+        compiled = compile_distributed(qc, cfg, seed=seed, strategy="ebit")
+
+        assert mapped.partition == compiled.partition
+        assert mapped.partition_diagnostics == compiled.partition_diagnostics
+
+
 def test_unknown_strategy_message_lists_ebit() -> None:
     cfg = _cfg()
     with pytest.raises(ValueError, match="'ebit'"):
@@ -280,10 +301,11 @@ def test_ebit_strategy_beats_cut_minimisation_at_its_own_objective() -> None:
     """The e-bit strategy has to actually spend fewer EPR pairs.
 
     It did not, before the penalty weights were rescaled: ``w_port`` measures
-    squared boundary-qubit overflow, which on these instances is one to two
-    orders of magnitude larger than an e-bit count, so removing the cut-distance
-    term left the port penalty steering the entire search and the strategy lost
-    to plain cut minimisation at the objective it was named for.
+    squared boundary-qubit overflow, which at its old weight is comparable to an
+    e-bit count, so removing the cut-distance term left the port penalty
+    competing with the e-bit term for control of the search. On this instance
+    the strategy did no better than plain cut minimisation at the objective it
+    was named for -- 44 e-bits each, where the rescaled objective finds 32.
     """
     cfg = _cfg(n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=2)
     qc = random_benchmark_circuit(n_logical=16, depth=12, seed=0)

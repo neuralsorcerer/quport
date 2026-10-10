@@ -139,6 +139,28 @@ def test_ebit_objective_matches_exhaustive_search():
     assert checked >= 30
 
 
+def test_a_wide_gate_is_cheapest_with_its_host_kept_company() -> None:
+    """Two operands off the host cost two round trips, so the search avoids it.
+
+    A Toffoli on three qubits over two QPUs of capacity two must leave one
+    operand behind. Stranding a guest costs one round trip; stranding the host,
+    which sends both guests travelling, costs two.
+    """
+    qc = QuantumCircuit(3)
+    qc.ccx(0, 1, 2)
+    packets = build_distributable_packets(qc)
+
+    best = optimal_partition(3, 2, 2, objective="ebits", packets=packets)
+
+    assert best.proved_optimal
+    assert best.objective == 2.0
+    assert best.part[0] in (best.part[1], best.part[2])
+
+    stranded_host = partition_gap([0, 1, 1], 2, 2, objective="ebits", packets=packets)
+    assert stranded_host.heuristic == 4.0
+    assert stranded_host.absolute == 2.0
+
+
 def test_incremental_cost_is_rolled_back_exactly():
     """A stale incremental cost would show up as a wrong second answer."""
     rng = random.Random(7)
@@ -322,6 +344,7 @@ def test_no_shipped_strategy_beats_the_proved_optimum():
     from quport.interaction import extract_twoq_weights
     from quport.partition import (
         balanced_greedy_partition,
+        ebit_partition,
         heavy_edge_clustering_partition,
         tpccap_partition,
         tpccap_sa_partition,
@@ -368,16 +391,8 @@ def test_no_shipped_strategy_beats_the_proved_optimum():
             ),
             tpccap_partition(**common)[0].part,
             tpccap_sa_partition(**common)[0].part,
-            tpccap_sa_partition(
-                **common,
-                w_dist=0.0,
-                w_port=0.0,
-                w_cong=0.05,
-                anneal_w_cong=0.05,
-                packets=packets,
-                w_ebit=1.0,
-                congestion_source="ebits",
-            )[0].part,
+            # The shipped "ebit" strategy itself, so this tracks its weights.
+            ebit_partition(**common, packets=packets)[0].part,
         ]
 
         for part in parts:

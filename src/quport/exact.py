@@ -185,17 +185,20 @@ class _EbitCost:
     occupy and which of those have already been charged. A packet whose root is
     still unassigned charges nothing, because which partners count as remote is
     not yet decided -- so the running total never over-counts, and because a
-    charged QPU is never un-charged it can only rise.
+    charged QPU is never un-charged it can only rise. An unpackable gate's
+    teleports follow the same rule: an operand's round trip is charged once it
+    and the gate's host operand are both placed on different QPUs.
     """
 
     __slots__ = (
         "_roots_of",
         "_partner_in",
-        "_gates_of",
+        "_hosted",
+        "_guests_of",
+        "_qpu_of",
         "_root_qpu",
         "_counted",
         "_partners",
-        "_gate_mask",
         "_undo",
     )
 
@@ -204,30 +207,34 @@ class _EbitCost:
         packets = decomposition.packets
         self._roots_of: list[list[int]] = [[] for _ in range(n)]
         self._partner_in: list[list[int]] = [[] for _ in range(n)]
-        self._gates_of: list[list[int]] = [[] for _ in range(n)]
+        # An unpackable gate runs on the QPU of its first operand, and every
+        # other operand off that QPU is teleported in and out. `_hosted[q]`
+        # lists the guest operands of the gates qubit `q` hosts; `_guests_of[q]`
+        # the hosts of the gates `q` is a guest in, once per gate.
+        self._hosted: list[list[int]] = [[] for _ in range(n)]
+        self._guests_of: list[list[int]] = [[] for _ in range(n)]
 
         for index, packet in enumerate(packets):
             self._roots_of[packet.root].append(index)
             for partner in packet.partners:
                 self._partner_in[partner].append(index)
-        for index, gate in enumerate(decomposition.unpackable_gates):
-            for qubit in gate.qubits:
-                self._gates_of[qubit].append(index)
+        for gate in decomposition.unpackable_gates:
+            host = gate.qubits[0]
+            for guest in gate.qubits[1:]:
+                self._hosted[host].append(guest)
+                self._guests_of[guest].append(host)
 
+        self._qpu_of = [-1] * n
         self._root_qpu = [-1] * len(packets)
         self._counted = [0] * len(packets)
         self._partners = [0] * len(packets)
-        self._gate_mask = [0] * len(decomposition.unpackable_gates)
         # One saved-state frame per assigned qubit, popped on backtrack.
-        self._undo: list[
-            tuple[list[tuple[int, int, int, int]], list[tuple[int, int]]]
-        ] = []
+        self._undo: list[list[tuple[int, int, int, int]]] = []
 
     def assign(self, qubit: int, qpu: int) -> float:
         bit = 1 << qpu
         delta = 0.0
         packet_frame: list[tuple[int, int, int, int]] = []
-        gate_frame: list[tuple[int, int]] = []
 
         for index in self._roots_of[qubit]:
             packet_frame.append(
@@ -260,26 +267,29 @@ class _EbitCost:
                 self._counted[index] |= bit
                 delta += 1.0
 
-        for index in self._gates_of[qubit]:
-            mask = self._gate_mask[index]
-            gate_frame.append((index, mask))
-            if not mask & bit:
-                # Every QPU beyond the first costs a teleport there and back.
-                if mask:
-                    delta += 2.0
-                self._gate_mask[index] = mask | bit
+        # A guest's round trip is settled once both it and its host are placed,
+        # by whichever of the two comes second, so it is charged exactly once.
+        qpu_of = self._qpu_of
+        for guest in self._hosted[qubit]:
+            placed = qpu_of[guest]
+            if placed >= 0 and placed != qpu:
+                delta += 2.0
+        for host in self._guests_of[qubit]:
+            placed = qpu_of[host]
+            if placed >= 0 and placed != qpu:
+                delta += 2.0
+        qpu_of[qubit] = qpu
 
-        self._undo.append((packet_frame, gate_frame))
+        self._undo.append(packet_frame)
         return delta
 
     def undo(self, qubit: int, qpu: int) -> None:
-        packet_frame, gate_frame = self._undo.pop()
+        packet_frame = self._undo.pop()
         for index, root, counted, partners in reversed(packet_frame):
             self._root_qpu[index] = root
             self._counted[index] = counted
             self._partners[index] = partners
-        for index, mask in reversed(gate_frame):
-            self._gate_mask[index] = mask
+        self._qpu_of[qubit] = -1
 
 
 def _validate_positive_int(value: object, *, label: str) -> int:

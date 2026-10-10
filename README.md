@@ -76,7 +76,7 @@ QuPort implements an end-to-end stack for multi-QPU circuit experiments:
 - Distributed compilation into per-QPU OpenQASM 3 programs, remote-operation JSON, and schedule JSON.
 - Schedule estimation under QPU-port, link-capacity, network-hop, switch-pair, and switch-reconfiguration constraints.
 - Event-driven, resource-constrained entanglement scheduling with per-port hold times, per-link channels, hop-scaled EPR distribution, and a heralded-success retry model.
-- Independent auditing of both finished schedules -- re-deriving the topology plan's layer and round intervals, port and link usage, and summary aggregates from the outside, and checking the entanglement schedule against the resource and monotonicity theorems its outputs must satisfy -- so a shipped manifest is a checked claim rather than a stated one.
+- Independent auditing of both finished schedules -- re-deriving the topology plan's layer and round intervals, port and link usage, and summary aggregates from the outside, and checking the entanglement schedule against the resource bounds its outputs must satisfy -- so a shipped manifest is a checked claim rather than a stated one. Monotonicity under wider resources is a property of the estimator rather than of one schedule, and is checked by scheduling one plan twice.
 - Metrics for SWAP count, depth, circuit size, one-qubit gates, two-qubit gates, remote two-qubit operations, cut weight, congestion, remote rounds, peak link utilization, EPR pairs, and makespan.
 - CLI commands for configuration generation, topology inspection, mapping, benchmarking, topology sweeps, schedule estimation, entanglement reporting, optimality-gap scoring, migration analysis, splitting, and distributed compilation.
 - Programmatic APIs for custom pipelines and automated experiments.
@@ -140,8 +140,8 @@ Inter-QPU edges are created only between communication qubits.
 | `mesh` | All QPU pairs are adjacent in the QPU graph. |
 | `ring` | QPU $q$ connects to $(q+1)\bmod N$. |
 | `degree_d` | Each QPU connects to a bounded number of nearby QPUs controlled by `inter_degree`. |
-| `clos` | Two-level approximation with pod-local and spine-style links when at least two ports exist. |
-| `fat_tree` | Tree-like QPU graph; physical inter-QPU adjacency uses representative communication ports. |
+| `clos` | Two-level approximation: QPUs sit in pods of about $\sqrt{N}$, port 0 links QPUs within a pod and port 1 joins every QPU on a spine, so the QPU graph is all-to-all. With a single comm port it falls back to a ring. |
+| `fat_tree` | Pod-style approximation: pods of about $\sqrt{N}$ QPUs, fully connected inside, whose first QPUs form a ring (plus links two pods ahead once there are four pods). Every physical inter-QPU link uses each QPU's first comm port. |
 
 The QPU graph is an undirected graph
 
@@ -206,16 +206,16 @@ Two consequences are worth keeping in mind when choosing $\gamma$:
 
 Which pipelines apply temporal weighting is not uniform, and it matters when comparing strategies:
 
-| entry point | `tpccap` | `tpccap_sa` |
-|---|---|---|
-| `compile_distributed` | `temporal_decay`, default $\gamma=0.98$ | `temporal_decay`, default $\gamma=0.98$ |
-| `map_and_transpile` | `temporal_decay`, default uniform counts | `temporal_decay`, default $\gamma=0.98$ |
+| entry point | `tpccap` | `tpccap_sa` | `ebit` |
+|---|---|---|---|
+| `compile_distributed` | `temporal_decay`, default $\gamma=0.98$ | `temporal_decay`, default $\gamma=0.98$ | `temporal_decay`, default $\gamma=0.98$ |
+| `map_and_transpile` | `temporal_decay`, default uniform counts | `temporal_decay`, default $\gamma=0.98$ | `temporal_decay`, default $\gamma=0.98$ |
 
 Both entry points accept `temporal_decay`, and both ignore it for `balanced` and
 `cluster`, which always partition on uniform interaction counts. What differs is
-the default: `compile_distributed` applies $\gamma=0.98$ to either topology-aware
+the default: `compile_distributed` applies $\gamma=0.98$ to every topology-aware
 strategy, while `map_and_transpile` leaves `tpccap` on uniform counts and puts
-`tpccap_sa` on $\gamma=0.98$.
+`tpccap_sa` and `ebit` on $\gamma=0.98$.
 
 That default asymmetry matters when reading benchmark output. `benchmark_random_circuits`
 and `sweep_topologies` both call `map_and_transpile` without a decay, so their `method=2`
@@ -333,41 +333,39 @@ After greedy placement, QuPort runs local move refinement. Moving vertex $v$ fro
 
 ### `tpccap`: topology-, port-, and congestion-aware partitioning
 
-`tpccap` extends cut minimization with architecture-aware terms. It considers:
-
-- cut weight;
-- QPU-network hop distance;
-- communication-port pressure;
-- routed link congestion;
-- disconnected-pair penalties;
-- load balance.
-
-A simplified objective has the structure:
+`tpccap` extends cut minimization with architecture-aware terms. It minimizes
 
 ```math
 J(\pi)
 =
-\lambda_{cut}\,cut(\pi)
+w_{\mathrm{dist}}\sum_{a\lt b} T_{ab}\,d(a,b)
 +
-\lambda_{hop}\sum_{a\lt b} T_{ab}\,d(a,b)
+w_{\mathrm{port}}\sum_q \max(0, B_q - P)^2
 +
-\lambda_{cong}\,L_2
+w_{\mathrm{cong}}\,L_2
 +
-\lambda_{port}\,\Phi_{port}
-+
-\lambda_{bal}\,\Phi_{bal}
-+
-\lambda_{disc}\,\Phi_{disc}.
+w_{\mathrm{ebit}}\,\tilde E(\pi),
 ```
 
-The terms mean:
+with defaults $w_{\mathrm{dist}}=1$, $w_{\mathrm{port}}=5$, $w_{\mathrm{cong}}=0.05$ and
+$w_{\mathrm{ebit}}=0$. The terms mean:
 
-- $\mathrm{cut}(\pi)$ counts remote interaction weight.
-- $\sum T_{ab}d(a,b)$ prefers remote traffic between nearby QPUs.
-- $L_2$ penalizes concentrating routed traffic on the same network links.
-- $\Phi_{\mathrm{port}}$ penalizes boundary pressure that exceeds available communication ports.
-- $\Phi_{\mathrm{bal}}$ discourages imbalanced QPU loads.
-- $\Phi_{\mathrm{disc}}$ penalizes traffic between disconnected QPU pairs.
+- $\sum T_{ab}d(a,b)$ is the cut weighted by hop distance. It is the only way the
+  cut enters: every unit of remote interaction weight costs at least one hop, and
+  more between distant QPUs.
+- $\sum_q \max(0, B_q-P)^2$ penalizes boundary qubits beyond the $P$ communication
+  ports of each QPU.
+- $L_2$ penalizes concentrating routed traffic on the same network links. The
+  partitioner routes it in ECMP mode.
+- $\tilde E(\pi)$ is the hop-scaled e-bit demand described under the `ebit`
+  strategy below; it is evaluated only when packets are supplied.
+
+Disconnected QPU pairs are not a separate term. Their distance is the finite
+sentinel $10^9$, and traffic that cannot be routed enters $L_2$ as a virtual load
+of $T_{ab}\cdot 10^9$, so any cut across them dominates the objective. Capacity is
+not a term either: it is a hard constraint, since the local search only moves a
+qubit to a QPU with a free slot. Nothing in $J$ rewards balanced loads; balance
+comes only from the capacity-balanced greedy partition the search starts from.
 
 The implementation validates all numeric controls and normalizes inputs before search so invalid capacities, probabilities, infinities, booleans, negative weights, malformed matrices, and disconnected routing cases fail deterministically or are penalized consistently.
 
@@ -392,7 +390,10 @@ The objective $J$ is not identical in the two stages. The seed is built with
 `anneal_w_cong = 0.2` — four times the congestion penalty. The annealing returns the
 best state it saw under *its* objective, so it never loses ground there, but the
 partition it hands back can score worse than its own seed when measured with the
-seed's weighting; on random instances that happens for roughly $40\%$ of them. Both
+seed's weighting. That is uncommon -- on random circuits it happened for $3$ of $240$
+instances spanning $2$ to $6$ QPUs and every interconnect, and for $3$ of $72$ at the
+default $10$-QPU configuration with $80$ logical qubits -- but it is possible
+(`python examples/reproduce_readme_figures.py annealing`). Both
 are parameters of `tpccap_sa_partition`, and `anneal_w_cong=None` anneals on exactly
 the objective the seed was built for. The defaults are the values every published
 QuPort result was produced with.
@@ -471,18 +472,22 @@ connectivity-minus-one ($\lambda-1$) metric of hypergraph partitioning:
 
 $$
 E(\pi)=\sum_{P\in\mathcal{P}}
-\Bigl\lvert\;\{\pi(t):t\in\mathrm{partners}(P)\}\setminus\{\pi(\mathrm{root}(P))\}\;\Bigr\rvert .
+\Bigl\lvert\;\{\pi(t):t\in\mathrm{partners}(P)\}\setminus\{\pi(\mathrm{root}(P))\}\;\Bigr\rvert
++\sum_{g\in\mathcal{U}} 2\,\lvert F(g,\pi)\rvert .
 $$
 
 One e-bit per packet per *distinct remote QPU*, not one per cut gate. Ten gates from
 one control into one QPU cost ten units of cut weight and one e-bit.
 
-Two kinds of gate cannot be served by a single cat copy: two-qubit gates with no
-diagonal operand (`swap`, `iswap`, `ecr`, `rxx`), and operations on three or more
-qubits, which a bipartite copy cannot bring together. A gate of either kind spanning
-$k$ QPUs is charged $2(k-1)$ e-bits, the cost of teleporting every foreign operand to
-one host and back, which is also the standard cost of an arbitrary non-local
-two-qubit unitary.
+The second sum is over the unpackable gates $\mathcal{U}$. Two kinds of gate cannot
+be served by a single cat copy: two-qubit gates with no diagonal operand (`swap`,
+`iswap`, `ecr`, `rxx`), and operations on three or more qubits, which a bipartite
+copy cannot bring together. A gate $g$ of either kind runs on the QPU of its first
+operand $h_g$, and every operand sitting anywhere else -- the set $F(g,\pi)$ -- is
+teleported there and back, so a gate with $f$ operands off that QPU is charged $2f$
+e-bits. The count is per operand, not per QPU: one EPR pair teleports one qubit, so
+two operands on the same foreign QPU cost two round trips. For a two-qubit gate that
+is $2$, the standard cost of an arbitrary non-local two-qubit unitary.
 
 Because each gate is charged to exactly one root, $E(\pi)$ is exact for the chosen
 root assignment and an upper bound over all assignments. Gates whose *both* operands
@@ -498,13 +503,20 @@ demand:
 
 $$
 J_{\mathrm{ebit}}(\pi)=
-w_{\mathrm{ebit}}\sum_{P\in\mathcal{P}}\;\sum_{q\in R(P,\pi)}d(\pi(\mathrm{root}(P)),q)
+w_{\mathrm{ebit}}\,\tilde E(\pi)
 +w_{\mathrm{port}}\sum_q\max(0,B_q-P)^2
 +w_{\mathrm{cong}}L_2,
 $$
 
-where $R(P,\pi)$ is the set of distinct remote QPUs packet $P$ touches. On an
-all-to-all fabric every distance is $1$ and the first term is exactly $E(\pi)$.
+$$
+\tilde E(\pi)=
+\sum_{P\in\mathcal{P}}\;\sum_{q\in R(P,\pi)}d(\pi(\mathrm{root}(P)),q)
++\sum_{g\in\mathcal{U}}\;\sum_{i\in F(g,\pi)}2\,d(\pi(h_g),\pi(i)),
+$$
+
+where $R(P,\pi)$ is the set of distinct remote QPUs packet $P$ touches, and
+$\mathcal{U}$, $h_g$ and $F(g,\pi)$ are as in the definition of $E(\pi)$ above. On
+an all-to-all fabric every distance is $1$ and $\tilde E(\pi)$ is exactly $E(\pi)$.
 
 `w_ebit` defaults to $0$ on `tpccap_partition` and `tpccap_sa_partition`, so every
 pre-existing objective and every published number is unchanged. Passing `packets`
@@ -515,8 +527,12 @@ without steering the search.
 
 Replacing the volume term is not a local change: $w_{\mathrm{port}}$ and
 $w_{\mathrm{cong}}$ were tuned against a term that counts *every cut gate*, and an
-e-bit count is smaller by the aggregation factor. Left as they were, the penalties
-stop biasing the objective and become it.
+e-bit count is smaller by the aggregation factor -- about $1.6\times$ on random
+circuits. Left as they were, the penalties stop merely biasing the objective and
+compete with it: at its old weight the port penalty is about as large as the e-bit
+count with two comm ports per QPU and several times larger with one (a median of
+$0.8\times$ and $4\times$ on random partitions, up to $11\times$;
+`python examples/reproduce_readme_figures.py penalty_scale`).
 
 The `ebit` strategy therefore sets $w_{\mathrm{port}}=0$. Beyond the scale, the
 penalty measures the wrong resource: what a cat-entanglement compiler needs a port
@@ -529,16 +545,17 @@ computes the cost, so the two cannot disagree. Both stages use the same congesti
 weight, since the default $4\times$ annealing asymmetry was also tuned for the
 gate-traffic scale.
 
-Over 36 configurations -- 9 to 20 logical qubits on 3 to 5 QPUs, across `ring`,
-`switch` and `mesh` interconnects, six random circuits each -- this takes the EPR
-pairs actually spent from $28.3$ to $21.4$, port evictions from $2.72$ to $2.06$,
-and the entanglement-aware makespan from $5073$ to $4237$, with peak link busy time
-essentially unchanged ($2378$ to $2406$). Fewer pairs *and* fewer evictions:
-minimising e-bits concentrates traffic into fewer, longer-lived cat copies, which
-need fewer simultaneous ports than the many short copies a boundary-minimising
-partition scatters around — the e-bit objective was already a better proxy for port
-pressure than the penalty meant to model it. `congestion_source` defaults to
-`"gates"`, so no other strategy moves.
+Over 72 instances -- 9 qubits on 3 QPUs, 12 on 3, 16 on 4 and 20 on 5, across
+`ring`, `switch` and `mesh` interconnects, six depth-20 random circuits each, two
+comm ports per QPU -- the rescaling takes the mean EPR pairs actually spent from
+$54.8$ to $52.6$, the entanglement-aware makespan from $9878$ to $9279$, and peak
+link busy time from $3783$ to $3464$, while port evictions hold at $5.8$ ($5.82$ to
+$5.74$). Dropping the port penalty therefore did not buy its savings with port
+pressure: minimising e-bits concentrates traffic into fewer, longer-lived cat
+copies, and those need no more simultaneous ports than the many short copies a
+boundary-minimising partition scatters around. `congestion_source` defaults to
+`"gates"`, so no other strategy moves. Reproduce with
+`python examples/reproduce_readme_figures.py rescaling`.
 
 ### Communication aggregation under a port budget
 
@@ -574,6 +591,8 @@ gate. The entanglement-aware estimator instead runs an as-soon-as-possible list
 schedule in program order against:
 
 - one timeline per physical qubit, so QPUs that share no qubits drift apart freely;
+- one timeline per classical bit, so feedforward waits for the measurement it
+  reads even when that measurement ran on another QPU;
 - a pool of `comm_qubits_per_qpu` ports per QPU, each held for a whole block;
 - `link_capacity` channels on every link along the routed path;
 - hop-scaled, probabilistic distribution
@@ -606,7 +625,8 @@ Both verifiers compare state vectors, so they speak about the state a circuit
 prepares. Measurements that come last are dropped, since they read that state out
 without changing it; a measurement or reset that later operations depend on
 genuinely changes what the circuit computes and is refused rather than quietly
-ignored.
+ignored. So is classical control -- an `if` block or other control-flow
+operation -- which has no state-vector evolution to compare.
 
 ### From plan to circuit, and proving it
 
@@ -667,7 +687,8 @@ by a `cx` fan-out, as built in `tests/test_protocol.py`:
 
 The cross-QPU gate count moves with the partition, so the `ebit` rows also record
 the rescaling described above: under the previous penalty weights the same two
-circuits cut $190$ gates to $88$ pairs and $10$ to $3$.
+circuits cut $190$ gates to $88$ pairs and $10$ to $3$. Reproduce both with
+`python examples/reproduce_readme_figures.py measured_effect`.
 
 Structured circuits benefit most, because a control that only ever picks up $R_z$
 rotations keeps its packet open across the whole ladder. Random circuits benefit
@@ -700,7 +721,10 @@ stays put, so the count runs over **root epochs** — maximal runs of a packet's
 gates during which the root's QPU does not change — and within an epoch one e-bit
 is charged per distinct remote QPU the partners occupy *at the time their own
 gates run*. A partner that migrates mid-packet therefore costs a second copy, and
-teleporting the root correctly kills every copy of it.
+teleporting the root starts a new epoch whose copies are paid for afresh. That is a
+conservative choice, not a physical necessity: teleportation carries the root's
+entanglement along, so an old copy would still be valid. It keeps the count an
+upper bound.
 
 That makes the generalisation faithful in the strong sense: with one window, or
 with the same assignment in every window, the cost is *identically* $E(\pi)$. A
@@ -712,8 +736,10 @@ A qubit relocated for a single window pays two migrations, in and out, and can
 only earn them back from that one window's traffic. The change that pays is
 usually to move a qubit *once* and leave it for several windows: two migrations
 against the traffic of the whole run. A single-window neighbourhood can only
-reach that through individually worse states, so it never does — on 16-qubit
-instances it found a $6.4\%$ saving where interval moves find $14.7\%$.
+reach that through individually worse states, so it never does. Started from the
+same stationary placement on 16 qubits over 4 QPUs, depth-20 circuits cut into 4
+windows, single-window moves save $5.5\%$ on average where interval moves save
+$8.3\%$ (`python examples/reproduce_readme_figures.py neighbourhood`).
 
 Because the neighbourhood includes the *whole-circuit* run, the search also
 improves the static placement, and two different effects then contribute to the
@@ -722,23 +748,38 @@ stationary optimum so that
 $\text{cost} \le \text{stationary} \le \text{seed}$ holds by construction — a
 plan that moved qubits can never lose to one that did not.
 
-Against the `ebit` strategy's partition, on random circuits with 6 seeds each:
+Against the `ebit` strategy's partition, on six depth-20 random circuits per row,
+one comm port per QPU on a `switch` fabric, cut into 2, 3 and 4 windows. The
+migration columns give the range, over those window counts, of the mean saving and
+the mean number of moves:
 
 | Instance | Better static placement | Migration, on top | Migrations used |
 |---|---|---|---|
-| 9q / 3 QPUs | $7.8\%$ | $12.9\%$ – $15.4\%$ | 1–2 |
-| 12q / 3 QPUs | $6.3\%$ | $7.5\%$ – $11.1\%$ | 1–3 |
-| 16q / 4 QPUs | $4.7\%$ | $3.6\%$ – $10.5\%$ | 2–3 |
-| 20q / 5 QPUs | $3.8\%$ | $5.5\%$ – $9.2\%$ | 3–6 |
+| 9q / 3 QPUs | $0.0\%$ | $2.0\%$ – $5.1\%$ | 0.7–1.7 |
+| 12q / 3 QPUs | $0.0\%$ | $3.8\%$ – $8.1\%$ | 2.3–3.3 |
+| 16q / 4 QPUs | $0.0\%$ | $3.9\%$ – $8.3\%$ | 2.7–4.8 |
+| 20q / 5 QPUs | $0.0\%$ | $3.5\%$ – $5.5\%$ | 3.2–7.0 |
 
-The static column is a useful cross-check on its own: it says the `ebit`
-strategy's partition is still $4$–$8\%$ improvable by local search, consistent
-with the $7.7\%$ gap to the proved optimum measured above.
+The static column is a useful cross-check on its own: local search finds nothing to
+improve in the `ebit` strategy's partition, consistent with its $1.6\%$ gap to the
+proved optimum measured below. Every saving in the table is migration. Reproduce
+with `python examples/reproduce_readme_figures.py temporal`.
 
 This is an analysis of what time-varying placement is worth. `compile_distributed`
 still emits a single static placement; the windows and their assignments are a
 plan a scheduler could act on, and a number a designer can use to decide whether
 teleport-based migration is worth building.
+
+The command-line examples for `migrate`, `optimal`, and `ebits --verify` use a
+small architecture -- four QPUs of three qubits each -- saved as `small.json`:
+
+```json
+{
+  "n_qpus": 4,
+  "compute_qubits_per_qpu": 2,
+  "comm_qubits_per_qpu": 1
+}
+```
 
 ```bash
 quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json
@@ -753,7 +794,14 @@ without a scale. `quport.exact` solves the same two partitioning problems exactl
 by branch and bound, on instances small enough for that to terminate:
 
 ```python
+from quport import MultiQPUConfig, compile_distributed
 from quport.exact import optimal_partition, partition_gap
+from quport.pipeline import random_benchmark_circuit
+
+# 9 qubits on 3 QPUs of capacity 3.
+cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+result = compile_distributed(random_benchmark_circuit(9, 10, 0), cfg, seed=0, strategy="ebit")
+packets = result.packets  # built from the circuit the partitioner actually saw
 
 best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
 gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
@@ -770,28 +818,35 @@ incumbent**, so pruning bites from the first node. `max_nodes` bounds the run;
 exhausting it clears `proved_optimal` rather than passing a guess off as a proof.
 
 The branch and bound is checked against exhaustive enumeration over every feasible
-assignment — 286 cut instances and 125 e-bit instances — which is the only real
-argument that the pruning and the canonical form never silently lose an optimum.
+assignment — 82 cut instances and 34 e-bit instances in `tests/test_exact.py` —
+which is the only real argument that the pruning and the canonical form never
+silently lose an optimum.
 `partition_gap` then raises rather than reporting a negative gap when a heuristic
 scores *below* a proved optimum, since one of the two implementations would have to
 be wrong; that makes it a cross-check between two independent readings of both
 objectives, run over every shipped strategy in `tests/test_exact.py`.
 
-Over 24 instances — 8 qubits on 2 QPUs, 9 on 3, and 12 on 3 and on 4, six random
-circuits each, all-to-all:
+Over 24 instances — 8 qubits on 2 QPUs, 9 on 3, and 12 on 3 and on 4, six depth-10
+random circuits each, all-to-all, one comm port per QPU and every QPU filled — the
+mean gap to the proved optimum is:
 
 | Strategy | gap vs. optimal e-bits | gap vs. optimal cut |
 |---|---|---|
-| `tpccap` | $55.8\%$ | $40.9\%$ |
-| `cluster` | $46.5\%$ | $26.8\%$ |
-| `tpccap_sa` | $44.3\%$ | $27.4\%$ |
-| `balanced` | $36.6\%$ | $27.3\%$ |
-| `ebit` | $\mathbf{7.7\%}$ | $\mathbf{18.4\%}$ |
+| `tpccap` | $42.3\%$ | $36.6\%$ |
+| `balanced` | $41.0\%$ | $38.4\%$ |
+| `cluster` | $22.8\%$ | $14.0\%$ |
+| `tpccap_sa` | $15.6\%$ | $\mathbf{9.9\%}$ |
+| `ebit` | $\mathbf{1.6\%}$ | $12.5\%$ |
+| `ebit` before the rescaling | $12.6\%$ | $9.5\%$ |
+| the same search on e-bits alone | $0.2\%$ | $11.1\%$ |
 
-This is what found the scaling defect described above. Before the rescaling `ebit`
-sat at $43.5\%$ — *behind plain balanced partitioning at the objective it is named
-for*. The search was never at fault: given the e-bit objective alone, the annealer
-lands within $0.2\%$ of the proved optimum.
+This is what found the scaling defect described above: before the rescaling the
+`ebit` search left $12.6\%$ of the e-bits it is named for on the table, and on these
+instances it now leaves $1.6\%$. The search was never at fault — given the e-bit
+objective alone, the annealer lands within $0.2\%$ of the proved optimum. Among the
+shipped strategies `ebit` is closest at e-bits and `tpccap_sa` at cut (bold); the
+last two rows are references, not strategies. Reproduce with
+`python examples/reproduce_readme_figures.py calibration`.
 
 The tree is over set partitions, so this terminates on roughly a dozen qubits. It is
 for calibration, not for compiling — measure what a heuristic leaves behind, then
@@ -823,7 +878,7 @@ Boundary-heavy qubits are good candidates for communication ports because remote
 Two communication-selection modes are implemented:
 
 - `topk`: choose the $P$ logical qubits in each QPU with the largest remote-boundary score;
-- `diverse`: prefer qubits that interact with many distinct remote QPUs, which spreads port access across different network destinations.
+- `diverse`: pick ports one at a time, discounting a candidate's score by its traffic to remote QPUs that the ports already picked in the same QPU cover, which spreads port access across different network destinations.
 
 A simple boundary score is:
 
@@ -831,17 +886,22 @@ $$
 s_i=\sum_{j:\pi(j)\ne\pi(i)}w_{ij}.
 $$
 
-A diversity-aware score also considers
+The diversity-aware score subtracts the candidate's heaviest traffic to a
+remote QPU already covered by a port chosen earlier in the same QPU:
 
 $$
-d_i^{\mathrm{remote}}=\left|\{\pi(j):w_{ij}>0,\pi(j)\ne\pi(i)\}\right|.
+s_i^{\mathrm{div}}=s_i-\lambda\max_{r\in C_q}e_{ir},\qquad
+e_{ir}=\sum_{j:\pi(j)=r}w_{ij},
 $$
 
-The diversity term is applied as a penalty against destinations already covered by
-ports chosen earlier in the same QPU, so it has nothing to act on until the second
-port. `tpccap` and `tpccap_sa` request `diverse` under both entry points, but at the
-default `comm_qubits_per_qpu` of $1$ it selects exactly what `topk` would; give each
-QPU at least two ports before attributing any result to port diversity.
+where $C_q$ holds, for each port already chosen in QPU $q$, the remote QPU it
+exchanges the most weight with, and $\lambda$ is `diversity_penalty` (default
+$0.6$). Qubits with no remote traffic are taken only to fill ports left over.
+$C_q$ is empty until the first port is chosen, so the penalty has nothing to act
+on until the second port. `tpccap`, `tpccap_sa` and `ebit` request `diverse`
+under both entry points, but at the default `comm_qubits_per_qpu` of $1$ it
+selects exactly what `topk` would; give each QPU at least two ports before
+attributing any result to port diversity.
 
 The final layout maps selected boundary qubits to communication physical qubits first, then maps remaining qubits to compute qubits and any unused communication qubits.
 
@@ -854,7 +914,7 @@ The `map_and_transpile` pipeline performs:
 1. **Capacity check**: reject circuits where $n>Q_{\mathrm{phys}}$.
 2. **Basis translation**: translate the circuit to configured basis gates, defaulting to `("rz", "sx", "x", "cx")`.
 3. **Interaction extraction**: compute $w_{ij}$ or temporal weights $W_{ij}$.
-4. **Partitioning**: apply `balanced`, `cluster`, `tpccap`, or `tpccap_sa`.
+4. **Partitioning**: apply `balanced`, `cluster`, `tpccap`, `tpccap_sa`, or `ebit`.
 5. **Layout hinting**: choose communication-port logical qubits and create an initial Qiskit layout.
 6. **Global coupling map construction**: create a directed coupling map for all local and inter-QPU physical links.
 7. **Qiskit transpilation**: run Qiskit with the configured optimization, layout, and routing settings.
@@ -870,24 +930,27 @@ This mode is useful when you want one routed Qiskit circuit for the entire modul
 The `compile_distributed` pipeline is designed for explicit multi-QPU execution artifacts:
 
 1. Translate the input circuit into the configured basis.
-2. Extract logical interaction weights.
+2. Extract logical interaction weights and build the distributable packets.
 3. Partition logical qubits across QPUs.
 4. Build a physical circuit with the partition-aware initial layout but without global inter-QPU routing.
 5. Split the physical circuit into local per-QPU circuits plus remote operations.
 6. Route each local circuit using that QPU's intra-QPU coupling map only.
-7. Estimate topology-aware remote-operation scheduling.
-8. Return all local circuits, remote-operation trace, metrics, and timing summaries.
+7. Re-express the remote-operation trace in the routed programs' qubit labelling.
+8. Estimate topology-aware remote-operation scheduling.
+9. Report the partition's e-bit demand, aggregate the cross-QPU gates into EPR blocks under the comm-port budget, and schedule those blocks with the entanglement-aware estimator.
+10. Return all local circuits, both remote-operation traces, metrics, the communication plan, and timing summaries.
 
 A remote operation records:
 
 - operation name;
 - global instruction index;
-- the two physical qubit indices it acts on;
+- two physical qubit indices it acts on: its first operand and the first operand on another QPU;
 - the QPU id owning each of those qubits;
+- which barrier in each of those two QPUs' programs marks it (`qpu0_marker`, `qpu1_marker`);
 - gate parameters;
 - classical bit indices the operation reads or writes.
 
-This split makes the boundary explicit: local gates remain in QPU-local programs, while cross-QPU two-qubit gates become remote events handled by orchestration, entanglement generation, teleportation-style protocols, or another execution backend.
+This split makes the boundary explicit: local gates remain in QPU-local programs, while cross-QPU gates become remote events handled by orchestration, entanglement generation, teleportation-style protocols, or another execution backend. An operation on three or more qubits is still one remote event; every QPU holding one of its operands gets a marker barrier naming its operands there.
 
 ---
 
@@ -904,6 +967,10 @@ A local one-qubit operation costs `oneq`, a local two-qubit operation costs `two
 $$
 \tau_{\mathrm{remote}}=\tau_{\mathrm{EPR}}+\tau_{\mathrm{RTT}}+\tau_{\mathrm{remote\_gate}}.
 $$
+
+A remote operation synchronizes every QPU holding one of its operands, a barrier
+aligns the QPUs it spans, and an operation that touches a classical bit waits for
+the previous operation on that bit, whichever QPU ran it.
 
 ### Layered estimator
 
@@ -955,6 +1022,11 @@ and every link $e$ on the chosen QPU-network path has
 $$
 \mathrm{link\_used}(e) \lt \mathtt{link\_capacity}.
 $$
+
+On switch-like fabrics a round also holds at most `switch_parallel_links` distinct
+QPU pairs. A round lasts as long as its most expensive operation,
+$\max \tau_{\mathrm{remote}}(a,b)$, plus `switch_reconfig_delay` on switch-like
+fabrics, and a layer lasts as long as the longer of its local work and its rounds.
 
 The estimator returns:
 
@@ -1020,8 +1092,8 @@ rewrites every routing SWAP into CX gates and `swaps` reads $0$ for every run
 while the routing overhead shows up inside `n_2q` instead. Add `"swap"` to
 `basis_gates` to keep SWAP instructions intact and make the metric non-zero.
 This applies wherever the metric surfaces, including the `SWAPs:` line printed
-by `quport map`, the `swaps` column of the benchmark CSV, and `swaps_mean` in the
-topology sweep.
+by `quport map`, the `Local SWAPs:` line printed by `quport compile-dist`, the
+`swaps` column of the benchmark CSV, and `swaps_mean` in the topology sweep.
 
 A `swap` instruction is also a two-qubit instruction, so it is counted in both
 `swaps` and `n_2q`.
@@ -1218,7 +1290,9 @@ $\lambda-1$ e-bit count, and both makespan figures. `--out` additionally writes 
 full plan, including every block's root, host QPU, protocol, and served gate
 indices.
 
-Two further flags turn the plan into a circuit:
+Two further flags turn the plan into a circuit. This example and the next two use
+`small.json`, the four-QPU architecture given with the time-varying placement
+results above:
 
 ```bash
 quport ebits --n-logical 4 --depth 4 --config small.json --verify --emit-qasm telegate.qasm
@@ -1385,13 +1459,22 @@ print(ebit_cost(build_distributable_packets(qc), [0] * qc.num_qubits, cfg.n_qpus
 ### Emitting and verifying the protocol
 
 ```python
-from quport import (
-    MultiQPUArchitecture,
-    build_telegate_circuit,
-    verify_telegate_equivalence,
-)
 from qiskit import qasm3
 
+from quport import (
+    MultiQPUArchitecture,
+    MultiQPUConfig,
+    build_telegate_circuit,
+    compile_distributed,
+    verify_telegate_equivalence,
+)
+from quport.pipeline import random_benchmark_circuit
+
+# Small on purpose: verification simulates the data qubits *and* the protocol
+# ancillas, and the 24-qubit architecture above would not fit.
+cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=3, comm_qubits_per_qpu=2)
+qc = random_benchmark_circuit(n_logical=6, depth=6, seed=0)
+result = compile_distributed(qc, cfg, seed=0, strategy="ebit")
 arch = MultiQPUArchitecture(cfg)
 
 # Unitary form: checkable by simulation.
@@ -1407,7 +1490,8 @@ qasm3.dumps(runnable.circuit)
 ```
 
 Verification is a state-vector simulation, so keep the circuit small — it is
-refused above 24 qubits.
+refused above 24 qubits, counting the protocol ancillas as well as the
+architecture's physical qubits.
 
 ### Custom architecture inspection
 
@@ -1543,6 +1627,12 @@ strictly top to bottom, which can deadlock.
 implementation of that rule, and it raises when two programs genuinely
 contradict each other rather than silently picking an order.
 
+Classical bits are shared rather than split: every program refers to the source
+circuit's classical bits, so a conditional on one QPU can read a bit measured on
+another. Each program keeps its own accesses to a bit in order, but nothing in
+the bundle records the order *between* QPUs; that comes from the mapped circuit,
+which is where `reassemble_distributed_program` takes it from.
+
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
 
@@ -1578,7 +1668,8 @@ Monotonicity is checked too, but it belongs to the estimator rather than to any 
 result, so it is obtained by scheduling one fixed plan twice: widening ports or link
 channels can only let an acquire return earlier, so the makespan must not rise, and
 slowing `epr_gen` or lowering `epr_success_prob` can only push events later, so it
-must not fall. Over 672 schedules spanning four topologies, every property held.
+must not fall. Over 672 schedules spanning four topologies, every property held
+(`python examples/reproduce_readme_figures.py schedules`).
 
 `q0_phys` and `q1_phys` here are positions in the *routed* per-QPU programs, not
 in `physical_circuit`. Local routing permutes qubits inside a QPU whenever
@@ -1630,9 +1721,11 @@ writes unrouted programs, correctly ships the pre-routing manifest.
 | `transpile_time_mean` | Mean transpilation time. |
 
 Cost is reported both ways because it is heavily skewed across random circuits.
-Comparing two strategies instance by instance, the per-instance ratio spans roughly
-$-50\%$ to $+200\%$, so a handful of hard instances can move the mean far enough to
-reverse which strategy looks better while the median points the other way. Quote
+Comparing `tpccap` with `balanced` instance by instance on 24 qubits over 6 QPUs,
+the per-instance cost ratio spans $-39\%$ to $+38\%$, and in one of four
+topology settings the mean and the median rank the two strategies the opposite way
+round (`python examples/reproduce_readme_figures.py sweep_skew`). A handful of hard
+instances can move the mean far enough to reverse which strategy looks better. Quote
 whichever you prefer, but say which one, and do not read a small difference in
 `cost_mean` as a ranking on its own.
 
@@ -1664,6 +1757,15 @@ python -m compileall src tests examples
 quport --help
 ```
 
+Every measured figure this README quotes -- the calibration and migration tables,
+the rescaling comparison, the measured-effect table and the rest -- is regenerated,
+from settings spelled out in the script, by:
+
+```bash
+python examples/reproduce_readme_figures.py            # every section, a few minutes
+python examples/reproduce_readme_figures.py calibration
+```
+
 ---
 
 ## Design notes and limitations
@@ -1677,7 +1779,8 @@ quport --help
 - Each gate is charged to exactly one packet root, so the e-bit count is exact for that assignment and an upper bound over all assignments of symmetric gates.
 - Teleport blocks are not merged: every non-diagonal cross-QPU gate pays its own round trip of two e-bits.
 - Emitted protocol circuits expand cat blocks in full; teleport blocks show the state movement as a `swap` in and out of the host ancilla rather than the Bell-measurement gadget, because the return trip needs a mid-circuit reset that would make the program non-unitary and so unverifiable by the same route.
-- State-vector verification is exponential in circuit width and is refused above 24 qubits, and it is refused outright for circuits with mid-circuit measurement or reset.
+- State-vector verification is exponential in circuit width and is refused above 24 qubits, and it is refused outright for circuits with mid-circuit measurement, reset, or classical control.
+- Cross-QPU classical feedforward is not marked in the emitted bundle: a program can read a classical bit another QPU writes, and the order of those accesses across QPUs is recorded only in the mapped circuit.
 - Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.

@@ -70,9 +70,10 @@ hypergraph partitioning: one e-bit per packet per *distinct remote QPU* its part
 occupy.
 
 Two kinds of gate cannot be served by one bipartite copy: two-qubit gates with no
-diagonal operand, and operations on three or more qubits. A gate of either kind
-spanning `k` QPUs is charged `2 * (k - 1)` e-bits — teleport each foreign operand to
-one host and back.
+diagonal operand, and operations on three or more qubits. A gate of either kind runs
+on the QPU of its first operand, and each operand sitting anywhere else is teleported
+there and back, so a gate with `f` operands off that QPU is charged `2 * f` e-bits.
+The count is per operand: two operands on the same foreign QPU cost two round trips.
 
 Each gate is charged to exactly one root, so the count is exact for that assignment
 and an upper bound over all assignments. Gates with two diagonal operands (`cz`,
@@ -102,54 +103,64 @@ Replacing the volume term is not a local change, because the remaining terms wer
 tuned against the term that was removed:
 
 - **The port penalty is dropped** (`w_port=0.0`). `w_port` charges squared
-  boundary-qubit overflow, which on realistic instances runs one to two orders of
-  magnitude larger than an e-bit count — so with `w_dist=0` it is not a penalty on
-  the objective, it *is* the objective. It also measures the wrong resource: what a
+  boundary-qubit overflow, which at its old weight is about as large as an e-bit
+  count with two comm ports per QPU and several times larger with one — a median
+  of 0.8× and 4× on random partitions, up to 11× (`examples/reproduce_readme_figures.py
+  penalty_scale`) — so with `w_dist=0` it competes with the objective rather than
+  biasing it. It also measures the wrong resource: what a
   cat-entanglement compiler needs a port for is a live cat copy, not every boundary
   qubit. And port pressure is already priced downstream, since
   `aggregate_remote_operations` converts a port shortage into evictions and fresh
   EPR pairs. Penalising it again double-counts a constraint in the wrong units.
-- **Congestion is kept but re-sourced** (`congestion_source="ebits"`). Gate demand
-  upper-bounds EPR demand — aggregation is exactly the business of removing
-  transactions — so routing gate traffic reports congestion that never happens. The
+- **Congestion is kept but re-sourced** (`congestion_source="ebits"`). With uniform
+  weights and gates a cat copy can serve, gate demand upper-bounds EPR demand —
+  aggregation is exactly the business of removing transactions — so routing gate
+  traffic reports congestion that never happens. (Teleported gates, at two EPR
+  pairs each, and decayed weights, which count a gate as less than one, are the
+  exceptions.) The
   e-bit traffic matrix comes from the same sweep that computes the e-bit cost, so
   the congestion term and the volume term cannot describe different plans.
 - **Both annealing stages use the same weight.** The default 4× congestion asymmetry
   between the TPCCAP seed and the annealer was tuned for the larger gate-traffic
   scale and costs e-bits at this one.
 
-Measured over 36 configurations -- 9 to 20 logical qubits on 3 to 5 QPUs, across
-`ring`, `switch` and `mesh` interconnects, six random circuits each -- rescaling
-these terms moves the realised numbers as follows:
+Measured over 72 instances -- 9 qubits on 3 QPUs, 12 on 3, 16 on 4 and 20 on 5,
+across `ring`, `switch` and `mesh` interconnects, six depth-20 random circuits
+each, two comm ports per QPU -- rescaling these terms moves the realised means as
+follows:
 
 | | Before | After |
 |---|---|---|
-| EPR pairs actually spent | 28.3 | **21.4** |
-| Port evictions | 2.72 | **2.06** |
-| Entanglement-aware makespan | 5073 | **4237** |
-| Peak link busy time | 2378 | 2406 |
+| EPR pairs actually spent | 54.8 | **52.6** |
+| Port evictions | 5.82 | 5.74 |
+| Entanglement-aware makespan | 9878 | **9279** |
+| Peak link busy time | 3783 | **3464** |
 
-Fewer EPR pairs *and* fewer evictions, for no material change in peak link load.
-The evictions fall because minimising e-bits concentrates traffic into fewer,
-longer-lived cat copies, which need fewer simultaneous ports than the many short
-copies a boundary-minimising partition scatters around -- the e-bit objective was
-already the better proxy for port pressure than the penalty meant to model it.
+Fewer EPR pairs, a shorter schedule and less peak link load, with evictions holding
+steady even though the port penalty is gone: minimising e-bits concentrates traffic
+into fewer, longer-lived cat copies, which need no more simultaneous ports than the
+many short copies a boundary-minimising partition scatters around.
 
 It also closes most of the distance to optimal. Over 24 instances -- 8 qubits on 2
-QPUs, 9 on 3, and 12 on 3 and on 4, six random circuits each, all-to-all:
+QPUs, 9 on 3, and 12 on 3 and on 4, six depth-10 random circuits each, all-to-all,
+one comm port per QPU and every QPU filled:
 
 | Strategy | e-bit gap vs. proved optimum |
 |---|---|
-| `tpccap` | 55.8% |
-| `cluster` | 46.5% |
-| `tpccap_sa` | 44.3% |
-| `balanced` | 36.6% |
-| `ebit` | **7.7%** |
+| `tpccap` | 42.3% |
+| `balanced` | 41.0% |
+| `cluster` | 22.8% |
+| `tpccap_sa` | 15.6% |
+| `ebit` | **1.6%** |
+| `ebit` before the rescaling | 12.6% |
+| the same search on e-bits alone | 0.2% |
 
-The row that motivated the change is `balanced`: before the rescaling, `ebit` sat at
-43.5%, *behind plain balanced partitioning at the objective it is named for*. The
-search was never the problem — given the e-bit objective alone, the annealer lands
-within 0.2% of the proved optimum.
+Before the rescaling the `ebit` search left 12.6% of the e-bits it is named for on
+the table; it now leaves 1.6%. The search was never the problem — given the e-bit
+objective alone, the annealer lands within 0.2% of the proved optimum.
+
+Both tables come from `examples/reproduce_readme_figures.py` (sections `rescaling`
+and `calibration`), which spells out every setting above and reruns them.
 
 ```{note}
 `congestion_source` defaults to `"gates"` everywhere, so this affects the `ebit`
@@ -193,6 +204,8 @@ gate; this estimator runs an as-soon-as-possible list schedule in program order 
 explicit resources:
 
 - one timeline per physical qubit, so QPUs sharing no qubits drift apart freely;
+- one timeline per classical bit, so feedforward waits for the measurement it
+  reads even when that measurement ran on another QPU;
 - a pool of `comm_qubits_per_qpu` ports per QPU, each held for a **whole block**;
 - `link_capacity` channels on each link along the routed path;
 - hop-scaled, probabilistic distribution: heralded entanglement needs `1 / p`
@@ -247,6 +260,17 @@ assumption. A hand-built plan that keeps a cat copy live across an `X` on its
 root — exactly what `aggregate_remote_operations` refuses to emit — drives the
 fidelity to zero, not merely down.
 
+The command-line examples on this page use a small architecture -- four QPUs of
+three qubits each -- saved as `small.json`:
+
+```json
+{
+  "n_qpus": 4,
+  "compute_qubits_per_qpu": 2,
+  "comm_qubits_per_qpu": 1
+}
+```
+
 ```bash
 quport ebits --n-logical 4 --depth 4 --config small.json --verify --emit-qasm telegate.qasm
 ```
@@ -256,7 +280,9 @@ Verification is a state-vector simulation and is refused above 24 qubits.
 Because it compares state vectors it speaks about the state a circuit prepares.
 Terminating measurements are dropped -- they read that state out without changing
 it -- while a measurement or reset that later operations depend on changes what
-the circuit computes, and is refused rather than quietly ignored.
+the circuit computes, and is refused rather than quietly ignored. So is classical
+control (an `if` block or other control-flow operation), which has no state-vector
+evolution to compare.
 
 ## Letting qubits move
 
@@ -271,7 +297,12 @@ instruction stream into contiguous **windows**, give each its own assignment, an
 charge a teleport for each qubit whose QPU changes between neighbouring windows.
 
 ```python
+from quport import MultiQPUConfig, compile_distributed
+from quport.pipeline import random_benchmark_circuit
 from quport.temporal import optimize_temporal_partition, split_windows
+
+cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=3, comm_qubits_per_qpu=1)
+result = compile_distributed(random_benchmark_circuit(12, 20, 0), cfg, seed=0, strategy="ebit")
 
 windows = split_windows(result.packets, 3)
 plan = optimize_temporal_partition(
@@ -288,7 +319,9 @@ stays put, so cost is counted over **root epochs** — maximal runs of a packet'
 gates during which the root's QPU does not change. Within an epoch, one e-bit is
 charged per distinct remote QPU the partners occupy *at the time their own gates
 run*, so a partner that migrates mid-packet correctly costs a second copy, and
-teleporting the root correctly invalidates every copy of it.
+teleporting the root starts a new epoch whose copies are paid for afresh. That is
+conservative rather than forced -- teleportation carries the root's entanglement
+along, so an old copy would still be valid -- and keeps the count an upper bound.
 
 That is what makes the generalisation faithful: with one window, or with the same
 assignment in every window, the cost is *identically* `ebit_cost`. A saving can
@@ -319,17 +352,20 @@ that moved qubits can never lose to one that did not. `migration_reduction` is
 the honest headline: it holds the placement search constant and varies only
 whether qubits may move.
 
-Measured against the `ebit` strategy's partition on random circuits, 9 to 20
-logical qubits across 3 to 5 QPUs:
+Measured against the `ebit` strategy's partition on six depth-20 random circuits
+per row, one comm port per QPU on a `switch` fabric, cut into 2, 3 and 4 windows;
+the migration column gives the range, over those window counts, of the mean saving:
 
 | Instance | Better static placement | Migration, on top |
 |---|---|---|
-| 9q / 3 QPUs | 7.8% | 12.9% – 15.4% |
-| 12q / 3 QPUs | 6.3% | 7.5% – 11.1% |
-| 16q / 4 QPUs | 4.7% | 3.6% – 10.5% |
-| 20q / 5 QPUs | 3.8% | 5.5% – 9.2% |
+| 9q / 3 QPUs | 0.0% | 2.0% – 5.1% |
+| 12q / 3 QPUs | 0.0% | 3.8% – 8.1% |
+| 16q / 4 QPUs | 0.0% | 3.9% – 8.3% |
+| 20q / 5 QPUs | 0.0% | 3.5% – 5.5% |
 
-Typically one to five qubit migrations do the work.
+Local search finds nothing to improve in the `ebit` partition, so every saving here
+is migration, bought with between 0.7 and 7 qubit moves on average. The
+numbers come from `examples/reproduce_readme_figures.py temporal`.
 
 ```{note}
 This is an analysis of what time-varying placement is worth. `compile_distributed`
@@ -350,7 +386,14 @@ same two problems exactly, by branch and bound, on instances small enough for th
 to terminate:
 
 ```python
+from quport import MultiQPUConfig, compile_distributed
 from quport.exact import optimal_partition, partition_gap
+from quport.pipeline import random_benchmark_circuit
+
+# 9 qubits on 3 QPUs of capacity 3.
+cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+result = compile_distributed(random_benchmark_circuit(9, 10, 0), cfg, seed=0, strategy="ebit")
+packets = result.packets  # built from the circuit the partitioner actually saw
 
 best = optimal_partition(9, 3, 3, objective="ebits", packets=packets)
 gap = partition_gap(result.partition, 3, 3, objective="ebits", packets=packets)
@@ -385,9 +428,9 @@ trust the heuristic at scale.
 wrong. That makes it a cross-check between two independent readings of both
 objectives, which is why `tests/test_exact.py` runs it over every shipped strategy.
 The branch and bound is itself checked against exhaustive enumeration over every
-feasible assignment — 286 cut instances and 125 e-bit instances — since that is the
-only real argument that the pruning and the canonical form do not silently lose an
-optimum.
+feasible assignment — 82 cut instances and 34 e-bit instances in
+`tests/test_exact.py` — since that is the only real argument that the pruning and
+the canonical form do not silently lose an optimum.
 
 ```bash
 quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
@@ -397,12 +440,13 @@ quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
 
 | Field | Where | Meaning |
 |---|---|---|
-| `ebits` | `EbitReport` | EPR pairs with unlimited ports — a lower bound on the plan |
+| `ebits` | `EbitReport` | EPR pairs with unlimited ports — a lower bound on the plan when every remote gate's root is forced (the default `cx` basis); symmetric gates can put either figure lower |
 | `epr_pairs` | `AggregationPlan` | EPR pairs under the real port budget |
 | `baseline_epr_pairs` | `AggregationPlan` | what a per-gate telegate compiler would spend |
 | `reduction` | both | fraction saved against that baseline |
 | `evictions` | `AggregationPlan` | copies released early because a port was needed |
-| `peak_cat_copies` | `AggregationPlan` | never exceeds the QPU's port budget, by construction |
+| `peak_cat_copies` | `AggregationPlan` | most cat copies live at once per QPU, each held until its root is disturbed or it is evicted; never exceeds the port budget, by construction |
+| `peak_cat_copies` | `EbitReport` | most port slots held at once per QPU with unlimited ports, counting each cat copy only from its first to its last gate and each teleported operand for its one gate; above the port budget, the unconstrained plan cannot run as is |
 | `entanglement_time` | `EntanglementScheduleSummary` | total link occupancy, summed over links |
 | `unschedulable_gates` | `EntanglementScheduleSummary` | gates no port/link budget could serve |
 

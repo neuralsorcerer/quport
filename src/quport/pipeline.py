@@ -32,6 +32,7 @@ from quport.partition import (
     PartitionDiagnostics,
     PartitionResult,
     balanced_greedy_partition,
+    ebit_partition,
     heavy_edge_clustering_partition,
     tpccap_partition,
     tpccap_sa_partition,
@@ -200,15 +201,15 @@ def map_and_transpile(
         Interaction weighting for the topology-aware strategies, matching the
         argument of the same name on :func:`quport.compiler.compile_distributed`.
         A value in (0, 1) emphasises earlier two-qubit gates; ``1.0`` is plain
-        interaction counts. It applies to ``tpccap`` and ``tpccap_sa`` alike, so
-        a run isolates the annealing rather than also changing the objective's
-        inputs.
+        interaction counts. It applies to ``tpccap``, ``tpccap_sa`` and ``ebit``
+        alike, so a run isolates the annealing rather than also changing the
+        objective's inputs.
 
         Leaving it as ``None`` keeps the historical per-strategy behaviour, in
-        which ``tpccap`` uses uniform counts and ``tpccap_sa`` uses a decay of
-        0.98. That default is preserved so existing benchmark numbers do not
-        move, but it means the two strategies differ in more than the search;
-        pass an explicit value to compare them on equal terms.
+        which ``tpccap`` uses uniform counts while ``tpccap_sa`` and ``ebit``
+        use a decay of 0.98. That default is preserved so existing benchmark
+        numbers do not move, but it means the strategies differ in more than the
+        search; pass an explicit value to compare them on equal terms.
 
     Returns
     -------
@@ -239,9 +240,9 @@ def map_and_transpile(
     ) -> Mapping[tuple[int, int], float]:
         """Interaction weights for a topology-aware strategy.
 
-        ``temporal_decay=None`` reproduces the historical split, where only
-        tpccap_sa decayed its weights; an explicit value is applied to both
-        topology-aware strategies so they can be compared on equal terms.
+        ``temporal_decay=None`` keeps each strategy's default -- uniform counts
+        for tpccap, a decay of 0.98 for tpccap_sa and ebit; an explicit value is
+        applied to all three so they can be compared on equal terms.
 
         Validation happens here rather than up front so that, exactly as in
         :func:`quport.compiler.compile_distributed`, a decay supplied alongside a
@@ -305,19 +306,18 @@ def map_and_transpile(
 
     elif strategy == "ebit":
         sp = arch.qpu_shortest_paths()
-        pres, diag, _anneal = tpccap_sa_partition(
+        # The same objective `compile_distributed` uses for this strategy,
+        # penalty rescaling included, so `quport map/bench/sweep --strategy ebit`
+        # measure the strategy the rest of QuPort calls by that name.
+        pres, diag, _anneal = ebit_partition(
             n=qc_basis.num_qubits,
             weights=topology_weights(0.98),
             n_qpus=cfg.n_qpus,
             capacity=capacity,
             comm_ports_per_qpu=max(0, cfg.comm_qubits_per_qpu),
             sp=sp,
-            seed=seed,
-            # Communication volume is measured in e-bits, so the cut-distance
-            # term is switched off rather than added on top of it.
-            w_dist=0.0,
             packets=build_distributable_packets(qc_basis),
-            w_ebit=1.0,
+            seed=seed,
         )
         part = pres.part
         cut = pres.cut
@@ -633,10 +633,10 @@ def sweep_topologies(
                     def median(k: str) -> float:
                         """Median alongside the mean, because cost is heavily skewed.
 
-                        Across random circuits the per-instance cost ratio between two
-                        strategies spans roughly -50% to +200%, so a handful of hard
-                        instances can move the mean far enough to reverse which
-                        strategy looks better. Reporting only the mean hides that.
+                        A handful of hard random circuits can move the mean far
+                        enough to reverse which strategy looks better while the
+                        median points the other way; README.md quotes a measured
+                        case. Reporting only the mean hides that.
                         """
                         values = sorted(float(r[k]) for r in rs)
                         if not values:

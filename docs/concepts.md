@@ -58,7 +58,7 @@ routing model.
 | `ring` | each QPU connects to the next QPU modulo `n_qpus` | sparse baseline with uniform degree |
 | `degree_d` | bounded-degree circulant-style QPU graph controlled by `inter_degree` | degree/cost scaling experiments |
 | `clos` | Clos-style approximation; one-port configurations fall back to a ring abstraction | multi-port network experiments |
-| `fat_tree` | tree-like/pod-style approximation with representative communication links | hierarchical network experiments |
+| `fat_tree` | pod-style approximation: pods of about sqrt(N) QPUs, fully connected inside, joined through a ring of their first QPUs; every link uses a QPU's first comm port | hierarchical network experiments |
 
 Scheduling and congestion calculations operate on the QPU-level graph, not only on
 physical-qubit coupling edges. This is why topology choice can affect both
@@ -102,19 +102,20 @@ gates from one control into one QPU costs one EPR pair rather than one per gate.
 [Entanglement model](entanglement.md).
 
 ```{note}
-The two entry points do not weight interactions the same way.
-`compile_distributed` applies temporal decay to both `tpccap` and `tpccap_sa`
-through its `temporal_decay` argument. `map_and_transpile` has no such argument:
-it runs `tpccap` on uniform interaction counts and `tpccap_sa` on temporal
-weights with the decay fixed at `0.98`.
+The two entry points do not weight interactions the same way by default.
+`compile_distributed` applies its `temporal_decay` (default `0.98`) to both
+`tpccap` and `tpccap_sa`. `map_and_transpile` takes a `temporal_decay` argument
+too, but its default of `None` keeps the historical split: `tpccap` on uniform
+interaction counts, `tpccap_sa` on temporal weights with a decay of `0.98`.
 
-Under `map_and_transpile` the two strategies therefore differ in the search
-procedure *and* in the objective's input weights. `benchmark_random_circuits`
-and `sweep_topologies` both go through `map_and_transpile`, so their `method=2`
-and `method=3` rows do not isolate the effect of the annealing; on random
-circuits most of the gap between them comes from the weighting change. Compare
-the strategies through `compile_distributed`, which weights both identically,
-when the annealing itself is the thing being measured.
+Under that default the two strategies differ in the search procedure *and* in
+the objective's input weights. `benchmark_random_circuits` and
+`sweep_topologies` both call `map_and_transpile` without a decay, so their
+`method=2` and `method=3` rows do not isolate the effect of the annealing; on
+random circuits much of the gap between them comes from the weighting change.
+When the annealing itself is the thing being measured, pass the same
+`temporal_decay` to both strategies, or compare them through
+`compile_distributed`, whose defaults already match.
 ```
 
 ## Capacity model
@@ -166,6 +167,12 @@ position. `reassemble_distributed_program` implements that rule, and
 `verify_distributed_program` uses it to check that the artifacts still compute
 the circuit they came from.
 
+Classical bits are not split: every program refers to the source circuit's
+bits, so a conditional on one QPU can read a bit measured on another. Each
+program keeps its own accesses to a bit in order, but the order across QPUs is
+recorded only in the mapped circuit, which is where
+`reassemble_distributed_program` takes it from.
+
 ## Scheduling
 
 QuPort exposes four schedule estimators:
@@ -206,7 +213,7 @@ counts, and non-self QPU/link pairs before returning the manifest.
 | Makespan | schedule-estimator time proxy | model-dependent, not hardware-calibrated by default |
 | Peak link utilization | maximum simultaneous per-link pressure in a round | topology-scheduler metric |
 | EPR pairs | entanglement consumed after communication aggregation | depends on the comm-port budget; compare against `baseline_epr_pairs` |
-| e-bits | EPR pairs a partition needs with unlimited ports | a lower bound on the compiled plan |
+| e-bits | EPR pairs a partition needs with unlimited ports | a lower bound on the compiled plan when every remote gate's root is forced, as in the default `cx` basis; with symmetric gates (`cz`, `cp`) either figure can be the lower |
 
 For fair comparisons, keep random seeds, config, transpiler settings, strategies,
 and latency model fixed except for the variable being studied.

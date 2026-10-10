@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sys
+import tomllib
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, metadata, version
 from pathlib import Path
@@ -24,7 +25,10 @@ author = "Soumyadip Sarkar"
 try:
     release = version("quport")
 except PackageNotFoundError:
-    release = "0.1.1"
+    # Building from a checkout without installing: read the version the package
+    # declares, rather than a copy of it that drifts with every release.
+    with open(ROOT / "pyproject.toml", "rb") as handle:
+        release = tomllib.load(handle)["project"]["version"]
 version = ".".join(release.split(".")[:2])
 
 try:

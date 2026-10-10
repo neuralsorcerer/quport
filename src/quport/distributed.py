@@ -469,6 +469,12 @@ def reassemble_distributed_program(
     an instruction runs once it is first in line on every qubit it touches --
     and a remote operation runs once its marker leads on both sides.
 
+    Classical bits are dataflow too, and they cross QPUs: a conditional on one
+    QPU can read a bit measured on another. The per-QPU programs do not record
+    that order -- each sees only its own accesses -- so it is taken from
+    ``mapped``: an instruction that touches a classical bit runs only once every
+    earlier access to that bit, on whichever QPU, has run.
+
     That is also the contract a consumer of the artifacts has to honour: reading
     each program strictly linearly can deadlock, because two QPUs can list the
     same pair of remote operations in opposite orders when they sit on disjoint
@@ -496,8 +502,8 @@ def reassemble_distributed_program(
     ------
     ValueError
         If a marker is missing, or if the programs impose contradictory orders
-        on the remote operations -- a genuine inconsistency rather than a
-        scheduling choice.
+        on the remote operations or classical bits -- a genuine inconsistency
+        rather than a scheduling choice.
     """
     if not isinstance(mapped, QuantumCircuit):
         raise ValueError("mapped must be a QuantumCircuit")
@@ -516,10 +522,23 @@ def reassemble_distributed_program(
         out.add_register(creg)
     clbit_at = {clbit: index for index, clbit in enumerate(mapped.clbits)}
 
+    def clbit_index(clbit: Any) -> int:
+        """Return the merged circuit's index for a program's classical bit."""
+        try:
+            return clbit_at[clbit]
+        except KeyError:  # pragma: no cover - defensive
+            raise ValueError(
+                "a per-QPU program uses classical bits the mapped circuit "
+                "does not have"
+            ) from None
+
     qpus = sorted(local_routed)
     data: dict[int, list[Any]] = {}
     index_of: dict[int, dict[Any, int]] = {}
     queues: dict[int, dict[int, deque[int]]] = {}
+    # Per QPU, each classical bit's accesses in program order, like ``queues``
+    # for qubits.
+    clbit_queues: dict[int, dict[int, deque[int]]] = {}
     retired: dict[int, list[bool]] = {}
     marker_at: dict[tuple[int, int], int] = {}
     marker_qubits: dict[tuple[int, int], list[int]] = {}
@@ -527,15 +546,34 @@ def reassemble_distributed_program(
 
     def carried_clbits(instruction: Any) -> list[Any]:
         """Map an instruction's classical arguments onto the merged circuit."""
-        if not instruction.clbits:
-            return []
-        try:
-            return [out.clbits[clbit_at[clbit]] for clbit in instruction.clbits]
-        except KeyError:  # pragma: no cover - defensive
-            raise ValueError(
-                "a per-QPU program uses classical bits the mapped circuit "
-                "does not have"
-            ) from None
+        return [out.clbits[clbit_index(clbit)] for clbit in instruction.clbits]
+
+    # Who touches each classical bit, in the mapped circuit's order: a QPU for
+    # a local instruction, a manifest ordinal for a remote one. Instructions
+    # without qubits are left out on both sides, as the merge skips them.
+    ordinal_at = {op.index: ordinal for ordinal, op in enumerate(remote_ops)}
+    clbit_owners: list[list[tuple[str, int]]] = [[] for _ in mapped.clbits]
+    for position, instruction in enumerate(mapped.data):
+        if not instruction.qubits or not instruction.clbits:
+            continue
+        ordinal = ordinal_at.get(position)
+        owner = (
+            ("local", arch.qpu_of_phys(mapped_at[instruction.qubits[0]]))
+            if ordinal is None
+            else ("remote", ordinal)
+        )
+        for clbit in instruction.clbits:
+            clbit_owners[clbit_at[clbit]].append(owner)
+    clbit_cursor = [0] * len(clbit_owners)
+
+    def owns_next(owner: tuple[str, int], clbits: Iterable[int]) -> bool:
+        """True when ``owner`` makes the next access to each of these bits."""
+        for clbit in clbits:
+            owners = clbit_owners[clbit]
+            cursor = clbit_cursor[clbit]
+            if cursor >= len(owners) or owners[cursor] != owner:
+                return False
+        return True
 
     for qpu in qpus:
         circuit = local_routed[qpu]
@@ -544,6 +582,7 @@ def reassemble_distributed_program(
         instructions = list(circuit.data)
         positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
         per_qubit: dict[int, deque[int]] = {}
+        per_clbit: dict[int, deque[int]] = {}
         for index, instruction in enumerate(instructions):
             ordinal = _remote_barrier_ordinal(instruction.operation)
             if ordinal is not None:
@@ -553,22 +592,45 @@ def reassemble_distributed_program(
                 ]
             for qubit in instruction.qubits:
                 per_qubit.setdefault(positions[qubit], deque()).append(index)
+            if instruction.qubits:
+                for clbit in instruction.clbits:
+                    per_clbit.setdefault(clbit_index(clbit), deque()).append(index)
         data[qpu] = instructions
         index_of[qpu] = positions
         queues[qpu] = per_qubit
+        clbit_queues[qpu] = per_clbit
         retired[qpu] = [False] * len(instructions)
 
     def leads(qpu: int, index: int) -> bool:
-        """True when this instruction is first in line on every qubit it uses."""
-        return all(
+        """True when this instruction is first in line on every bit it uses.
+
+        That is every qubit and classical bit in its own program, and, for a
+        classical bit, across all programs as well.
+        """
+        instruction = data[qpu][index]
+        if not all(
             queues[qpu][index_of[qpu][qubit]][0] == index
-            for qubit in data[qpu][index].qubits
-        )
+            for qubit in instruction.qubits
+        ):
+            return False
+        clbits = [clbit_index(clbit) for clbit in instruction.clbits]
+        return all(
+            clbit_queues[qpu][clbit][0] == index for clbit in clbits
+        ) and owns_next(("local", qpu), clbits)
+
+    def advance(clbits: Iterable[int]) -> None:
+        for clbit in clbits:
+            clbit_cursor[clbit] += 1
 
     def retire(qpu: int, index: int) -> None:
         retired[qpu][index] = True
-        for qubit in data[qpu][index].qubits:
+        instruction = data[qpu][index]
+        for qubit in instruction.qubits:
             queues[qpu][index_of[qpu][qubit]].popleft()
+        clbits = [clbit_index(clbit) for clbit in instruction.clbits]
+        for clbit in clbits:
+            clbit_queues[qpu][clbit].popleft()
+        advance(clbits)
 
     remaining = {qpu: sum(1 for inst in data[qpu] if inst.qubits) for qpu in qpus}
     pending = set(range(len(remote_ops)))
@@ -617,6 +679,9 @@ def reassemble_distributed_program(
                 retired[qpu][marker] or not leads(qpu, marker) for qpu, marker in sides
             ):
                 continue
+            source_clbits = [clbit_at[clbit] for clbit in source.clbits]
+            if not owns_next(("remote", ordinal), source_clbits):
+                continue
             operands = _remote_operands(ordinal, op, source_qpus, marker_qubits)
             out.append(
                 source.operation,
@@ -626,13 +691,15 @@ def reassemble_distributed_program(
             for qpu, marker in sides:
                 retire(qpu, marker)
                 remaining[qpu] -= 1
+            advance(source_clbits)
             pending.discard(ordinal)
             progressed = True
 
         if not progressed:
             raise ValueError(
                 "per-QPU programs impose contradictory orders on their remote "
-                "operations; the programs and the manifest are out of step"
+                "operations or classical bits; the programs and the manifest "
+                "are out of step"
             )
 
     if restore_layout:
