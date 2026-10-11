@@ -554,3 +554,69 @@ def test_result_reduction_is_zero_when_nothing_is_cut():
     assert result.cost.total == 0
     assert result.reduction == 0.0
     assert result.saved == 0
+
+
+def test_a_bad_first_window_is_reported_as_a_value_error() -> None:
+    qc = QuantumCircuit(2)
+    qc.cx(0, 1)
+    packets = build_distributable_packets(qc)
+    for windows in (((0, 1),), (TemporalWindow(0, 1), (1, 2))):
+        partition = TemporalPartition(
+            windows=cast(Any, windows), assignments=((0, 1),) * len(windows)
+        )
+        with pytest.raises(ValueError, match="TemporalWindow instances"):
+            temporal_ebit_cost(packets, partition, 2)
+
+
+def test_a_root_teleported_away_and_back_starts_a_new_epoch() -> None:
+    """Moving the root restarts its copies, whether or not it comes back."""
+    qc = QuantumCircuit(3)
+    qc.cx(0, 1)  # packet rooted at 0, window 0
+    qc.cx(2, 1)  # window 1
+    qc.cx(0, 1)  # same packet, window 2
+    packets = build_distributable_packets(qc)
+    windows = (TemporalWindow(0, 1), TemporalWindow(1, 2), TemporalWindow(2, 3))
+
+    def packet_ebits(*assignments: tuple[int, ...]) -> int:
+        partition = TemporalPartition(windows=windows, assignments=assignments)
+        return temporal_ebit_cost(packets, partition, 3).packet_ebits
+
+    assert packet_ebits((0, 2, 2), (0, 2, 2), (0, 2, 2)) == 1
+    assert packet_ebits((0, 2, 2), (1, 2, 2), (1, 2, 2)) == 2
+    assert packet_ebits((0, 2, 2), (1, 2, 2), (0, 2, 2)) == 2
+
+
+def test_a_plan_without_moves_reports_no_migration_saving() -> None:
+    """A short phase-one budget must not turn re-placement into "migration".
+
+    With ``max_passes=1`` the stationary phase stops early, and the temporal
+    phase keeps improving the static placement through its whole-circuit
+    interval. With migration priced out the plan moves nothing, so all of
+    that is re-placement.
+    """
+    from qiskit import transpile
+
+    from quport.pipeline import random_benchmark_circuit
+
+    qc = transpile(
+        random_benchmark_circuit(7, 10, 6),
+        basis_gates=["rz", "sx", "x", "cx"],
+        optimization_level=0,
+        seed_transpiler=6,
+    )
+    packets = build_distributable_packets(qc)
+    held = optimize_temporal_partition(
+        packets,
+        [qubit % 2 for qubit in range(7)],
+        2,
+        4,
+        split_windows(packets, 3),
+        migration_cost=10_000,
+        max_passes=1,
+        seed=6,
+    )
+
+    assert held.cost.moves == 0
+    assert held.cost.total == held.stationary_cost
+    assert held.migration_saved == 0
+    assert held.migration_reduction == 0.0

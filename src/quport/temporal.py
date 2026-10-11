@@ -378,16 +378,21 @@ def _cost(
     packet_ebits = 0
     for packet in decomposition.packets:
         root = packet.root
-        epoch_root = -1
+        previous_window = -1
         charged: set[int] = set()
         for gate_index, partner in zip(packet.gate_indices, packet.gate_partners):
             window = window_of(gate_index)
             root_qpu = assignments[window][root]
-            if root_qpu != epoch_root:
-                # The root moved: pay for its copies afresh. Conservative, since
-                # teleportation would carry the entanglement along.
-                epoch_root = root_qpu
+            # The root moved since the packet's last gate -- even if it has
+            # come back since -- so its copies are paid for afresh.
+            # Conservative, since teleportation would carry the entanglement
+            # along.
+            if previous_window < 0 or any(
+                assignments[w][root] != assignments[w - 1][root]
+                for w in range(previous_window + 1, window + 1)
+            ):
                 charged = set()
+            previous_window = window
             partner_qpu = assignments[window][partner]
             if partner_qpu != root_qpu and partner_qpu not in charged:
                 charged.add(partner_qpu)
@@ -619,11 +624,18 @@ def optimize_temporal_partition(
         windows=tuple(windows),
         assignments=tuple(tuple(assignment) for assignment in assignments),
     )
+    # A plan that moves no qubit is itself a stationary placement. Phase two
+    # can reach a better one than phase one did when ``max_passes`` stopped
+    # phase one short; counting that re-placement as a migration saving would
+    # report migration buying something no qubit's move bought.
+    stationary_total = stationary_cost.total
+    if best.moves == 0:
+        stationary_total = min(stationary_total, best.total)
     return TemporalResult(
         partition=partition,
         cost=best,
         static_cost=static_cost,
-        stationary_cost=stationary_cost.total,
+        stationary_cost=stationary_total,
         passes=passes,
     )
 
