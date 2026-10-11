@@ -440,7 +440,7 @@ quport optimal --n-logical 9 --depth 10 --config small.json --strategy ebit
 
 | Field | Where | Meaning |
 |---|---|---|
-| `ebits` | `EbitReport` | EPR pairs with unlimited ports — a lower bound on the plan when every remote gate's root is forced (the default `cx` basis); symmetric gates can put either figure lower |
+| `ebits` | `EbitReport` | EPR pairs with unlimited ports — a lower bound on the plan when every remote gate's root is forced (the default `cx` basis) and none is unschedulable, since an unschedulable gate spends no EPR pair; symmetric gates can put either figure lower |
 | `epr_pairs` | `AggregationPlan` | EPR pairs under the real port budget |
 | `baseline_epr_pairs` | `AggregationPlan` | what a per-gate telegate compiler would spend |
 | `reduction` | both | fraction saved against that baseline |

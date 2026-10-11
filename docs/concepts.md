@@ -214,7 +214,7 @@ counts, and non-self QPU/link pairs before returning the manifest.
 | Makespan | schedule-estimator time proxy | model-dependent, not hardware-calibrated by default |
 | Peak link utilization | maximum simultaneous per-link pressure in a round | topology-scheduler metric |
 | EPR pairs | entanglement consumed after communication aggregation | depends on the comm-port budget; compare against `baseline_epr_pairs` |
-| e-bits | EPR pairs a partition needs with unlimited ports | a lower bound on the compiled plan when every remote gate's root is forced, as in the default `cx` basis; with symmetric gates (`cz`, `cp`) either figure can be the lower |
+| e-bits | EPR pairs a partition needs with unlimited ports | a lower bound on the compiled plan when every remote gate's root is forced, as in the default `cx` basis, and the plan can serve every gate (one it marks unschedulable spends no EPR pair); with symmetric gates (`cz`, `cp`) either figure can be the lower |
 
 For fair comparisons, keep random seeds, config, transpiler settings, strategies,
 and latency model fixed except for the variable being studied.
