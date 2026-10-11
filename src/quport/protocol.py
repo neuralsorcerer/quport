@@ -62,11 +62,12 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit, QuantumRegister
 from qiskit.circuit import ClassicalRegister, ControlFlowOp
 
+from quport._validation import is_boolean
 from quport.aggregation import AggregationPlan, RemoteBlock, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
 from quport.distributed import (
@@ -455,6 +456,7 @@ def verify_telegate_equivalence(
     import numpy as np
     from qiskit.quantum_info import Statevector
 
+    tolerance = _validated_atol(atol)
     program = build_telegate_circuit(
         mapped, arch, plan, coherent=True, ports_per_qpu=ports_per_qpu
     )
@@ -495,7 +497,7 @@ def verify_telegate_equivalence(
     by_ancilla = actual.reshape(2 ** (total - program.n_data), 2**program.n_data)
     overlaps = by_ancilla @ expected.conj()
     fidelity = float(np.vdot(overlaps, overlaps).real)
-    return bool(fidelity >= 1.0 - atol)
+    return bool(fidelity >= 1.0 - tolerance)
 
 
 def verify_distributed_program(
@@ -551,6 +553,7 @@ def verify_distributed_program(
     """
     from qiskit.quantum_info import Statevector
 
+    tolerance = _validated_atol(atol)
     merged = reassemble_distributed_program(
         mapped, local_routed, remote_ops, arch, restore_layout=True
     )
@@ -592,10 +595,28 @@ def verify_distributed_program(
     fidelity = _dephased_fidelity(
         Statevector(actual).data, Statevector(expected).data, n_data=width
     )
-    return bool(fidelity >= 1.0 - atol)
+    return bool(fidelity >= 1.0 - tolerance)
 
 
 _NON_UNITARY_OPS = frozenset({"measure", "reset", "initialize"})
+
+
+def _validated_atol(atol: object) -> float:
+    """Return a tolerance on ``1 - fidelity`` that can still fail a check.
+
+    A boolean is not a tolerance, and one of 1 or more -- or an infinite one --
+    passes every circuit, while NaN fails every one; each would turn the
+    verification into a constant.
+    """
+    if is_boolean(atol):
+        raise ValueError("atol must be numeric, not boolean")
+    try:
+        value = float(cast(SupportsFloat | SupportsIndex | str, atol))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("atol must be numeric") from None
+    if not math.isfinite(value) or not 0.0 <= value < 1.0:
+        raise ValueError("atol must be a finite tolerance in [0, 1)")
+    return value
 
 
 def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:

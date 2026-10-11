@@ -1069,3 +1069,56 @@ def test_a_wide_gate_acting_diagonally_on_a_root_keeps_its_cat_copy() -> None:
     target.cx(0, 4)
     assert aggregate_remote_operations(target, arch).epr_pairs == 2
     assert verify_telegate_equivalence(target, arch)
+
+
+@pytest.mark.parametrize(
+    "atol", [True, False, float("inf"), float("nan"), 1.0, 2.0, -1e-9, "loose"]
+)
+def test_both_verifiers_refuse_a_tolerance_that_decides_the_answer(
+    atol: object,
+) -> None:
+    """With ``atol >= 1`` every plan passed; with NaN every plan failed."""
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.x(0)
+    mapped.cx(0, 3)
+    # One copy held across the X on its root: provably wrong.
+    forced = AggregationPlan(
+        blocks=(
+            RemoteBlock(
+                protocol="cat",
+                root_phys=0,
+                root_qpu=0,
+                remote_qpu=1,
+                gate_indices=(1, 3),
+                epr_pairs=1,
+            ),
+        ),
+        remote_gates=2,
+        epr_pairs=1,
+        baseline_epr_pairs=2,
+        unschedulable_gates=0,
+        evictions=0,
+        peak_cat_copies=(0, 1),
+    )
+    assert not verify_telegate_equivalence(mapped, arch, forced)
+
+    with pytest.raises(ValueError, match="atol"):
+        verify_telegate_equivalence(mapped, arch, forced, atol=atol)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="atol"):
+        verify_distributed_program(mapped, {}, [], arch, atol=atol)  # type: ignore[arg-type]
+
+
+def test_a_numeric_tolerance_below_one_is_accepted() -> None:
+    import numpy as np
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    for atol in (1e-9, 0.5, np.float64(1e-6)):
+        assert verify_telegate_equivalence(mapped, arch, atol=atol)
