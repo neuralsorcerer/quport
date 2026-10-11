@@ -1429,3 +1429,29 @@ def test_cached_shortest_path_dags_route_bit_for_bit_like_fresh_ones() -> None:
         assert from_reused == validating
 
     assert reused.ecmp_dags, "the fixture must actually populate the cache"
+
+
+def test_ecmp_refuses_a_table_that_overstates_a_realizable_distance() -> None:
+    """A longer walk exists, so the old checks passed and routed along it."""
+    from quport.network import QpuShortestPaths, all_pairs_shortest_paths
+
+    adjacency = [[1, 4], [0, 2], [1, 3], [2, 4], [3, 0]]  # a 5-cycle
+    good = all_pairs_shortest_paths(adjacency)
+    distances = [row[:] for row in good.dist]
+    distances[0][2] = distances[2][0] = 3  # the graph's distance is 2
+    bad = QpuShortestPaths(dist=distances, next_hop=good.next_hop, adj=adjacency)
+
+    traffic = [[0.0] * 5 for _ in range(5)]
+    traffic[0][2] = traffic[2][0] = 1.0
+    assert route_link_loads(traffic, good, mode="ecmp") == {(0, 1): 1.0, (1, 2): 1.0}
+    with pytest.raises(ValueError, match=r"distance 3 between QPU 0 and 2"):
+        route_link_loads(traffic, bad, mode="ecmp")
+
+
+def test_a_non_sequence_adjacency_is_a_value_error() -> None:
+    from quport.network import QpuShortestPaths, all_pairs_shortest_paths
+
+    paths = all_pairs_shortest_paths([[1], [0]])
+    broken = QpuShortestPaths(dist=paths.dist, next_hop=paths.next_hop, adj=5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="adjacency must be a sequence of rows"):
+        route_link_loads([[0.0, 1.0], [1.0, 0.0]], broken, mode="ecmp")

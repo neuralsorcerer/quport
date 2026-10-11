@@ -632,3 +632,41 @@ def test_all_blocks_returns_every_qpu_block_in_order() -> None:
 
     covered = [phys for block in blocks for phys in (*block.compute, *block.comm)]
     assert sorted(covered) == list(range(arch.n_phys))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"intra_topology": "grid2d", "grid_rows": 0}, "grid_rows must be positive"),
+        (
+            {"intra_topology": "grid2d", "grid_rows": 1, "grid_cols": 1},
+            r"grid_rows \* grid_cols must cover",
+        ),
+        (
+            {"inter_topology": "degree_d", "inter_degree": 2.5},
+            "inter_degree must be an integer",
+        ),
+    ],
+)
+def test_validate_architecture_config_checks_what_the_build_reads(
+    overrides: dict[str, object], match: str
+) -> None:
+    """It promises a buildable architecture, so it runs the build-time checks."""
+    from quport.architecture import validate_architecture_config
+
+    cfg = MultiQPUConfig(
+        n_qpus=4, compute_qubits_per_qpu=4, comm_qubits_per_qpu=1, **overrides  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match=match):
+        validate_architecture_config(cfg)
+
+
+def test_validate_architecture_config_ignores_fields_a_topology_never_reads() -> None:
+    from quport.architecture import validate_architecture_config
+
+    for overrides in (
+        {"intra_topology": "line", "grid_rows": 0},
+        {"inter_topology": "switch", "inter_degree": 2.5},
+        {"inter_topology": "degree_d", "inter_degree": -3},  # clamped by design
+    ):
+        validate_architecture_config(MultiQPUConfig(**overrides))  # type: ignore[arg-type]

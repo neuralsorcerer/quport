@@ -475,3 +475,70 @@ def test_relative_gap_is_infinite_when_the_optimum_is_zero_and_the_heuristic_is_
     assert gap.heuristic == 2.0
     assert gap.absolute == 2.0
     assert gap.relative == math.inf
+
+
+def test_the_reported_cut_optimum_is_cut_weight_of_its_partition() -> None:
+    """The search sums per qubit, cut_weight per edge; the report must not differ.
+
+    Floating addition does not associate, so with large fractional weights the
+    two orders gave different last bits, and partition_gap then raised "beats
+    the proved optimum" on the optimum's own partition.
+    """
+    weights = {
+        (0, 1): 70660612.1,
+        (0, 2): 7235443.2,
+        (0, 3): 91784877.9,
+        (1, 2): 22948685.7,
+        (1, 3): 80531160.4,
+        (2, 3): 15106945.0,
+    }
+    best = optimal_partition(4, 4, 1, objective="cut", weights=weights)
+
+    assert best.objective == cut_weight(weights, list(best.part))
+    gap = partition_gap(list(best.part), 4, 1, objective="cut", weights=weights)
+    assert gap.absolute == 0.0
+    assert gap.relative == 0.0
+
+
+def test_partition_gap_tolerance_scales_with_the_cost() -> None:
+    """Equal-cost partitions may sum an ulp apart; that is not a contradiction."""
+    rng = random.Random(3)
+    for _ in range(300):
+        n = rng.randint(2, 6)
+        n_qpus = rng.randint(1, 3)
+        capacity = -(-n // n_qpus) + rng.randint(0, 1)
+        weights = {
+            (i, j): rng.uniform(1.0, 1e8)
+            for i in range(n)
+            for j in range(i + 1, n)
+            if rng.random() < 0.7
+        }
+        best = optimal_partition(n, n_qpus, capacity, objective="cut", weights=weights)
+        partition_gap(
+            list(best.part), n_qpus, capacity, objective="cut", weights=weights
+        )
+
+
+def test_an_exhausted_search_reports_the_nodes_it_explored() -> None:
+    """``max_nodes`` is a ceiling on explored nodes, and ``nodes`` never passes it."""
+    rng = random.Random(11)
+    weights = {
+        (i, j): rng.randint(1, 4)
+        for i in range(12)
+        for j in range(i + 1, 12)
+        if rng.random() < 0.6
+    }
+    for budget in (1, 5, 100):
+        result = optimal_partition(
+            12, 4, 3, objective="cut", weights=weights, max_nodes=budget
+        )
+        assert result.nodes == budget
+        assert not result.proved_optimal
+
+    full = optimal_partition(12, 4, 3, objective="cut", weights=weights)
+    exact_budget = optimal_partition(
+        12, 4, 3, objective="cut", weights=weights, max_nodes=full.nodes
+    )
+    # A budget of exactly the nodes the proof needs still proves it.
+    assert exact_budget.proved_optimal
+    assert exact_budget.objective == full.objective

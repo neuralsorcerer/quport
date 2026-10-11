@@ -848,3 +848,75 @@ def test_sweep_reports_a_real_cost_median(tmp_path: Path, trials: int) -> None:
             disagreed = True
 
     assert disagreed, "expected the median and mean to differ on at least one row"
+
+
+@pytest.mark.parametrize("entry", ["map_and_transpile", "transpile_baseline"])
+def test_global_routing_refuses_a_machine_it_cannot_route_on(entry: str) -> None:
+    """With no comm ports no path joins the QPUs, and Qiskit failed deep inside."""
+    from qiskit import QuantumCircuit
+
+    from quport.pipeline import transpile_baseline
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0, optimization_level=0
+    )
+    qc = QuantumCircuit(4)
+    for qubit in range(3):
+        qc.cx(qubit, qubit + 1)
+
+    with pytest.raises(ValueError, match="global routing cannot connect QPUs"):
+        if entry == "map_and_transpile":
+            map_and_transpile(qc, cfg, seed=0)
+        else:
+            transpile_baseline(qc, cfg, seed=0)
+
+
+def test_global_routing_accepts_a_disconnected_machine_it_does_not_route_across() -> (
+    None
+):
+    """Only operations whose operands land in different parts are refused."""
+    from qiskit import QuantumCircuit
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0, optimization_level=0
+    )
+    qc = QuantumCircuit(2)
+    qc.cx(0, 1)
+
+    res = map_and_transpile(qc, cfg, seed=0, strategy="cluster")
+    assert res.metrics.remote_2q == 0
+
+
+def test_sweep_checks_every_setting_before_running_any(tmp_path: Path) -> None:
+    """A disconnected setting late in the grid must not discard earlier rows."""
+    from quport.pipeline import sweep_topologies
+
+    out = tmp_path / "sweep.csv"
+    with pytest.raises(ValueError, match=r"\(intra=clique, inter=ring, ports=0\)"):
+        sweep_topologies(
+            n_logical=4,
+            depth=3,
+            trials=1,
+            seed=0,
+            out_csv=str(out),
+            intra_topologies=("clique",),
+            inter_topologies=("ring",),
+            comm_ports=(1, 0),
+            compute_per_qpu=2,
+            n_qpus=2,
+        )
+    assert not out.exists()
+
+
+def test_a_zero_qubit_benchmark_circuit_is_empty_and_maps() -> None:
+    from quport.compiler import compile_distributed
+
+    qc = random_benchmark_circuit(n_logical=0, depth=5, seed=0)
+    assert qc.num_qubits == 0
+    assert qc.size() == 0
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1, optimization_level=0
+    )
+    assert map_and_transpile(qc, cfg, seed=0).metrics.remote_2q == 0
+    assert compile_distributed(qc, cfg, seed=0).routed_remote_ops == []

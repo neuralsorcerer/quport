@@ -2371,3 +2371,37 @@ def test_no_estimator_beats_the_circuit_critical_path(seed: int) -> None:
     ):
         makespan = estimator(circuit, arch, latency).makespan
         assert makespan >= floor - 1e-9, estimator.__name__
+
+
+def test_audit_catches_a_round_that_places_nothing():
+    """A real round is closed only once it holds an operation."""
+    from quport.schedule import audit_topology_schedule_plan
+
+    res, arch, model = _audited_case()
+    plan = res.schedule_plan
+    index = _first_round_layer(plan)
+    first = plan.layers[index].remote_rounds[0]
+
+    empty = _replace_first_round(
+        plan,
+        index,
+        qpu_pairs=(),
+        qpu_ports_used=tuple(0 for _ in first.qpu_ports_used),
+        link_utilization=(),
+    )
+    problems = audit_topology_schedule_plan(empty, arch, model)
+    assert any("places no operation" in problem for problem in problems)
+
+
+@pytest.mark.parametrize("pair", [(0, 7), (-1, 1), (True, 2)])
+def test_audit_reports_pairs_outside_the_architecture_instead_of_crashing(pair):
+    """A negative index would wrap; a large one raised IndexError."""
+    from quport.schedule import audit_topology_schedule_plan
+
+    res, arch, model = _audited_case()
+    plan = res.schedule_plan
+    index = _first_round_layer(plan)
+
+    broken = _replace_first_round(plan, index, qpu_pairs=(pair,))
+    problems = audit_topology_schedule_plan(broken, arch, model)
+    assert any("outside the 3-QPU architecture" in problem for problem in problems)

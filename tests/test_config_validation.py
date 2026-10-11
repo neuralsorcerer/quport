@@ -184,3 +184,76 @@ def test_config_round_trips_whatever_the_suffix_case(
     dump_config(cfg, str(path))
 
     assert load_config(str(path)) == cfg
+
+
+def test_dump_config_writes_numpy_and_int_subclass_values(tmp_path: Path) -> None:
+    """A config the validators accept must save and load back in both formats."""
+    import numpy as np
+
+    from quport.config import dump_config, load_config
+
+    class FancyInt(int):
+        pass
+
+    cfg = MultiQPUConfig(
+        n_qpus=FancyInt(3),
+        compute_qubits_per_qpu=2,
+        optimization_level=np.arange(4)[2],
+        async_overlap=np.float64(0.25),
+    )
+    expected = MultiQPUConfig(
+        n_qpus=3, compute_qubits_per_qpu=2, optimization_level=2, async_overlap=0.25
+    )
+    suffixes = [".json"]
+    try:
+        import yaml  # noqa: F401
+
+        suffixes.append(".yaml")
+    except ImportError:  # pragma: no cover - yaml is a test extra
+        pass
+    for suffix in suffixes:
+        path = tmp_path / f"cfg{suffix}"
+        dump_config(cfg, str(path))
+        assert load_config(str(path)) == expected
+
+
+def test_a_failed_dump_leaves_the_existing_config_untouched(tmp_path: Path) -> None:
+    from quport.config import dump_config, load_config
+
+    path = tmp_path / "cfg.json"
+    dump_config(MultiQPUConfig(), str(path))
+    before = path.read_text(encoding="utf-8")
+
+    unserializable = MultiQPUConfig(grid_rows=object())  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        dump_config(unserializable, str(path))
+
+    assert path.read_text(encoding="utf-8") == before
+    assert load_config(str(path)) == MultiQPUConfig()
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda np: MultiQPUConfig(async_overlap=np.True_),
+        lambda np: __import__(
+            "quport.config", fromlist=["validate_epr_success_prob"]
+        ).validate_epr_success_prob(np.True_),
+        lambda np: __import__(
+            "quport.network", fromlist=["compute_traffic_matrix"]
+        ).compute_traffic_matrix({(0, 1): np.True_}, [0, 1], 2),
+        lambda np: __import__(
+            "quport.network", fromlist=["congestion_metrics"]
+        ).congestion_metrics({(0, 1): np.True_}),
+        lambda np: __import__(
+            "quport.partition", fromlist=["balanced_greedy_partition"]
+        ).balanced_greedy_partition(2, {(0, 1): np.True_}, 2, 1),
+    ],
+    ids=["async_overlap", "epr_success_prob", "traffic", "link-loads", "weights"],
+)
+def test_numpy_booleans_are_rejected_like_python_booleans(call: Any) -> None:
+    """``type(x) is bool`` misses ``numpy.bool_``, which ``float()`` accepts."""
+    import numpy as np
+
+    with pytest.raises(ValueError, match="boolean"):
+        call(np)

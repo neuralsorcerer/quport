@@ -1875,3 +1875,221 @@ def test_routed_reassembly_keeps_classical_feedforward_in_order() -> None:
     expected = classical(_instruction_trace(result.physical_circuit))
     assert expected == ["measure", "if_else", "measure"]
     assert classical(_instruction_trace(merged)) == expected
+
+
+def test_marker_indices_count_barriers_nested_in_control_flow() -> None:
+    """The emitted program inlines an ``if`` body, barriers and all.
+
+    A consumer counting barrier statements in the OpenQASM file must land on
+    the marker; skipping the nested barrier pointed it one statement early, at
+    a barrier on another qubit.
+    """
+    from qiskit import qasm3
+
+    from quport.distributed import remap_remote_ops_to_routed
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(1)
+    mapped.measure(1, 0)
+    with mapped.if_test((mapped.clbits[0], 1)):
+        mapped.x(1)
+        mapped.barrier(1)
+    mapped.cx(0, 3)
+
+    program = split_into_qpus(mapped, arch)
+    marker = program.remote_ops[0].qpu0_marker
+    statements = [
+        line.strip()
+        for line in qasm3.dumps(program.local_circuits[0]).splitlines()
+        if line.strip().startswith("barrier")
+    ]
+
+    assert marker == 1
+    assert statements[marker] == "barrier q[0];"
+    remapped = remap_remote_ops_to_routed(program.remote_ops, program.local_circuits)
+    assert remapped[0].qpu0_marker == marker
+
+
+def test_remap_counts_barriers_and_not_every_directive() -> None:
+    """A classical store is a directive too, but it is not a barrier."""
+    from qiskit.circuit.classical import expr
+
+    from quport.distributed import remap_remote_ops_to_routed
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    program = split_into_qpus(mapped, arch)
+
+    # A store reaches a program only if someone edits it in, since the split
+    # refuses one; the marker count must still skip it.
+    edited: dict[int, QuantumCircuit] = {}
+    for qpu, circuit in program.local_circuits.items():
+        rebuilt = circuit.copy_empty_like()
+        rebuilt.store(rebuilt.clbits[0], expr.lift(True))
+        for instruction in circuit.data:
+            rebuilt.append(instruction)
+        edited[qpu] = rebuilt
+
+    remapped = remap_remote_ops_to_routed(program.remote_ops, edited)
+    assert (remapped[0].qpu0_marker, remapped[0].qpu1_marker) == (0, 0)
+
+
+def _with_classical_storage(kind: str, n_qubits: int) -> QuantumCircuit:
+    from qiskit.circuit.classical import expr
+
+    circuit = QuantumCircuit(n_qubits, 1)
+    circuit.h(0)
+    circuit.cx(0, 3)
+    if kind == "store":
+        circuit.store(circuit.clbits[0], expr.lift(True))
+    elif kind == "var":
+        circuit.add_var("flag", expr.lift(False))
+    else:
+        circuit.add_stretch("gap")
+    return circuit
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("store", "classical store"),
+        ("var", "classical variables"),
+        ("stretch", "stretches"),
+    ],
+)
+def test_split_and_reassembly_refuse_classical_storage(kind: str, message: str) -> None:
+    """A store was broadcast to every program and then dropped by the merge."""
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = _with_classical_storage(kind, arch.n_phys)
+
+    with pytest.raises(ValueError, match=message):
+        split_into_qpus(mapped, arch)
+    with pytest.raises(ValueError, match=message):
+        reassemble_distributed_program(mapped, {}, [], arch)
+
+
+def test_a_classical_register_called_q_survives_the_round_trip() -> None:
+    """The per-QPU programs add a quantum register of their own, also ``q``."""
+    from qiskit import qasm3
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(
+        QuantumRegister(arch.n_phys, "data"), ClassicalRegister(1, "q")
+    )
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+
+    program = split_into_qpus(mapped, arch)
+    for circuit in program.local_circuits.values():
+        qasm3.dumps(circuit)
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, restore_layout=False
+    )
+
+    assert _instruction_trace(merged) == _instruction_trace(mapped)
+    assert [register.name for register in merged.cregs] == ["q"]
+
+
+def test_a_bad_manifest_leaves_an_existing_bundle_untouched(tmp_path: Path) -> None:
+    """Every artifact is validated before the first one is written."""
+    from quport.distributed import RemoteOp, write_distributed_program
+
+    bundle = tmp_path / "bundle"
+    write_distributed_program(
+        DistributedProgram(local_circuits={0: QuantumCircuit(2)}, remote_ops=[]),
+        bundle,
+    )
+    before = {path.name: path.read_text() for path in bundle.iterdir()}
+
+    changed = QuantumCircuit(2)
+    changed.h(0)
+    bad = DistributedProgram(
+        local_circuits={0: changed},
+        remote_ops=[
+            RemoteOp(
+                name="cx",
+                q0_phys=0,
+                q1_phys=0,
+                qpu0=0,
+                qpu1=1,
+                params=(),
+                clbits=(),
+                index=0,
+            )
+        ],
+    )
+    with pytest.raises(ValueError, match="distinct"):
+        write_distributed_program(bad, bundle)
+
+    assert {path.name: path.read_text() for path in bundle.iterdir()} == before
+
+
+def test_routed_reassembly_accepts_a_decomposed_instruction_writing_a_bit_twice() -> (
+    None
+):
+    """Routing turns one ``parity_readout`` into two accesses to its bit.
+
+    The order across QPUs is read from ``mapped``, which lists the instruction
+    once; a QPU whose accesses to a bit form a single run owns all of them.
+    """
+    from qiskit import transpile
+
+    from quport.distributed import (
+        reassemble_distributed_program,
+        remap_remote_ops_to_routed,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1, intra_topology="line"
+    )
+    arch = MultiQPUArchitecture(cfg)
+    readout = QuantumCircuit(2, 1, name="parity_readout")
+    readout.measure(0, 0)
+    readout.measure(1, 0)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.append(readout.to_instruction(), [0, 1], [0])
+
+    program = split_into_qpus(mapped, arch)
+    routed = {
+        qpu: transpile(
+            circuit,
+            coupling_map=arch.build_intra_coupling_map(qpu),
+            initial_layout=list(range(arch.n_phys)),
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=0,
+            layout_method="trivial",
+            seed_transpiler=0,
+        )
+        for qpu, circuit in program.local_circuits.items()
+    }
+    assert [i.operation.name for i in routed[0].data].count("measure") == 2
+
+    merged = reassemble_distributed_program(
+        mapped, routed, remap_remote_ops_to_routed(program.remote_ops, routed), arch
+    )
+
+    assert merged.count_ops()["measure"] == 2
+    measured = [
+        merged.find_bit(instruction.qubits[0]).index
+        for instruction in merged.data
+        if instruction.operation.name == "measure"
+    ]
+    assert sorted(measured) == [0, 1]
