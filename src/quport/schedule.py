@@ -15,6 +15,7 @@ from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit
 
+from quport._validation import is_boolean
 from quport.aggregation import (
     AggregationPlan,
     RemoteBlock,
@@ -22,7 +23,6 @@ from quport.aggregation import (
 )
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig, validate_epr_success_prob
-from quport.distributed import split_into_qpus
 from quport.entanglement import is_directive
 from quport.network import UNREACHABLE_DISTANCE, QpuEdge, path_edges
 
@@ -62,7 +62,7 @@ def _validated_nonnegative_int(value: object, *, label: str) -> int:
 
 
 def _validated_nonnegative_finite(value: object, *, label: str) -> float:
-    if isinstance(value, bool):
+    if is_boolean(value):
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))
@@ -192,13 +192,16 @@ def estimate_parallel_makespan(
     # Validate QPU mappings before downstream splitting/scheduling logic.
     qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
 
-    program = split_into_qpus(mapped, arch)
     t = [0.0] * arch.cfg.n_qpus
     remote_cost = lat.remote_cost
 
     # Build a simplified linear scan over original circuit instructions, applying costs.
 
-    remote_indices = {op.index for op in program.remote_ops}
+    # The remote events, chosen exactly as split_into_qpus chooses them. They
+    # are read off the circuit rather than off a split, which a circuit with
+    # classical variables cannot be turned into, but which every estimator
+    # here can schedule.
+    remote_indices = _cross_qpu_operation_indices(mapped, arch)
     steps = 0
     # When each classical bit was last touched. A measurement on one QPU and
     # the conditional on another that reads it share no qubit, so the QPU
@@ -209,8 +212,11 @@ def estimate_parallel_makespan(
     for idx, inst in enumerate(mapped.data):
         # Compiler directives (barriers) synchronize but consume no time; they
         # are never RemoteOps (split_into_qpus handles them separately). A
-        # barrier with no qubits spans the whole machine.
+        # barrier with no qubits spans the whole machine. A classical store is
+        # a directive too, but it touches no qubit and synchronizes nothing.
         if getattr(inst.operation, "_directive", False):
+            if not inst.qubits and inst.operation.name != "barrier":
+                continue
             spanned = set(_instruction_qpus(inst.qubits, qindex, phys_to_qpu))
             if not inst.qubits:
                 spanned = set(range(len(t)))
@@ -261,9 +267,7 @@ def estimate_parallel_makespan(
         for bit in bits:
             clbit_ready[bit] = finish
 
-    return ScheduleSummary(
-        makespan=max(t), steps=steps, remote_ops=len(program.remote_ops)
-    )
+    return ScheduleSummary(makespan=max(t), steps=steps, remote_ops=len(remote_indices))
 
 
 def estimate_parallel_makespan_layered(
@@ -1165,6 +1169,19 @@ def audit_topology_schedule_plan(
                         f"{spot}: names {len(rnd.qpu_pairs)} pairs for "
                         f"{rnd.unschedulable_ops} unschedulable operations"
                     )
+            elif not rnd.qpu_pairs:
+                # The estimator only closes a round once it has placed an
+                # operation, so a real round with none can only be padding.
+                problems.append(f"{spot}: places no operation but lasts {rnd.duration}")
+            elif any(
+                type(qpu) is not int or not 0 <= qpu < n_qpus
+                for pair in rnd.qpu_pairs
+                for qpu in pair
+            ):
+                problems.append(
+                    f"{spot}: pairs {list(rnd.qpu_pairs)} name a QPU outside the "
+                    f"{n_qpus}-QPU architecture"
+                )
             else:
                 expected_ports = [0] * n_qpus
                 expected_link: dict[QpuEdge, int] = {}
@@ -1190,7 +1207,7 @@ def audit_topology_schedule_plan(
                         f"{spot}: reports links {list(rnd.link_utilization)}, but its "
                         f"pairs consume {sorted(expected_link.items())}"
                     )
-                if rnd.qpu_pairs and not close(rnd.duration, worst + reconfig):
+                if not close(rnd.duration, worst + reconfig):
                     problems.append(
                         f"{spot}: lasts {rnd.duration}, but its slowest operation "
                         f"takes {worst + reconfig}"
@@ -1264,15 +1281,22 @@ def _count_cross_qpu_operations(
     operand elsewhere, matching :func:`quport.distributed.split_into_qpus` and
     every schedule estimator.
     """
+    return len(_cross_qpu_operation_indices(mapped, arch))
+
+
+def _cross_qpu_operation_indices(
+    mapped: QuantumCircuit, arch: MultiQPUArchitecture
+) -> set[int]:
+    """Instruction indices of the operations that span more than one QPU."""
     qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
-    count = 0
-    for instruction in mapped.data:
+    indices: set[int] = set()
+    for index, instruction in enumerate(mapped.data):
         if getattr(instruction.operation, "_directive", False):
             continue
         qpus = _instruction_qpus(instruction.qubits, qindex, phys_to_qpu)
         if len(qpus) >= 2 and _first_remote_partner(qpus) is not None:
-            count += 1
-    return count
+            indices.add(index)
+    return indices
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1537,10 @@ def estimate_entanglement_schedule(
 
     blocks = plan.blocks
     runtime = [_BlockRuntime() for _ in blocks]
+    # Blocks established and not yet released, by root. A gate a block serves
+    # runs on the cat copy's timeline, not the root's, so a barrier over the
+    # root has to reach the copy through these.
+    open_blocks: dict[int, set[int]] = {}
     starts: dict[int, list[int]] = {}
     members: dict[int, list[int]] = {}
     ends: dict[int, list[int]] = {}
@@ -1525,7 +1553,14 @@ def estimate_entanglement_schedule(
     qubit_ready = [0.0] * n_phys
     cindex = {clbit: index for index, clbit in enumerate(mapped.clbits)}
     clbit_ready = [0.0] * len(mapped.clbits)
-    port_pools = [_ResourcePool(ports[qpu]) for qpu in range(n_qpus)]
+    # A pool never serves more than two acquisitions per block -- a port pool
+    # one per block it hosts or roots, a link pool one per distribution, of
+    # which a teleport makes two -- and an untouched server is always the
+    # earliest free, so servers beyond that many are never reached. Capping
+    # there keeps a huge budget, the documented way to remove a constraint,
+    # from allocating one slot per server, and changes no result.
+    pool_cap = 2 * len(blocks)
+    port_pools = [_ResourcePool(min(ports[qpu], pool_cap)) for qpu in range(n_qpus)]
     link_pools: dict[QpuEdge, _ResourcePool] = {}
     link_busy: dict[QpuEdge, float] = {}
     port_intervals: list[list[tuple[float, float]]] = [[] for _ in range(n_qpus)]
@@ -1538,7 +1573,7 @@ def estimate_entanglement_schedule(
     def link_pool(edge: QpuEdge) -> _ResourcePool:
         pool = link_pools.get(edge)
         if pool is None:
-            pool = _ResourcePool(link_cap)
+            pool = _ResourcePool(min(link_cap, pool_cap))
             link_pools[edge] = pool
         return pool
 
@@ -1578,12 +1613,13 @@ def estimate_entanglement_schedule(
             or not port_pools[source].available()
         ):
             state.feasible = False
-            state.ready = qubit_ready[block.root_phys] + UNSCHEDULABLE_PENALTY
-            qubit_ready[block.root_phys] = state.ready
-            # The gates this block would have served are counted where they are
-            # reached, so an operation gathered by several blocks -- a wide gate
-            # needing one teleport per foreign operand -- counts once, not once
-            # per block.
+            state.ready = qubit_ready[block.root_phys]
+            open_blocks.setdefault(block.root_phys, set()).add(ordinal)
+            # The gates this block would have served are counted, and charged
+            # the penalty, where they are reached: once per gate, as for a gate
+            # the aggregator could not serve at all, so an operation gathered by
+            # several blocks -- a wide gate needing one teleport per foreign
+            # operand -- counts once, not once per block.
             return
 
         state.hops = hops
@@ -1602,6 +1638,7 @@ def estimate_entanglement_schedule(
         state.ready = ready
         state.port_start = start
         state.holds_port = True
+        open_blocks.setdefault(block.root_phys, set()).add(ordinal)
         # The root's own port is only needed until the entangler completes.
         port_pools[source].release(ready)
         port_intervals[source].append((start, ready))
@@ -1612,6 +1649,7 @@ def estimate_entanglement_schedule(
         block = blocks[ordinal]
         state = runtime[ordinal]
         host = block.remote_qpu
+        open_blocks.get(block.root_phys, set()).discard(ordinal)
 
         if not state.feasible:
             qubit_ready[block.root_phys] = max(
@@ -1641,11 +1679,23 @@ def estimate_entanglement_schedule(
         qubits = [qindex[qubit] for qubit in instruction.qubits]
 
         if is_directive(operation):
+            # A classical store is a directive too, but it touches no qubit and
+            # synchronizes nothing; a barrier with no qubits spans them all.
+            if not qubits and operation.name != "barrier":
+                continue
             targets = qubits if qubits else list(range(n_phys))
+            copies = [
+                ordinal for qubit in targets for ordinal in open_blocks.get(qubit, ())
+            ]
             if targets:
-                sync = max(qubit_ready[qubit] for qubit in targets)
+                sync = max(
+                    [qubit_ready[qubit] for qubit in targets]
+                    + [runtime[ordinal].ready for ordinal in copies]
+                )
                 for qubit in targets:
                     qubit_ready[qubit] = sync
+                for ordinal in copies:
+                    runtime[ordinal].ready = sync
             continue
 
         if not qubits:
@@ -1660,9 +1710,26 @@ def estimate_entanglement_schedule(
         ordinals = members.get(index)
         if ordinals is not None:
             remote_gates += 1
-            if any(not runtime[ordinal].feasible for ordinal in ordinals):
-                unschedulable += 1
             host = blocks[ordinals[0]].remote_qpu
+            if any(not runtime[ordinal].feasible for ordinal in ordinals):
+                # Charged like a gate no block serves: the penalty, on every
+                # operand, once for this gate however many blocks gather it.
+                unschedulable += 1
+                start = max(
+                    [runtime[ordinal].ready for ordinal in ordinals]
+                    + [qubit_ready[qubit] for qubit in qubits]
+                    + [after]
+                )
+                finish = start + UNSCHEDULABLE_PENALTY
+                for ordinal in ordinals:
+                    runtime[ordinal].ready = finish
+                for qubit in qubits:
+                    qubit_ready[qubit] = finish
+                for bit in bits:
+                    clbit_ready[bit] = finish
+                for ordinal in ends.get(index, ()):
+                    release(ordinal)
+                continue
             roots = {blocks[ordinal].root_phys for ordinal in ordinals}
             duration = lat.swap if operation.name == "swap" else lat.twoq
             start = max(

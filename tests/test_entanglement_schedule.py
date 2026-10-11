@@ -622,3 +622,142 @@ def test_a_swap_is_charged_swap_time_not_two_qubit_time() -> None:
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"link_capacity": 0}, {"inter_topology": "degree_d", "inter_degree": 0}],
+    ids=["no-link-capacity", "no-route"],
+)
+def test_every_gate_of_an_infeasible_block_pays_the_penalty(
+    overrides: dict[str, object],
+) -> None:
+    """Each unschedulable gate is charged, not each block that would serve it.
+
+    Charging once per block made three lost gates cost one penalty when one
+    block would have aggregated them, and three when the plan split them --
+    and three again when no port could serve them at all.
+    """
+    from quport.schedule import UNSCHEDULABLE_PENALTY
+
+    arch = _arch(**overrides)
+    qc = QuantumCircuit(arch.n_phys)
+    for _ in range(3):
+        qc.cx(0, 4)
+
+    plan = aggregate_remote_operations(qc, arch)
+    assert len(plan.blocks) == 1
+    summary = estimate_entanglement_schedule(qc, arch, LatencyModel(), plan=plan)
+
+    assert summary.unschedulable_gates == 3
+    assert summary.makespan >= 3 * UNSCHEDULABLE_PENALTY
+
+    unserved = estimate_entanglement_schedule(qc, arch, LatencyModel(), ports_per_qpu=0)
+    assert unserved.makespan == pytest.approx(summary.makespan, rel=1e-6)
+
+
+@pytest.mark.parametrize("before_barrier", [True, False])
+def test_a_barrier_over_a_root_orders_the_gates_its_cat_copy_serves(
+    before_barrier: bool,
+) -> None:
+    """Gates on a cat copy run on the copy's timeline, not the root's.
+
+    A barrier over the root still has to order them against the work on its
+    other side, or the makespan drops below the circuit's dependency chain.
+    """
+    arch = _arch()
+    model = LatencyModel(oneq=1.0, twoq=10.0, epr_gen=0.0)
+    qc = QuantumCircuit(arch.n_phys)
+    if before_barrier:
+        for _ in range(100):
+            qc.x(4)
+        qc.cz(0, 4)  # the copy of qubit 0 serves this on QPU 1 ...
+        qc.barrier(0, 1)
+        for _ in range(100):
+            qc.x(1)  # ... and this must wait for it
+        qc.cz(0, 4)
+    else:
+        qc.cz(0, 4)
+        for _ in range(100):
+            qc.x(1)
+        qc.barrier(0, 1)
+        qc.cz(0, 4)  # must wait for the x(1) run before the barrier ...
+        for _ in range(100):
+            qc.x(4)  # ... and this for it
+
+    plan = aggregate_remote_operations(qc, arch)
+    assert len(plan.blocks) == 1, "the copy must stay live across the barrier"
+    summary = estimate_entanglement_schedule(qc, arch, model, plan=plan)
+
+    # 100 x-gates, a remote gate (10), then 100 more x-gates on the far side.
+    assert summary.makespan >= 210.0
+
+
+def test_a_huge_comm_budget_measures_the_unconstrained_schedule() -> None:
+    """Passing a large budget is the documented way to lift a constraint."""
+    import sys
+
+    arch = _arch()
+    qc = random_benchmark_circuit(arch.n_phys, 6, 3)
+    model = LatencyModel()
+
+    ample = estimate_entanglement_schedule(qc, arch, model, ports_per_qpu=64)
+    for budget in (sys.maxsize, 2**64):
+        huge = estimate_entanglement_schedule(qc, arch, model, ports_per_qpu=budget)
+        assert huge.makespan == ample.makespan
+
+    wide = MultiQPUArchitecture(
+        MultiQPUConfig(**{**arch.cfg.__dict__, "link_capacity": sys.maxsize})
+    )
+    roomy = MultiQPUArchitecture(
+        MultiQPUConfig(**{**arch.cfg.__dict__, "link_capacity": 64})
+    )
+    assert (
+        estimate_entanglement_schedule(qc, wide, model).makespan
+        == estimate_entanglement_schedule(qc, roomy, model).makespan
+    )
+
+
+def test_a_classical_store_synchronizes_nothing() -> None:
+    """A store is a directive with no qubits, not a barrier over the machine."""
+    from qiskit.circuit.classical import expr
+
+    from quport.schedule import (
+        estimate_parallel_makespan,
+        estimate_parallel_makespan_layered,
+        estimate_parallel_makespan_topology,
+    )
+
+    arch = _arch()
+    model = LatencyModel(oneq=1.0)
+    for with_store in (False, True):
+        qc = QuantumCircuit(arch.n_phys, 1)
+        for _ in range(50):
+            qc.x(0)
+        if with_store:
+            qc.store(qc.clbits[0], expr.lift(True))
+        qc.x(4)  # independent work on the other QPU
+        for estimator in (
+            estimate_parallel_makespan,
+            estimate_parallel_makespan_layered,
+            estimate_parallel_makespan_topology,
+            estimate_entanglement_schedule,
+        ):
+            assert estimator(qc, arch, model).makespan == 50.0, estimator.__name__
+
+
+def test_the_linear_estimator_schedules_classical_variables() -> None:
+    """It no longer needs a split, which a circuit with variables cannot make."""
+    from qiskit.circuit.classical import expr
+
+    from quport.schedule import estimate_parallel_makespan
+
+    arch = _arch()
+    qc = QuantumCircuit(arch.n_phys)
+    flag = qc.add_var("flag", False)
+    qc.x(0)
+    qc.cx(0, 4)
+    qc.store(flag, expr.lift(True))
+
+    summary = estimate_parallel_makespan(qc, arch, LatencyModel())
+    assert summary.remote_ops == 1
