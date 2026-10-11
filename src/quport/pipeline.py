@@ -11,10 +11,13 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, TypeAlias, TypeVar
+from typing import TextIO, TypeAlias, TypeVar, cast
 
 from qiskit import QuantumCircuit, transpile
+from qiskit.circuit.controlflow import CONTROL_FLOW_OP_NAMES
+from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
 from qiskit.circuit.random import random_circuit
+from qiskit.transpiler.preset_passmanagers.plugin import list_stage_plugins
 
 from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
@@ -28,6 +31,7 @@ from quport.interaction import (
 )
 from quport.layout import compute_layout_hints, naive_layout
 from quport.metrics import CircuitMetrics, compute_metrics
+from quport.network import build_qpu_graph, topology_metrics
 from quport.partition import (
     PartitionDiagnostics,
     PartitionResult,
@@ -167,6 +171,83 @@ def _translate_to_basis(
     return transpile(
         qc, basis_gates=list(basis_gates), optimization_level=0, seed_transpiler=seed
     )
+
+
+def validate_transpiler_settings(cfg: MultiQPUConfig) -> None:
+    """Check the config's transpiler settings name things Qiskit has.
+
+    ``MultiQPUConfig`` checks only that they are non-empty strings; Qiskit
+    rejects an unknown layout or routing plugin, a basis gate it does not
+    define, or a basis gate on three or more qubits next to a coupling map --
+    which every QuPort pipeline routes on -- but only once ``transpile`` runs,
+    after partitioning. This applies the same rules up front, read from
+    Qiskit's own registries, so what passes here is what ``transpile`` accepts.
+    """
+    for stage, method in (
+        ("layout", cfg.layout_method),
+        ("routing", cfg.routing_method),
+    ):
+        available = list_stage_plugins(stage)
+        if method not in available:
+            raise ValueError(
+                f"{stage}_method {method!r} is not a Qiskit {stage} plugin; "
+                f"choose one of: {', '.join(available)}"
+            )
+    standard = get_standard_gate_name_mapping()
+    for gate in cfg.basis_gates:
+        if gate in CONTROL_FLOW_OP_NAMES:
+            continue
+        operation = standard.get(gate)
+        if operation is None:
+            raise ValueError(
+                f"basis_gates entry {gate!r} is not a standard Qiskit gate"
+            )
+        if operation.num_qubits > 2:
+            raise ValueError(
+                f"basis_gates entry {gate!r} acts on {operation.num_qubits} qubits; "
+                "Qiskit routes on a coupling map only with gates on at most two"
+            )
+
+
+def _require_routable(
+    qc: QuantumCircuit, layout: Sequence[int], arch: MultiQPUArchitecture
+) -> None:
+    """Refuse a global routing problem Qiskit cannot solve, with a clear reason.
+
+    Global routing can only move state along coupling-map edges, so every
+    multi-qubit operation needs its operands placed in one connected part of
+    the machine. With no comm ports, or an interconnect that leaves QPUs
+    unreachable, it may not be -- and Qiskit then fails deep inside routing.
+    The distributed compiler handles the same machine: it schedules such
+    operations as unschedulable rather than routing them.
+    """
+    n_phys = arch.n_phys
+    parent = list(range(n_phys))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for u, v in arch.build_coupling_map().get_edges():
+        parent[find(u)] = find(v)
+
+    index = {qubit: position for position, qubit in enumerate(qc.qubits)}
+    for instruction in qc.data:
+        if len(instruction.qubits) < 2 or getattr(
+            instruction.operation, "_directive", False
+        ):
+            continue
+        physical = [layout[index[qubit]] for qubit in instruction.qubits]
+        if len({find(p) for p in physical}) > 1:
+            qpus = sorted({arch.qpu_of_phys(p) for p in physical})
+            raise ValueError(
+                f"global routing cannot connect QPUs {qpus}: no inter-QPU path "
+                "joins them (comm_qubits_per_qpu=0 or a disconnected "
+                "inter_topology); compile_distributed schedules such operations "
+                "as unschedulable instead"
+            )
 
 
 def map_and_transpile(
@@ -345,6 +426,7 @@ def map_and_transpile(
 
     hints = compute_layout_hints(qc_basis, arch, part, comm_mode=comm_mode)
     mapping_time = time.perf_counter() - t0
+    _require_routable(qc_basis, hints.initial_layout, arch)
 
     # Step 2: transpile on the global coupling map using SABRE
     t1 = time.perf_counter()
@@ -383,7 +465,13 @@ def transpile_baseline(
     latency: LatencyModel | None = None,
     seed: int | None = None,
 ) -> MapResult:
-    """Baseline: translate to basis then let transpiler pick layout/routing (no partition hints)."""
+    """Baseline: translate to basis, place logical qubit ``i`` on physical qubit
+    ``i``, and let the transpiler route (no partition hints).
+
+    The identity layout is deliberate -- it is deterministic and exposes the
+    inter-QPU penalty an unpartitioned placement pays -- so ``cfg.layout_method``
+    does not apply: Qiskit skips its layout stage when given an initial layout.
+    """
     latency = latency or LatencyModel()
     if seed is not None:
         seed = validate_nonnegative_integral(seed, label="seed")
@@ -400,6 +488,7 @@ def transpile_baseline(
     # Optional: initial layout = identity (logical i -> physical i)
     # This baseline is deterministic and exposes inter-QPU penalties.
     init_layout = naive_layout(qc_basis.num_qubits)
+    _require_routable(qc_basis, init_layout, arch)
 
     t0 = time.perf_counter()
     mapped = transpile(
@@ -440,6 +529,11 @@ def random_benchmark_circuit(
     n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
     depth_value = validate_nonnegative_integral(depth, label="depth")
     seed_value = validate_nonnegative_integral(seed, label="seed")
+    if n_logical_value == 0:
+        # Qiskit's generator rejects zero qubits with an unrelated error about
+        # its operand distribution; the empty circuit is what was asked for,
+        # and every pipeline handles it.
+        return QuantumCircuit(0)
     return random_circuit(
         num_qubits=n_logical_value,
         depth=depth_value,
@@ -586,17 +680,44 @@ def sweep_topologies(
     latency = LatencyModel()
     summary: list[SweepSummaryRow] = []
 
+    def setting_config(intra: str, inter: str, ports: int) -> MultiQPUConfig:
+        return MultiQPUConfig(
+            n_qpus=n_qpus_value,
+            compute_qubits_per_qpu=compute_per_qpu_value,
+            comm_qubits_per_qpu=ports,
+            intra_topology=cast(IntraTopology, intra),
+            inter_topology=cast(InterTopology, inter),
+            inter_degree=inter_degree_value,
+        )
+
+    # Every setting that runs is routed globally, which needs a connected
+    # machine. Check them all before running any, so a bad setting late in the
+    # grid cannot throw away the ones already computed.
+    disconnected: list[str] = []
     for intra in intra_values:
         for inter in inter_values:
             for ports in comm_port_values:
-                cfg = MultiQPUConfig(
-                    n_qpus=n_qpus_value,
-                    compute_qubits_per_qpu=compute_per_qpu_value,
-                    comm_qubits_per_qpu=ports,
-                    intra_topology=intra,
-                    inter_topology=inter,
-                    inter_degree=inter_degree_value,
-                )
+                setting = setting_config(intra, inter, ports)
+                if (
+                    n_qpus_value <= 1
+                    or n_logical_value > setting.total_physical_qubits()
+                ):
+                    continue
+                if not topology_metrics(build_qpu_graph(setting)).connected:
+                    disconnected.append(
+                        f"(intra={intra}, inter={inter}, ports={ports})"
+                    )
+    if disconnected:
+        raise ValueError(
+            "sweep_topologies routes every circuit globally, which needs a "
+            "connected inter-QPU network; these settings leave QPUs unreachable: "
+            + ", ".join(disconnected)
+        )
+
+    for intra in intra_values:
+        for inter in inter_values:
+            for ports in comm_port_values:
+                cfg = setting_config(intra, inter, ports)
                 if n_logical_value > cfg.total_physical_qubits():
                     continue
 
@@ -659,6 +780,11 @@ def sweep_topologies(
                         "transpile_time_mean": mean("transpile_time_s"),
                     }
 
+                # With no trials there is nothing to summarise: a row of zeros
+                # would read as a measured zero cost. benchmark_random_circuits
+                # writes only its header in the same case.
+                if trials_value == 0:
+                    continue
                 for strategy_name in selected_strategies:
                     summary.append(agg(strategy_name))
 

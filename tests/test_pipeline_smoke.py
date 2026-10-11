@@ -90,10 +90,12 @@ def test_sweep_writes_reproducible_topology_labels(tmp_path: Path) -> None:
 
     out = tmp_path / "sweep.csv"
 
+    # One trivial trial: a sweep with no trials writes no summary rows, since a
+    # row of zeros would read as a measured cost.
     sweep_topologies(
         n_logical=1,
         depth=0,
-        trials=0,
+        trials=1,
         seed=5,
         out_csv=str(out),
         intra_topologies=("clique",),
@@ -331,7 +333,7 @@ def test_sweep_can_include_tpccap_sa_strategy(tmp_path: Path) -> None:
     sweep_topologies(
         n_logical=1,
         depth=0,
-        trials=0,
+        trials=1,
         seed=5,
         out_csv=str(out),
         intra_topologies=("clique",),
@@ -342,7 +344,8 @@ def test_sweep_can_include_tpccap_sa_strategy(tmp_path: Path) -> None:
         strategies=("tpccap_sa",),
     )
 
-    assert "3.0" in out.read_text(encoding="utf-8")
+    rows = out.read_text(encoding="utf-8").splitlines()[1:]
+    assert [row.split(",")[3] for row in rows] == ["3.0"]
 
 
 def test_benchmark_preserves_requested_strategy_order() -> None:
@@ -453,10 +456,43 @@ def test_benchmark_method_labels_are_stable_copy() -> None:
     assert benchmark_method_labels()[4.0] == "cluster"
 
 
-def test_sweep_supports_cluster_strategy_with_zero_trials(tmp_path: Path) -> None:
+def test_sweep_supports_cluster_strategy(tmp_path: Path) -> None:
     from quport.pipeline import sweep_topologies
 
     out = tmp_path / "sweep_cluster.csv"
+
+    sweep_topologies(
+        n_logical=1,
+        depth=0,
+        trials=1,
+        seed=5,
+        out_csv=str(out),
+        intra_topologies=("clique",),
+        inter_topologies=("switch",),
+        comm_ports=(0,),
+        compute_per_qpu=1,
+        n_qpus=1,
+        strategies=("cluster",),
+    )
+
+    header, *rows = out.read_text(encoding="utf-8").splitlines()
+    assert header == (
+        "intra,inter,ports,method,swaps_mean,remote_2q_mean,depth_mean,"
+        "cost_mean,cost_median,transpile_time_mean"
+    )
+    # A one-qubit, depth-0 circuit: nothing to swap, route, or pay for.
+    assert len(rows) == 1
+    assert rows[0].startswith("clique,switch,0.0,4.0,0.0,0.0,0.0,0.0,0.0,")
+
+
+def test_sweep_with_zero_trials_writes_no_summary_rows(tmp_path: Path) -> None:
+    """No trials means no sample; a row of zeros would read as a measured cost.
+
+    ``benchmark_random_circuits`` writes only its header in the same case.
+    """
+    from quport.pipeline import sweep_topologies
+
+    out = tmp_path / "sweep_empty.csv"
 
     sweep_topologies(
         n_logical=1,
@@ -475,7 +511,6 @@ def test_sweep_supports_cluster_strategy_with_zero_trials(tmp_path: Path) -> Non
     assert out.read_text(encoding="utf-8") == (
         "intra,inter,ports,method,swaps_mean,remote_2q_mean,depth_mean,"
         "cost_mean,cost_median,transpile_time_mean\n"
-        "clique,switch,0.0,4.0,0.0,0.0,0.0,0.0,0.0,0.0\n"
     )
 
 

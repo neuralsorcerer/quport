@@ -39,6 +39,7 @@ from quport.pipeline import (
     map_and_transpile,
     random_benchmark_circuit,
     sweep_topologies,
+    validate_transpiler_settings,
 )
 from quport.schedule import (
     audit_entanglement_schedule,
@@ -110,7 +111,7 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
     input_path = Path(input_qasm)
     try:
         source = input_path.read_text(encoding="utf-8-sig")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise typer.BadParameter(
             f"Unable to read --input-qasm file {input_qasm!r}: {exc}"
         ) from exc
@@ -122,7 +123,14 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
     def parse_qasm2() -> QuantumCircuit:
         # `qasm2.load` appends the input file's own directory to the include
         # path; keep that, so a program including a sibling file still resolves.
-        return qasm2.loads(source, include_path=(".", str(input_path.parent)))
+        # Qiskit's own exporter writes gates such as `sx`, `swap` and `cp` that
+        # the paper-era qelib1.inc lacks; `QuantumCircuit.from_qasm_file` reads
+        # them through the legacy definitions, and so must this.
+        return qasm2.loads(
+            source,
+            include_path=(".", str(input_path.parent)),
+            custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS,
+        )
 
     def parse_qasm3() -> QuantumCircuit:
         return qasm3.loads(source)
@@ -216,10 +224,11 @@ def _load_config_or_default(config: str | None) -> MultiQPUConfig:
     used to report a table for a config every other command rejects.
 
     That includes the fields read lazily. The grid dimensions and
-    ``inter_degree`` are checked only when a coupling map is built, and the
-    link and switch limits only when a schedule is estimated -- for
+    ``inter_degree`` are read only when a coupling map is built, and the link
+    and switch limits only when a schedule is estimated -- for
     ``compile-dist``, after partitioning and routing have already run -- so all
-    of them are checked here, by the same code that reads them later.
+    of them are checked here, by the same code that reads them later. So are
+    the transpiler settings, against Qiskit's own plugin and gate registries.
     ``load_config`` also raises
     ``RuntimeError`` when a YAML path is requested without the optional PyYAML
     dependency, whose message is the install hint, matching how the plotting
@@ -230,8 +239,8 @@ def _load_config_or_default(config: str | None) -> MultiQPUConfig:
     try:
         cfg = load_config(config)
         validate_architecture_config(cfg)
-        MultiQPUArchitecture(cfg).build_coupling_map()
         validate_network_limits(cfg)
+        validate_transpiler_settings(cfg)
         return cfg
     except RuntimeError as exc:
         raise typer.BadParameter(str(exc)) from exc
