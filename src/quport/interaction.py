@@ -14,7 +14,7 @@ from typing import SupportsFloat, SupportsIndex, TypeAlias, cast
 
 from qiskit import QuantumCircuit
 
-from quport._validation import validate_nonnegative_integral
+from quport._validation import is_boolean, validate_nonnegative_integral
 
 WeightValue: TypeAlias = SupportsFloat | SupportsIndex | str
 
@@ -39,7 +39,7 @@ def _iter_validated_weights(
         j = int(j_raw)
         if i < 0 or j < 0 or i >= n_value or j >= n_value:
             raise ValueError("weights contain out-of-range logical indices")
-        if type(raw_weight) is bool:
+        if is_boolean(raw_weight):
             raise ValueError("weights must be numeric values, not booleans")
         try:
             weight = float(cast(SupportsFloat | SupportsIndex | str, raw_weight))
@@ -119,7 +119,7 @@ def cut_weight(
 
 def validate_temporal_decay(decay: object, *, label: str = "decay") -> float:
     """Validate and normalize temporal 2Q-weight decay factors."""
-    if type(decay) is bool:
+    if is_boolean(decay):
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         decay_value = float(cast(SupportsFloat | SupportsIndex | str, decay))

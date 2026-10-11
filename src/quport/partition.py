@@ -17,6 +17,7 @@ from typing import Literal, SupportsFloat, SupportsIndex, cast
 # `ebit_objective` re-validates the partition and distance table on every call,
 # which the annealing loop invokes thousands of times per run. Inputs are
 # validated once at the public partitioner boundary instead.
+from quport._validation import is_boolean
 from quport.hypergraph import PacketDecomposition, _ebit_objective_fast
 from quport.interaction import cut_weight, degree
 from quport.network import (
@@ -84,7 +85,7 @@ def _validate_and_normalize_partition_inputs(
             raise ValueError("weights keys must contain integer logical indices")
         if u < 0 or v < 0 or u >= n or v >= n:
             raise ValueError("weights contain out-of-range logical indices")
-        if type(w_raw) is bool:
+        if is_boolean(w_raw):
             raise ValueError("weights must be numeric values, not booleans")
         try:
             w = float(w_raw)
@@ -116,7 +117,7 @@ def _build_weighted_adjacency(
 
 def _coerce_finite_float(value: object, *, label: str) -> float:
     """Return a finite float for numeric runtime parameters."""
-    if type(value) is bool:
+    if is_boolean(value):
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))
@@ -763,7 +764,7 @@ def _validate_sp_dimensions(sp: QpuShortestPaths, n_qpus: int) -> None:
             raise ValueError("shortest-path dimensions do not match n_qpus")
         out_row: list[float] = []
         for d in row:
-            if type(d) is bool:
+            if is_boolean(d):
                 raise ValueError("shortest-path distances must be numeric")
             try:
                 d_float = float(d)

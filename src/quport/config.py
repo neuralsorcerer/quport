@@ -11,6 +11,7 @@ import importlib.util
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Literal
 
@@ -272,6 +273,27 @@ def load_config(path: str) -> MultiQPUConfig:
     return MultiQPUConfig(**_validate_config_data(data, path))
 
 
+def _plain_value(value: object) -> object:
+    """Return ``value`` as the built-in type both encoders accept.
+
+    A config may hold any integral or real number its validators accept --
+    a NumPy integer, an ``int`` subclass -- which the JSON encoder or
+    PyYAML's safe dumper then refuses; they are written as the numbers they
+    are. Sequences (the basis gates) become lists of the same.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        return float(value)
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, Sequence):
+        return [_plain_value(item) for item in value]
+    return value
+
+
 def dump_config(cfg: MultiQPUConfig, path: str) -> None:
     """Save MultiQPUConfig to JSON or YAML.
 
@@ -279,14 +301,16 @@ def dump_config(cfg: MultiQPUConfig, path: str) -> None:
     The directory the path names is created, as ``write_remote_ops_json`` does,
     so writing a config into a fresh results directory does not fail.
     """
-    data: dict[str, Any] = asdict(cfg)
+    data = {key: _plain_value(value) for key, value in asdict(cfg).items()}
+    # Serialize before opening the target: a value the encoder rejects must
+    # not leave the file that was there truncated or empty.
+    if _is_yaml_path(path):
+        yaml = _load_yaml_module()
+        text = yaml.safe_dump(data, sort_keys=False)
+    else:
+        text = json.dumps(data, indent=2)
     parent = Path(path).parent
     if parent != Path(""):
         parent.mkdir(parents=True, exist_ok=True)
-    if _is_yaml_path(path):
-        yaml = _load_yaml_module()
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.safe_dump(data, f, sort_keys=False)
-    else:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)

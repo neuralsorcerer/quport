@@ -313,6 +313,8 @@ def _window_lookup(windows: Sequence[TemporalWindow]) -> tuple[list[int], int]:
     """Validate window contiguity and return ``(starts, last_stop)`` for bisect."""
     if not windows:
         raise ValueError("windows must not be empty")
+    if not all(isinstance(window, TemporalWindow) for window in windows):
+        raise ValueError("windows must contain TemporalWindow instances")
     if windows[0].start != 0:
         # Instructions before the first window would have no assignment to be
         # costed against, and a lookup for one would silently fall through to
@@ -321,8 +323,6 @@ def _window_lookup(windows: Sequence[TemporalWindow]) -> tuple[list[int], int]:
     starts: list[int] = []
     expected = windows[0].start
     for index, window in enumerate(windows):
-        if not isinstance(window, TemporalWindow):
-            raise ValueError("windows must contain TemporalWindow instances")
         if window.start != expected:
             raise ValueError(
                 f"windows must be contiguous: window {index} starts at "

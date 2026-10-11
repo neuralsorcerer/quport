@@ -14,6 +14,7 @@ from typing import SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit
 
+from quport._validation import is_boolean
 from quport.architecture import MultiQPUArchitecture
 from quport.interaction import extract_twoq_weights
 
@@ -37,7 +38,7 @@ def _validate_positive_int(value: object, *, label: str) -> int:
 
 def _validate_nonnegative_float(value: object, *, label: str) -> float:
     """Return a finite non-negative float, rejecting booleans."""
-    if type(value) is bool:
+    if is_boolean(value):
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))
@@ -101,7 +102,7 @@ def _iter_validated_layout_weights(
             raise ValueError("weights keys must contain integer logical indices")
         if i < 0 or j < 0 or i >= n_logical or j >= n_logical:
             raise ValueError("weights contain out-of-range logical indices")
-        if type(weight_raw) is bool:
+        if is_boolean(weight_raw):
             raise ValueError("weights must be numeric values, not booleans")
         try:
             weight = float(cast(SupportsFloat | SupportsIndex | str, weight_raw))

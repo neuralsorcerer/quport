@@ -1260,9 +1260,10 @@ def test_ecmp_rejects_a_distance_matrix_no_path_can_satisfy() -> None:
     """A hand-built distance table can claim a distance the graph cannot realize.
 
     Here every pair claims distance 2, so no pair is adjacent and no midpoint
-    exists. The entry check passes -- 2 is a finite distance -- and only the
-    path-count check downstream can catch it. Routing anyway would silently
-    account the load onto no links at all.
+    exists. The entry check passes -- 2 is a finite distance -- but the table
+    is not the graph's own shortest-path distances, which is checked before
+    anything is routed. Routing anyway would silently account the load onto no
+    links at all.
     """
     distances = [[0, 2, 2], [2, 0, 2], [2, 2, 0]]
     paths = QpuShortestPaths(
@@ -1273,7 +1274,7 @@ def test_ecmp_rejects_a_distance_matrix_no_path_can_satisfy() -> None:
     traffic = [[0.0] * 3 for _ in range(3)]
     traffic[0][2] = traffic[2][0] = 5.0
 
-    with pytest.raises(ValueError, match="no path between QPU 0 and 2"):
+    with pytest.raises(ValueError, match="does not match the graph's distance"):
         route_link_loads(traffic, paths, mode="ecmp")
 
 

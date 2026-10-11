@@ -10,6 +10,18 @@ import math
 from numbers import Integral
 from typing import SupportsFloat, SupportsIndex, cast
 
+import numpy as np
+
+
+def is_boolean(value: object) -> bool:
+    """True for a Python or NumPy boolean.
+
+    ``type(value) is bool`` misses ``numpy.bool_``, which ``float()`` then
+    accepts as 0.0 or 1.0, so a validator that promises to reject booleans has
+    to check for both before converting.
+    """
+    return isinstance(value, bool | np.bool_)
+
 
 def validate_nonnegative_integral(value: object, *, label: str) -> int:
     """Return a non-negative integer, rejecting booleans and non-integral values."""
@@ -23,7 +35,7 @@ def validate_nonnegative_integral(value: object, *, label: str) -> int:
 
 def validate_nonnegative_finite_float(value: object, *, label: str) -> float:
     """Return a finite non-negative float, rejecting booleans."""
-    if type(value) is bool:
+    if is_boolean(value):
         raise ValueError(f"{label} must be numeric, not boolean")
     try:
         out = float(cast(SupportsFloat | SupportsIndex | str, value))

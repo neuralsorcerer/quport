@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from numbers import Integral
 from typing import Callable, Literal, SupportsFloat, SupportsIndex, cast, get_args
 
+from quport._validation import is_boolean
 from quport.config import InterTopology, MultiQPUConfig
 
 QpuEdge = tuple[int, int]  # undirected edge (min, max)
@@ -224,7 +225,7 @@ def _iter_validated_positive_weight_edges(
             raise ValueError("weights contain negative logical index")
         if i >= part_len or j >= part_len:
             raise ValueError("partition length is smaller than max logical index")
-        if type(w_raw) is bool:
+        if is_boolean(w_raw):
             raise ValueError("weights must be numeric values, not booleans")
         try:
             w = float(w_raw)
@@ -376,7 +377,7 @@ def _validate_square_rows(
 
 def _coerce_traffic_value(value: object) -> float:
     """Coerce a traffic-matrix entry to float with deterministic errors."""
-    if type(value) is bool:
+    if is_boolean(value):
         raise ValueError("traffic matrix must contain numeric values, not booleans")
     if isinstance(value, str | bytes | bytearray | memoryview):
         raise ValueError("traffic matrix must contain numeric values")
@@ -660,17 +661,20 @@ def prepare_routing_tables(
         dist_matrix = _validate_ecmp_distance_matrix(sp.dist, n=n)
         neighbors = _neighbors_from_distance_matrix(dist_matrix)
         if sp.adj is not None:
-            if len(sp.adj) != n:
+            adj_rows = _as_nonstring_sequence(sp.adj, label="shortest-path adjacency")
+            if len(adj_rows) != n:
                 raise ValueError(
                     "shortest-path adjacency dimensions do not match traffic matrix"
                 )
             normalized_adj = _normalize_undirected_adjacency(
-                sp.adj, label="shortest-path adjacency"
+                cast(Sequence[Sequence[int]], adj_rows),
+                label="shortest-path adjacency",
             )
             if normalized_adj != neighbors:
                 raise ValueError(
                     "shortest-path adjacency must align with unit distances"
                 )
+        _require_graph_distances(dist_matrix, neighbors)
         return RoutingTables(
             n=n, mode=mode, dist=dist_matrix, neighbors=neighbors, next_hop=[]
         )
@@ -751,6 +755,40 @@ def route_prepared_link_loads(
             if steps > n:
                 raise ValueError("shortest-path routing contains a cycle")
     return loads
+
+
+def _require_graph_distances(
+    dist: Sequence[Sequence[int]], neighbors: Sequence[tuple[int, ...]]
+) -> None:
+    """Require ``dist`` to be the shortest-path distances of its own graph.
+
+    The unit entries define the graph; every other entry must then be what a
+    breadth-first search over it finds. A table that overstates a distance a
+    longer walk can realise would otherwise be routed along that walk without
+    complaint, charging links no shortest path uses.
+    """
+    n = len(dist)
+    for src in range(n):
+        found = [UNREACHABLE_DISTANCE] * n
+        found[src] = 0
+        queue = deque([src])
+        while queue:
+            u = queue.popleft()
+            for v in neighbors[u]:
+                if found[v] == UNREACHABLE_DISTANCE:
+                    found[v] = found[u] + 1
+                    queue.append(v)
+        for dst in range(n):
+            if found[dst] != dist[src][dst]:
+                actual = (
+                    "unreachable"
+                    if found[dst] == UNREACHABLE_DISTANCE
+                    else str(found[dst])
+                )
+                raise ValueError(
+                    f"shortest-path distance {dist[src][dst]} between QPU {src} and "
+                    f"{dst} does not match the graph's distance ({actual})"
+                )
 
 
 def _neighbors_from_distance_matrix(
@@ -926,7 +964,7 @@ def congestion_metrics(loads: Mapping[QpuEdge, float]) -> CongestionMetrics:
         if u == v:
             raise ValueError("link-load keys cannot be self-loops")
 
-        if type(w_raw) is bool:
+        if is_boolean(w_raw):
             raise ValueError("link loads must be numeric values, not booleans")
         try:
             w = float(w_raw)

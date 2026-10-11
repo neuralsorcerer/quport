@@ -66,11 +66,23 @@ def _validate_architecture_config(cfg: MultiQPUConfig) -> None:
 def validate_architecture_config(cfg: MultiQPUConfig) -> None:
     """Check a config describes a buildable architecture, without building one.
 
-    ``MultiQPUArchitecture`` runs the same checks in its constructor. Callers
-    that only read the inter-QPU graph never reach that, so this gives them the
-    invariants without the cost of deriving every coupling map.
+    It runs the checks ``MultiQPUArchitecture`` runs in its constructor, plus
+    the two the constructor leaves to the build itself: the ``grid2d``
+    dimensions and, for a ``degree_d`` interconnect, ``inter_degree``. Each is
+    checked by the code that reads it during the build, and only where the
+    build reads it, so a field a topology ignores is not held against it.
+    Callers that only read the inter-QPU graph never construct an
+    architecture, so this gives them the invariants without the cost of
+    deriving every coupling map.
     """
     _validate_architecture_config(cfg)
+    if cfg.intra_topology == "grid2d":
+        _grid_dimensions(
+            cfg.compute_qubits_per_qpu + cfg.comm_qubits_per_qpu,
+            cfg.grid_rows,
+            cfg.grid_cols,
+        )
+    build_qpu_graph(cfg)
 
 
 def _add_bidir(edges: list[tuple[int, int]], a: int, b: int) -> None:
