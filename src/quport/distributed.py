@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from qiskit import QuantumCircuit, QuantumRegister
+from qiskit.circuit import ControlFlowOp
 
 from quport.architecture import MultiQPUArchitecture
 
@@ -297,12 +298,23 @@ def write_distributed_program(
             raise ValueError(f"local_circuits[{qpu!r}] must be a QuantumCircuit")
         entries.append((qpu_id, circuit))
 
+    # Render every artifact, and so validate it, before writing any of them: a
+    # bad manifest found after the programs were written would leave new
+    # programs beside a stale manifest that no longer matches them.
+    rendered: list[tuple[int, str]] = [
+        (qpu_id, qasm3.dumps(circuit))
+        for qpu_id, circuit in sorted(entries, key=lambda item: item[0])
+        if include_empty_circuits or len(circuit.data) > 0
+    ]
+    for idx, op in enumerate(program.remote_ops):
+        if not isinstance(op, RemoteOp):
+            raise ValueError(f"remote_ops[{idx}] must be a RemoteOp")
+        op.to_dict()
+
     written: dict[str, Path] = {}
-    for qpu_id, circuit in sorted(entries, key=lambda item: item[0]):
-        if not include_empty_circuits and len(circuit.data) == 0:
-            continue
+    for qpu_id, text in rendered:
         qpu_path = out_dir / f"qpu_{qpu_id}.qasm"
-        qpu_path.write_text(qasm3.dumps(circuit), encoding="utf-8")
+        qpu_path.write_text(text, encoding="utf-8")
         written[f"qpu_{qpu_id}"] = qpu_path
 
     remote_path = out_dir / "remote_ops.json"
@@ -326,9 +338,35 @@ def remote_barrier_label(ordinal: int) -> str:
     return f"{REMOTE_BARRIER_LABEL_PREFIX}{_validate_manifest_int(ordinal, label='remote operation ordinal')}"
 
 
+def _is_barrier(operation: object) -> bool:
+    """True for a barrier -- not for every directive: a classical store is one."""
+    return bool(getattr(operation, "_directive", False)) and (
+        getattr(operation, "name", None) == "barrier"
+    )
+
+
+def _barrier_statements(operation: object) -> int:
+    """Barrier statements ``operation`` puts in an emitted program.
+
+    A barrier is one. A control-flow operation is emitted with its bodies
+    inline, so it contributes every barrier inside them; anything else none.
+    Marker indices count exactly these, so that a consumer counting barrier
+    statements in the OpenQASM file lands on the same one.
+    """
+    if _is_barrier(operation):
+        return 1
+    if isinstance(operation, ControlFlowOp):
+        return sum(
+            _barrier_statements(instruction.operation)
+            for block in operation.blocks
+            for instruction in block.data
+        )
+    return 0
+
+
 def _remote_barrier_ordinal(operation: object) -> int | None:
     """Return the remote-op ordinal a barrier marks, or None if it marks none."""
-    if not getattr(operation, "_directive", False):
+    if not _is_barrier(operation):
         return None
     label = getattr(operation, "label", None)
     if not isinstance(label, str) or not label.startswith(REMOTE_BARRIER_LABEL_PREFIX):
@@ -364,8 +402,11 @@ def remap_remote_ops_to_routed(
     -------
     list[RemoteOp]
         The same operations, in the same order, with ``q0_phys`` and ``q1_phys``
-        replaced by their post-routing positions. Every other field, including
-        the global instruction ``index``, is unchanged.
+        replaced by their post-routing positions, and ``qpu0_marker`` and
+        ``qpu1_marker`` by where each marker now sits among the routed
+        program's barriers -- routing can move a marker past another barrier.
+        Every other field, including the global instruction ``index``, is
+        unchanged.
 
     Raises
     ------
@@ -386,7 +427,8 @@ def remap_remote_ops_to_routed(
         positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
         seen_barriers = 0
         for instruction in circuit.data:
-            if not getattr(instruction.operation, "_directive", False):
+            if not _is_barrier(instruction.operation):
+                seen_barriers += _barrier_statements(instruction.operation)
                 continue
             position = seen_barriers
             seen_barriers += 1
@@ -483,9 +525,11 @@ def reassemble_distributed_program(
     Parameters
     ----------
     mapped:
-        The circuit the programs were split from. Only its width and the
-        operations named by ``remote_ops[k].index`` are used, which is how
-        parameters and custom gates survive the round trip exactly.
+        The circuit the programs were split from. Its width, its classical bits
+        and registers, the order in which its instructions access each
+        classical bit, and the operations named by ``remote_ops[k].index`` are
+        used -- the last is how parameters and custom gates survive the round
+        trip exactly. Its other operations are taken from the programs.
     local_routed:
         Per-QPU programs, routed or not. Both are accepted; an unrouted program
         simply has an identity layout.
@@ -512,8 +556,11 @@ def reassemble_distributed_program(
     if not isinstance(arch, MultiQPUArchitecture):
         raise ValueError("arch must be a MultiQPUArchitecture")
 
+    reject_classical_storage(mapped, what="reassemble_distributed_program")
+
     width = max(arch.n_phys, len(mapped.qubits))
-    out = QuantumCircuit(QuantumRegister(width, "q"))
+    name = _fresh_register_name("q", (creg.name for creg in mapped.cregs))
+    out = QuantumCircuit(QuantumRegister(width, name))
     # Carry the classical side across, so measurements and conditioned
     # operations land on the bits they named in the circuit that was split.
     if mapped.clbits:
@@ -565,6 +612,20 @@ def reassemble_distributed_program(
         for clbit in instruction.clbits:
             clbit_owners[clbit_at[clbit]].append(owner)
     clbit_cursor = [0] * len(clbit_owners)
+    # How many separate runs of accesses each QPU makes to each bit. Routing
+    # can decompose one instruction into several that all access its bits, so
+    # a QPU's program may hold more accesses than ``mapped`` lists for it; with
+    # a single run they all belong to it, and the order moves on only once the
+    # program has no access to the bit left.
+    local_runs: list[dict[int, int]] = []
+    for owners in clbit_owners:
+        runs: dict[int, int] = {}
+        previous: tuple[str, int] | None = None
+        for owner in owners:
+            if owner != previous and owner[0] == "local":
+                runs[owner[1]] = runs.get(owner[1], 0) + 1
+            previous = owner
+        local_runs.append(runs)
 
     def owns_next(owner: tuple[str, int], clbits: Iterable[int]) -> bool:
         """True when ``owner`` makes the next access to each of these bits."""
@@ -622,6 +683,21 @@ def reassemble_distributed_program(
         for clbit in clbits:
             clbit_cursor[clbit] += 1
 
+    def advance_local(qpu: int, clbits: Iterable[int]) -> None:
+        """Move past a local access, or past the QPU's whole single run."""
+        owner = ("local", qpu)
+        for clbit in clbits:
+            if local_runs[clbit].get(qpu, 0) != 1:
+                clbit_cursor[clbit] += 1
+                continue
+            if clbit_queues[qpu][clbit]:
+                continue
+            owners = clbit_owners[clbit]
+            cursor = clbit_cursor[clbit]
+            while cursor < len(owners) and owners[cursor] == owner:
+                cursor += 1
+            clbit_cursor[clbit] = cursor
+
     def retire(qpu: int, index: int) -> None:
         retired[qpu][index] = True
         instruction = data[qpu][index]
@@ -630,7 +706,7 @@ def reassemble_distributed_program(
         clbits = [clbit_index(clbit) for clbit in instruction.clbits]
         for clbit in clbits:
             clbit_queues[qpu][clbit].popleft()
-        advance(clbits)
+        advance_local(qpu, clbits)
 
     remaining = {qpu: sum(1 for inst in data[qpu] if inst.qubits) for qpu in qpus}
     pending = set(range(len(remote_ops)))
@@ -834,6 +910,39 @@ def _local_cargs_for_qpu(
     return [qpu_clbits[i] for i in cargs_idx]
 
 
+def _fresh_register_name(preferred: str, taken: Iterable[str]) -> str:
+    """Return ``preferred``, or the first ``preferred_<n>`` not in ``taken``.
+
+    QuPort adds registers of its own beside a circuit's classical registers,
+    and Qiskit refuses two registers of one name, so a user's register that
+    happens to be called ``q`` or ``cat`` must not stop the build.
+    """
+    names = set(taken)
+    if preferred not in names:
+        return preferred
+    suffix = 1
+    while f"{preferred}_{suffix}" in names:
+        suffix += 1
+    return f"{preferred}_{suffix}"
+
+
+def reject_classical_storage(circuit: QuantumCircuit, *, what: str) -> None:
+    """Refuse classical variables, stretches, and top-level ``store``.
+
+    Each per-QPU program would need its own declaration of a variable, and a
+    store touches no qubit -- no QPU owns it, and nothing records the order it
+    takes against the other accesses to its target -- so neither can be split
+    and merged back faithfully. Saying so beats a Qiskit error from deep inside,
+    or a store that silently disappears in the round trip.
+    """
+    if circuit.num_vars or getattr(circuit, "num_stretches", 0):
+        raise ValueError(
+            f"{what} does not support circuits with classical variables or stretches"
+        )
+    if any(instruction.operation.name == "store" for instruction in circuit.data):
+        raise ValueError(f"{what} does not support classical store instructions")
+
+
 def _new_local_circuit(mapped: QuantumCircuit, n_phys: int) -> QuantumCircuit:
     """Create an empty per-QPU circuit mirroring the source's classical layout.
 
@@ -847,7 +956,8 @@ def _new_local_circuit(mapped: QuantumCircuit, n_phys: int) -> QuantumCircuit:
     local circuit built with its own register leaves those references dangling
     and Qiskit cannot convert the result to a DAG.
     """
-    circuit = QuantumCircuit(QuantumRegister(n_phys, "q"))
+    name = _fresh_register_name("q", (creg.name for creg in mapped.cregs))
+    circuit = QuantumCircuit(QuantumRegister(n_phys, name))
     if mapped.clbits:
         circuit.add_bits(mapped.clbits)
     for creg in mapped.cregs:
@@ -868,6 +978,7 @@ def split_into_qpus(
     - For remote ops, local circuits will include barriers on the involved QPUs to make
       synchronization explicit for downstream schedulers.
     """
+    reject_classical_storage(mapped, what="split_into_qpus")
     n_qpus = arch.cfg.n_qpus
     local: dict[int, QuantumCircuit] = {}
     # Create per-QPU circuits with the full physical register for clarity.
@@ -914,6 +1025,11 @@ def split_into_qpus(
     # the next one so the local DAG keeps them in order.
     last_marker_qubit: list[int | None] = [None] * n_qpus
 
+    def append_local(qpu: int, op: Any, qargs: list[Any], cargs: list[Any]) -> None:
+        """Append a local operation, counting any barriers nested inside it."""
+        local[qpu].append(op, qargs, cargs)
+        barriers_emitted[qpu] += _barrier_statements(op)
+
     qindex = {q: i for i, q in enumerate(mapped.qubits)}
     cindex = {c: i for i, c in enumerate(mapped.clbits)}
 
@@ -929,8 +1045,8 @@ def split_into_qpus(
                     barriers_emitted[qpu] += 1
             else:
                 for qpu in range(n_qpus):
-                    local[qpu].append(
-                        op, [], _local_cargs_for_qpu(local, qpu, cargs_idx)
+                    append_local(
+                        qpu, op, [], _local_cargs_for_qpu(local, qpu, cargs_idx)
                     )
             continue
 
@@ -947,7 +1063,8 @@ def split_into_qpus(
 
         if len(qs) == 1:
             qpu = op_qpus[0]
-            local[qpu].append(
+            append_local(
+                qpu,
                 op,
                 [local[qpu].qubits[qs[0]]],
                 _local_cargs_for_qpu(local, qpu, cargs_idx),
@@ -957,7 +1074,8 @@ def split_into_qpus(
             q0, q1 = qs
             qpu0, qpu1 = op_qpus
             if qpu0 == qpu1:
-                local[qpu0].append(
+                append_local(
+                    qpu0,
                     op,
                     [local[qpu0].qubits[q0], local[qpu0].qubits[q1]],
                     _local_cargs_for_qpu(local, qpu0, cargs_idx),
@@ -991,7 +1109,8 @@ def split_into_qpus(
             qpu_order, qpu_qubits = _group_qubits_by_qpu_in_operand_order(qs, op_qpus)
             if len(qpu_order) == 1:
                 qpu = qpu_order[0]
-                local[qpu].append(
+                append_local(
+                    qpu,
                     op,
                     [local[qpu].qubits[q] for q in qs],
                     _local_cargs_for_qpu(local, qpu, cargs_idx),
