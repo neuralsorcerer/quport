@@ -53,7 +53,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from quport.hypergraph import PacketDecomposition
+from quport.hypergraph import PacketDecomposition, _ebit_cost_fast
 from quport.interaction import WeightValue, _iter_validated_weights
 
 __all__ = [
@@ -472,10 +472,13 @@ def optimal_partition(
             if loads[qpu] >= capacity_value:
                 continue
 
-            nodes += 1
-            if nodes > max_nodes_value:
+            # The budget counts nodes explored, so the one that would exceed
+            # it is not counted, and a search needing exactly the budget is
+            # still a proof.
+            if nodes >= max_nodes_value:
                 exhausted = True
                 return
+            nodes += 1
 
             delta = cost.assign(qubit, qpu)
             total = running + delta
@@ -491,9 +494,22 @@ def optimal_partition(
 
     descend(0, 0.0, 0)
 
+    # The search sums its cost one qubit at a time, in search order, and
+    # floating-point addition does not associate; report the cost the way
+    # `cut_weight` and `ebit_cost` compute it, so the objective is the same
+    # number they give for the same partition.
+    if objective == "cut":
+        reported = 0.0
+        for i, j, weight in edges:
+            if best_part[i] != best_part[j]:
+                reported += weight
+    else:
+        assert packets is not None
+        reported = float(_ebit_cost_fast(packets, best_part, n_qpus_value))
+
     return ExactPartition(
         part=tuple(best_part),
-        objective=best_cost,
+        objective=reported,
         proved_optimal=not exhausted,
         nodes=nodes,
     )
@@ -564,7 +580,10 @@ def partition_gap(
         assert packets is not None
         heuristic = float(ebit_cost(packets, assignments, n_qpus_value))
 
-    if exact.proved_optimal and heuristic < exact.objective - 1e-9:
+    # Two partitions of equal cost can still sum to costs an ulp apart, so the
+    # tolerance scales with the cost rather than being fixed.
+    tolerance = 1e-9 * max(1.0, abs(exact.objective))
+    if exact.proved_optimal and heuristic < exact.objective - tolerance:
         raise ValueError(
             f"heuristic cost {heuristic} beats the proved optimum "
             f"{exact.objective}; one of the two is wrong"
