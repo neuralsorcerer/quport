@@ -29,7 +29,7 @@ files beside benchmark outputs.
 | `grid_cols` | `None` | optional columns for `grid2d` | inferred if omitted; explicit rows/cols must cover local qubits |
 | `basis_gates` | `("rz", "sx", "x", "cx")` | Qiskit basis gates used by translation/transpilation | non-empty sequence of non-empty strings |
 | `optimization_level` | `3` | Qiskit optimization level | integer `0`, `1`, `2`, or `3` |
-| `layout_method` | `"sabre"` | Qiskit layout method for global transpilation | non-empty string |
+| `layout_method` | `"sabre"` | Qiskit layout method for global transpilation; every pipeline supplies an initial layout, which makes Qiskit skip its layout stage, so it does not change results | non-empty string |
 | `routing_method` | `"sabre"` | Qiskit routing method | non-empty string |
 
 ### Loading a config file
@@ -41,7 +41,16 @@ that writes one still loads. `dump_config` creates the directory its path names.
 The CLI checks a `--config` file as it loads it: a path it cannot read, text
 neither parser accepts, an unknown field, and a document that parses but cannot
 describe an architecture are all reported as errors naming the file, rather than
-surfacing later as a traceback from wherever the value was first used.
+surfacing later as a traceback from wherever the value was first used. That
+includes the fields only some topologies read (`grid_rows`/`grid_cols` for
+`grid2d`, `inter_degree` for `degree_d`, the switch limits on switch-like
+fabrics), `link_capacity`, and the transpiler settings: `layout_method` and
+`routing_method` must name installed Qiskit plugins, and every `basis_gates`
+entry must be a standard Qiskit gate on at most two qubits.
+
+`dump_config` writes integral and real values as plain numbers, so a config
+holding a NumPy integer saves and loads back, and it serializes before opening
+the file, so a failed write leaves an existing config untouched.
 
 ### Derived quantities
 

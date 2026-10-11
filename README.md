@@ -721,8 +721,12 @@ J_{\mathrm{temporal}}(\pi_1,\dots,\pi_W)=
 \underbrace{\sum_{P\in\mathcal{P}}\;\sum_{e\in\mathrm{epochs}(P)}
 \bigl|\{\pi_{w(g)}(\mathrm{partner}(g)) : g\in e\}
 \setminus\{\pi(\mathrm{root}(P))|_e\}\bigr|}_{\text{cat copies}}
+\;+\;\underbrace{\sum_{g\in\mathcal{U}} 2\,\lvert F(g,\pi_{w(g)})\rvert}_{\text{teleported gates}}
 \;+\;\sum_{q}\sum_{w<W}\;m\cdot[\pi_w(q)\neq\pi_{w+1}(q)]
 $$
+
+The middle term is the unpackable-gate cost of $E(\pi)$, priced with the
+assignment of the window each gate falls in.
 
 A window boundary is not a barrier. A cat copy stays valid as long as its root
 stays put, so the count runs over **root epochs** — maximal runs of a packet's
@@ -1538,7 +1542,7 @@ print(arch.qpu_shortest_paths().dist)
 | `grid_cols` | `None` | Optional column count for `grid2d`. |
 | `basis_gates` | `("rz", "sx", "x", "cx")` | Basis gates for Qiskit translation/transpilation. |
 | `optimization_level` | `3` | Qiskit optimization level. |
-| `layout_method` | `sabre` | Qiskit layout method for global transpilation. |
+| `layout_method` | `sabre` | Qiskit layout method for global transpilation. Every pipeline supplies an initial layout -- the partition's, or the identity for the baseline -- and Qiskit skips its layout stage when given one, so this is validated but does not change results. |
 | `routing_method` | `sabre` | Qiskit routing method. |
 
 JSON example:
