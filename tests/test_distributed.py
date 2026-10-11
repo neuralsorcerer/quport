@@ -2093,3 +2093,126 @@ def test_routed_reassembly_accepts_a_decomposed_instruction_writing_a_bit_twice(
         if instruction.operation.name == "measure"
     ]
     assert sorted(measured) == [0, 1]
+
+
+def _route_locally(program: DistributedProgram, cfg: MultiQPUConfig) -> dict[int, Any]:
+    from qiskit import transpile
+
+    arch = MultiQPUArchitecture(cfg)
+    return {
+        qpu: transpile(
+            circuit,
+            coupling_map=arch.build_intra_coupling_map(qpu),
+            initial_layout=list(range(arch.n_phys)),
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=0,
+            layout_method="trivial",
+            seed_transpiler=0,
+        )
+        for qpu, circuit in program.local_circuits.items()
+    }
+
+
+def _clbit_trace(circuit: QuantumCircuit) -> list[tuple[str, int]]:
+    return [
+        (instruction.operation.name, circuit.find_bit(instruction.qubits[0]).index)
+        for instruction in circuit.data
+        if instruction.clbits
+    ]
+
+
+@pytest.mark.parametrize("later", ["read", "declared_only"])
+def test_routed_reassembly_orders_a_decomposed_instruction_among_several_runs(
+    later: str,
+) -> None:
+    """The readout's two measurements both precede QPU 1's read of the bit.
+
+    With a second run of accesses on QPU 0, counting the decomposed readout as
+    one access either stalled the merge ("read") or -- when QPU 0's later
+    instruction only declares the bit and so loses it in decomposition --
+    silently put QPU 1's read between the two measurements.
+    """
+    from quport.distributed import (
+        reassemble_distributed_program,
+        remap_remote_ops_to_routed,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        basis_gates=("rz", "sx", "x", "cx", "if_else"),
+    )
+    arch = MultiQPUArchitecture(cfg)
+    readout = QuantumCircuit(2, 1, name="parity_readout")
+    readout.measure(0, 0)
+    readout.measure(1, 0)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.append(readout.to_instruction(), [0, 1], [0])
+    with mapped.if_test((mapped.clbits[0], 1)):
+        mapped.x(4)
+    if later == "read":
+        with mapped.if_test((mapped.clbits[0], 1)):
+            mapped.x(2)
+    else:
+        flagged = QuantumCircuit(1, 1, name="flagged_x")
+        flagged.x(0)
+        mapped.append(flagged.to_instruction(), [2], [0])
+
+    program = split_into_qpus(mapped, arch)
+    routed = _route_locally(program, cfg)
+    merged = reassemble_distributed_program(
+        mapped,
+        routed,
+        remap_remote_ops_to_routed(program.remote_ops, routed),
+        arch,
+        restore_layout=False,
+    )
+
+    expected = [("measure", 0), ("measure", 1), ("if_else", 4)]
+    if later == "read":
+        expected.append(("if_else", 2))
+    assert _clbit_trace(merged) == expected
+
+    # Unrouted programs keep the instructions whole and merge as before.
+    unrouted = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, restore_layout=False
+    )
+    assert _instruction_trace(unrouted) == _instruction_trace(mapped)
+
+
+@pytest.mark.parametrize("field", ["name", "params"])
+def test_an_unencodable_manifest_leaves_an_existing_bundle_untouched(
+    tmp_path: Path, field: str
+) -> None:
+    """A lone surrogate passes every check on a str and fails only on encoding."""
+    from quport.distributed import RemoteOp, write_distributed_program
+
+    bundle = tmp_path / "bundle"
+    write_distributed_program(
+        DistributedProgram(local_circuits={0: QuantumCircuit(2)}, remote_ops=[]),
+        bundle,
+    )
+    before = {path.name: path.read_text() for path in bundle.iterdir()}
+
+    changed = QuantumCircuit(2)
+    changed.h(0)
+    op = RemoteOp(
+        name="\ud800" if field == "name" else "cx",
+        q0_phys=0,
+        q1_phys=1,
+        qpu0=0,
+        qpu1=1,
+        params=("\ud800",) if field == "params" else (),
+        clbits=(),
+        index=0,
+    )
+    with pytest.raises(ValueError, match="cannot be encoded as UTF-8"):
+        write_distributed_program(
+            DistributedProgram(local_circuits={0: changed}, remote_ops=[op]), bundle
+        )
+
+    assert {path.name: path.read_text() for path in bundle.iterdir()} == before

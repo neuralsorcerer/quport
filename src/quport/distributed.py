@@ -13,6 +13,7 @@ import os
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass
+from functools import cache
 from numbers import Integral
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -251,18 +252,39 @@ def write_remote_ops_json(remote_ops: Iterable[RemoteOp], path: _PathLike) -> No
     emitted manifest is standards-compliant JSON rather than Python's extended
     NaN/Infinity dialect.
     """
+    text = _render_remote_ops_json(remote_ops)
+    out_path = _coerce_output_path(path, label="path")
+    if out_path.parent != Path(""):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+
+
+def _encodable(text: str, *, label: str) -> str:
+    """Return ``text`` once it is known to encode as UTF-8.
+
+    A lone surrogate survives every check on a ``str`` and fails only when the
+    file is written -- after ``write_text`` has already truncated it -- so
+    encoding is part of validating an artifact rather than of writing it.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"{label} contains text that cannot be encoded as UTF-8"
+        ) from exc
+    return text
+
+
+def _render_remote_ops_json(remote_ops: Iterable[RemoteOp]) -> str:
+    """Validate remote operations and return their manifest's text."""
     payload: list[dict[str, Any]] = []
     for idx, op in enumerate(remote_ops):
         if not isinstance(op, RemoteOp):
             raise ValueError(f"remote_ops[{idx}] must be a RemoteOp")
         payload.append(op.to_dict())
-
-    out_path = _coerce_output_path(path, label="path")
-    if out_path.parent != Path(""):
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(
+    return _encodable(
         json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        encoding="utf-8",
+        label="the remote-operation manifest",
     )
 
 
@@ -298,18 +320,18 @@ def write_distributed_program(
             raise ValueError(f"local_circuits[{qpu!r}] must be a QuantumCircuit")
         entries.append((qpu_id, circuit))
 
-    # Render every artifact, and so validate it, before writing any of them: a
-    # bad manifest found after the programs were written would leave new
-    # programs beside a stale manifest that no longer matches them.
+    # Render every artifact, and check that it encodes, before writing any of
+    # them: a bad manifest found after the programs were written would leave
+    # new programs beside a stale manifest that no longer matches them.
     rendered: list[tuple[int, str]] = [
-        (qpu_id, qasm3.dumps(circuit))
+        (
+            qpu_id,
+            _encodable(qasm3.dumps(circuit), label=f"the program for QPU {qpu_id}"),
+        )
         for qpu_id, circuit in sorted(entries, key=lambda item: item[0])
         if include_empty_circuits or len(circuit.data) > 0
     ]
-    for idx, op in enumerate(program.remote_ops):
-        if not isinstance(op, RemoteOp):
-            raise ValueError(f"remote_ops[{idx}] must be a RemoteOp")
-        op.to_dict()
+    manifest = _render_remote_ops_json(program.remote_ops)
 
     written: dict[str, Path] = {}
     for qpu_id, text in rendered:
@@ -318,7 +340,7 @@ def write_distributed_program(
         written[f"qpu_{qpu_id}"] = qpu_path
 
     remote_path = out_dir / "remote_ops.json"
-    write_remote_ops_json(program.remote_ops, remote_path)
+    remote_path.write_text(manifest, encoding="utf-8")
     written["remote_ops"] = remote_path
     return written
 
@@ -598,19 +620,35 @@ def reassemble_distributed_program(
     # Who touches each classical bit, in the mapped circuit's order: a QPU for
     # a local instruction, a manifest ordinal for a remote one. Instructions
     # without qubits are left out on both sides, as the merge skips them.
+    #
+    # A program routing decomposed a custom instruction in no longer names it,
+    # and holds one access to each bit for every access the instruction's
+    # definition makes -- two for a readout measuring twice into one bit, none
+    # for a bit it only declares -- so such an instruction stands for that many
+    # accesses here. Counting it once would let another QPU's access slip in
+    # between the pieces, or leave the order stuck.
+    program_names = {
+        qpu: {instruction.operation.name for instruction in circuit.data}
+        for qpu, circuit in local_routed.items()
+        if isinstance(circuit, QuantumCircuit)
+    }
     ordinal_at = {op.index: ordinal for ordinal, op in enumerate(remote_ops)}
     clbit_owners: list[list[tuple[str, int]]] = [[] for _ in mapped.clbits]
     for position, instruction in enumerate(mapped.data):
         if not instruction.qubits or not instruction.clbits:
             continue
         ordinal = ordinal_at.get(position)
-        owner = (
-            ("local", arch.qpu_of_phys(mapped_at[instruction.qubits[0]]))
-            if ordinal is None
-            else ("remote", ordinal)
-        )
-        for clbit in instruction.clbits:
-            clbit_owners[clbit_at[clbit]].append(owner)
+        accesses: list[int] | None = None
+        if ordinal is None:
+            qpu = arch.qpu_of_phys(mapped_at[instruction.qubits[0]])
+            owner = ("local", qpu)
+            if instruction.operation.name not in program_names.get(qpu, ()):
+                accesses = _accesses_once_decomposed(instruction.operation)
+        else:
+            owner = ("remote", ordinal)
+        for slot, clbit in enumerate(instruction.clbits):
+            count = 1 if accesses is None else accesses[slot]
+            clbit_owners[clbit_at[clbit]].extend([owner] * count)
     clbit_cursor = [0] * len(clbit_owners)
     # How many separate runs of accesses each QPU makes to each bit. Routing
     # can decompose one instruction into several that all access its bits, so
@@ -781,6 +819,39 @@ def reassemble_distributed_program(
     if restore_layout:
         _append_layout_restoration(out, local_routed, arch, width)
     return out
+
+
+def _accesses_once_decomposed(operation: Any) -> list[int] | None:
+    """Accesses to each classical argument once ``operation`` is decomposed.
+
+    Transpilation keeps a standard operation, a control-flow block, and an
+    operation without a definition whole -- one access to each of its bits,
+    reported as ``None`` -- and replaces any other by its definition, recursively.
+    """
+    if isinstance(operation, ControlFlowOp) or (
+        operation.name in _standard_operation_names()
+    ):
+        return None
+    definition = getattr(operation, "definition", None)
+    if not isinstance(definition, QuantumCircuit):
+        return None
+    slot_of = {clbit: slot for slot, clbit in enumerate(definition.clbits)}
+    counts = [0] * len(definition.clbits)
+    for inner in definition.data:
+        if not inner.qubits:
+            continue
+        nested = _accesses_once_decomposed(inner.operation)
+        for slot, clbit in enumerate(inner.clbits):
+            counts[slot_of[clbit]] += 1 if nested is None else nested[slot]
+    return counts
+
+
+@cache
+def _standard_operation_names() -> frozenset[str]:
+    """Names of the operations Qiskit defines as standard."""
+    from qiskit.circuit.library import get_standard_gate_name_mapping
+
+    return frozenset(get_standard_gate_name_mapping())
 
 
 def _remote_operands(
