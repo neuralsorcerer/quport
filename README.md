@@ -630,8 +630,11 @@ comparison. Local routing at `optimization_level` 2 or 3 may drop a diagonal gat
 right before a measurement, or re-target the classical bit of a measurement that
 follows a `swap`; neither changes an outcome, and neither now fails verification.
 Comparing per classical bit also checks which bit each measurement writes, and
-each measured bit counts toward the 24-qubit simulation limit. A measurement or
-reset that later operations depend on
+each measured bit counts toward the 24-qubit simulation limit. A measured qubit is
+left in a fixed generic state, so a program that acts on a qubit after measuring
+it, other than to move it, fails the check. A measurement terminates when nothing
+but barriers acts on its qubit afterwards; a measurement or reset that later
+operations depend on
 genuinely changes what the circuit computes and is refused rather than quietly
 ignored. So is classical control -- an `if` block or other control-flow
 operation -- which has no state-vector evolution to compare.

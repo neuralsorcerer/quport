@@ -563,8 +563,10 @@ simulation. Terminating measurements are compared by outcome, per classical bit:
 each is swapped into an ancilla for its bit, and the ancillas are dephased, so
 the measurement-aware optimizations of `optimization_level` 2 and 3 (dropping a
 diagonal gate before a measurement, re-targeting the bit of a measurement after a
-`swap`) verify, while a measurement written to the wrong bit does not. Each
-measured bit counts toward the 24-qubit simulation limit. A circuit with
+`swap`) verify, while a measurement written to the wrong bit does not, and nor
+does a program that acts on a qubit after measuring it other than to move it.
+Each measured bit counts toward the 24-qubit simulation limit. A measurement is
+terminating when nothing but barriers acts on its qubit afterwards; a circuit with
 mid-circuit measurement, reset, or classical control is refused with
 `ValueError`.
 

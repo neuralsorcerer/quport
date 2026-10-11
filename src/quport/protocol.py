@@ -62,6 +62,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit, QuantumRegister
@@ -537,6 +538,14 @@ def verify_distributed_program(
     measured at most once and every classical bit written at most once, so a
     mapped circuit outside that is refused rather than compared on it.
 
+    A measured qubit is left in a fixed generic state, the same whichever bit
+    it was measured into. Moving it afterwards -- as routing and the swaps
+    undoing it do -- changes nothing, but any other operation on it changes
+    the compared state, so a program that uses a qubit after measuring it
+    fails the check. That is conservative: deferring a measurement past the
+    operations it controls would be equivalent, but the mapped circuit's
+    measurements are all terminating, and a faithful split keeps them so.
+
     Parameters
     ----------
     remote_ops:
@@ -577,6 +586,8 @@ def verify_distributed_program(
         )
 
     preparation = _widen(_random_product_state(width, seed), total)
+    for slot in range(width, total):
+        _prepare_left_behind_state(preparation, slot)
 
     actual = preparation.copy()
     actual.compose(
@@ -623,47 +634,79 @@ def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
     """Return ``circuit`` without its terminating measurements.
 
     Verification compares state vectors, so it can only speak about the state a
-    circuit prepares. Measurements that come last are dropped -- they read that
+    circuit prepares. Terminating measurements are dropped -- they read that
     state out without changing it -- while a measurement or reset that other
     operations depend on genuinely changes what the circuit computes, and is
     refused rather than quietly ignored. So is classical control: an operation
     conditioned on a classical bit, or any other control-flow block, has no
-    state-vector evolution to compare.
+    state-vector evolution to compare. Barriers are dropped as well; they
+    order operations and change no state.
     """
-    trimmed = circuit.remove_final_measurements(inplace=False)
-    if trimmed is None:  # pragma: no cover - defensive across Qiskit versions
-        trimmed = circuit
-    surviving = {
-        instruction.operation.name
-        for instruction in trimmed.data
-        if instruction.operation.name in _NON_UNITARY_OPS
-    }
+    terminating = _terminating_measurements(circuit)
+    trimmed = QuantumCircuit(len(circuit.qubits), global_phase=circuit.global_phase)
+    position = {qubit: index for index, qubit in enumerate(circuit.qubits)}
+    surviving: set[str] = set()
+    controlled: set[str] = set()
+    stores = False
+    for index, instruction in enumerate(circuit.data):
+        operation = instruction.operation
+        if index in terminating or operation.name == "barrier":
+            continue
+        if operation.name in _NON_UNITARY_OPS:
+            surviving.add(operation.name)
+        elif instruction.clbits or isinstance(operation, ControlFlowOp):
+            controlled.add(operation.name)
+        elif operation.name == "store":
+            # A store writes a classical bit or variable without touching a
+            # qubit, and names its target inside the operation rather than in
+            # its classical arguments, so the check above does not see it.
+            stores = True
+        else:
+            trimmed.append(
+                operation, [trimmed.qubits[position[q]] for q in instruction.qubits]
+            )
     if surviving:
         raise ValueError(
             f"cannot verify {label}: it contains mid-circuit "
             f"{', '.join(sorted(surviving))}, which state-vector comparison "
             "cannot represent"
         )
-    controlled = {
-        instruction.operation.name
-        for instruction in trimmed.data
-        if instruction.clbits or isinstance(instruction.operation, ControlFlowOp)
-    }
     if controlled:
         raise ValueError(
             f"cannot verify {label}: it contains classically controlled "
             f"{', '.join(sorted(controlled))}, which state-vector comparison "
             "cannot represent"
         )
-    # A store writes a classical bit or variable without touching a qubit, and
-    # names its target inside the operation rather than in its classical
-    # arguments, so the checks above do not see it.
-    if any(instruction.operation.name == "store" for instruction in trimmed.data):
+    if stores:
         raise ValueError(
             f"cannot verify {label}: it contains a classical store, which "
             "state-vector comparison cannot represent"
         )
     return trimmed
+
+
+def _terminating_measurements(circuit: QuantumCircuit) -> set[int]:
+    """Positions of the measurements nothing later depends on.
+
+    A measurement terminates its qubit when nothing but barriers and other
+    terminating measurements acts on that qubit afterwards. The test is per
+    qubit: a barrier across the whole register orders later gates on *other*
+    qubits after the measurement, but reads nothing from it, so it does not
+    make the measurement mid-circuit -- Qiskit's ``remove_final_measurements``
+    treats it as if it did.
+    """
+    used_later: set[Any] = set()
+    terminating: set[int] = set()
+    for index in range(len(circuit.data) - 1, -1, -1):
+        instruction = circuit.data[index]
+        name = instruction.operation.name
+        if name == "barrier":
+            continue
+        if name == "measure" and used_later.isdisjoint(instruction.qubits):
+            terminating.add(index)
+            continue
+        used_later.update(instruction.qubits)
+    return terminating
 
 
 def _measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
@@ -682,8 +725,8 @@ def _single_measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
     Verification moves each measured qubit into an ancilla for its bit, which
     reproduces a measurement's outcome only when every qubit is measured once
     and every bit is written once: a second measurement of the same qubit
-    would read the ``|0>`` left behind, and a second write to the same bit
-    would bring the first value back into play. Either is refused rather than
+    would read the state left behind rather than an outcome, and a second
+    write to the same bit would bring the first value back into play. Either is refused rather than
     compared on a model that does not describe it.
     """
     measured: set[Any] = set()
@@ -716,8 +759,9 @@ def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:
     circuits can agree on a particular state while differing elsewhere. A wrong
     protocol passes only if it happens to map this one generic input correctly.
     """
-    if type(seed) is bool or not isinstance(seed, int):
+    if is_boolean(seed) or not isinstance(seed, Integral):
         raise ValueError("seed must be an integer")
+    seed = int(seed)
     circuit = QuantumCircuit(QuantumRegister(n_qubits, "q"))
     for qubit in range(n_qubits):
         step = (seed * 7 + qubit * 13 + 1) % 17
@@ -756,9 +800,13 @@ def _measurements_into_ancillas(
     A terminating measurement only records its qubit's computational-basis
     value, so moving the qubit into an ancilla that is dephased afterwards
     keeps exactly what the measurement observes and nothing it does not. The
-    qubit is left in ``|0>`` -- the same in every circuit compared -- so
-    whatever moves it afterwards, such as the swaps undoing routing in a merged
-    circuit, cannot make two equivalent programs differ.
+    qubit receives the ancilla's starting state, which
+    :func:`_prepare_left_behind_state` makes the same for every bit, so moving
+    it afterwards -- the swaps undoing routing in a merged circuit, or a
+    measurement Qiskit re-targeted past a ``swap`` -- cannot make two
+    equivalent programs differ. The state is generic rather than ``|0>``, so
+    an operation that *uses* the qubit afterwards, as a control or otherwise,
+    is not hidden by acting trivially on it.
     """
     out = QuantumCircuit(QuantumRegister(total, "q"))
     position = {qubit: index for index, qubit in enumerate(circuit.qubits)}
@@ -775,6 +823,19 @@ def _measurements_into_ancillas(
             )
         out.append(operation, [out.qubits[qubit] for qubit in qubits])
     return out
+
+
+#: Angles of the state every outcome ancilla starts in, and so the state a
+#: measured qubit is left in: generic, so that no gate acting on it reduces to
+#: the identity the way a control in ``|0>`` would.
+_LEFT_BEHIND_ANGLES = (1.1, 0.7)
+
+
+def _prepare_left_behind_state(circuit: QuantumCircuit, qubit: int) -> None:
+    """Rotate ``qubit`` of ``circuit`` from ``|0>`` into the left-behind state."""
+    theta, phi = _LEFT_BEHIND_ANGLES
+    circuit.ry(theta, qubit)
+    circuit.rz(phi, qubit)
 
 
 def _dephased_fidelity(actual: Any, expected: Any, *, n_data: int) -> float:

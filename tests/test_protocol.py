@@ -1122,3 +1122,78 @@ def test_a_numeric_tolerance_below_one_is_accepted() -> None:
     mapped.cx(0, 3)
     for atol in (1e-9, 0.5, np.float64(1e-6)):
         assert verify_telegate_equivalence(mapped, arch, atol=atol)
+
+
+def test_a_program_that_uses_a_qubit_after_measuring_it_fails() -> None:
+    """A measured qubit left in ``|0>`` hid any gate it controls afterwards.
+
+    The edited program applies ``cx(0, 1)`` after measuring qubit 0, which
+    flips qubit 1 whenever the outcome is one; the mapped circuit does not.
+    """
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+    program = split_into_qpus(mapped, arch)
+    assert verify_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+
+    edited = program.local_circuits[0].copy()
+    edited.cx(0, 1)
+    assert not verify_distributed_program(
+        mapped, {0: edited, 1: program.local_circuits[1]}, program.remote_ops, arch
+    )
+
+
+def test_a_barrier_after_a_terminating_measurement_does_not_make_it_mid_circuit() -> (
+    None
+):
+    """Nothing after the barrier acts on the measured qubit."""
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 2)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+    mapped.barrier()
+    mapped.h(1)
+    mapped.measure(1, 1)
+    program = split_into_qpus(mapped, arch)
+
+    assert verify_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+    assert verify_telegate_equivalence(mapped, arch)
+
+    # A gate on the measured qubit itself still makes it mid-circuit.
+    mapped.x(0)
+    with pytest.raises(ValueError, match="mid-circuit measure"):
+        verify_telegate_equivalence(mapped, arch)
+
+
+def test_both_verifiers_accept_a_numpy_integer_seed() -> None:
+    import numpy as np
+
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    program = split_into_qpus(mapped, arch)
+
+    seed = np.int64(3)
+    assert verify_telegate_equivalence(mapped, arch, seed=seed)  # type: ignore[arg-type]
+    assert verify_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch, seed=seed  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="seed"):
+        verify_telegate_equivalence(mapped, arch, seed=np.bool_(True))  # type: ignore[arg-type]
