@@ -69,7 +69,11 @@ from qiskit.circuit import ClassicalRegister, ControlFlowOp
 
 from quport.aggregation import AggregationPlan, RemoteBlock, aggregate_remote_operations
 from quport.architecture import MultiQPUArchitecture
-from quport.distributed import RemoteOp, reassemble_distributed_program
+from quport.distributed import (
+    RemoteOp,
+    _fresh_register_name,
+    reassemble_distributed_program,
+)
 from quport.entanglement import is_directive
 
 __all__ = [
@@ -208,6 +212,11 @@ def build_telegate_circuit(
         raise ValueError("arch must be a MultiQPUArchitecture")
     if not isinstance(coherent, bool):
         raise ValueError("coherent must be a boolean")
+    if mapped.num_vars or getattr(mapped, "num_stretches", 0):
+        raise ValueError(
+            "build_telegate_circuit does not support circuits with classical "
+            "variables or stretches"
+        )
 
     resolved = _validate_plan(plan, mapped, arch, ports_per_qpu)
 
@@ -233,8 +242,13 @@ def build_telegate_circuit(
     # Worst case one ancilla per block; the pool recycles, so the real width is
     # discovered during the walk and the register is trimmed afterwards.
     max_ancillas = max(1, len(resolved.blocks) + 1)
-    work = QuantumRegister(n_data, "q")
-    ancilla_register = QuantumRegister(max_ancillas, "cat")
+    # The mapped circuit's classical registers keep their names, so the
+    # registers added here take names none of them uses.
+    taken = {creg.name for creg in mapped.cregs}
+    work = QuantumRegister(n_data, _fresh_register_name("q", taken))
+    taken.add(work.name)
+    ancilla_register = QuantumRegister(max_ancillas, _fresh_register_name("cat", taken))
+    taken.add(ancilla_register.name)
     circuit = QuantumCircuit(work, ancilla_register)
     if mapped.clbits:
         circuit.add_bits(mapped.clbits)
@@ -242,7 +256,9 @@ def build_telegate_circuit(
         circuit.add_register(creg)
     protocol_register: ClassicalRegister | None = None
     if protocol_bits:
-        protocol_register = ClassicalRegister(protocol_bits, "cat_c")
+        protocol_register = ClassicalRegister(
+            protocol_bits, _fresh_register_name("cat_c", taken)
+        )
         circuit.add_register(protocol_register)
 
     pool = _AncillaPool(n_data)
@@ -337,7 +353,9 @@ def build_telegate_circuit(
             close_block(block)
 
     used = pool.allocated
-    trimmed = _trim_unused_ancillas(circuit, work, mapped, protocol_register, used)
+    trimmed = _trim_unused_ancillas(
+        circuit, work, ancilla_register.name, mapped, protocol_register, used
+    )
 
     return TelegateProgram(
         circuit=trimmed,
@@ -353,6 +371,7 @@ def build_telegate_circuit(
 def _trim_unused_ancillas(
     circuit: QuantumCircuit,
     work: QuantumRegister,
+    ancilla_name: str,
     mapped: QuantumCircuit,
     protocol_register: ClassicalRegister | None,
     used: int,
@@ -368,7 +387,7 @@ def _trim_unused_ancillas(
     if used == total - n_data:
         return circuit
 
-    ancillas = QuantumRegister(used, "cat")
+    ancillas = QuantumRegister(used, ancilla_name)
     trimmed = QuantumCircuit(work, ancillas) if used else QuantumCircuit(work)
     if mapped.clbits:
         trimmed.add_bits(mapped.clbits)
@@ -412,8 +431,11 @@ def verify_telegate_equivalence(
     not a proof of it; see :func:`_random_product_state`.
 
     This is the empirical counterpart of :mod:`quport.entanglement`'s
-    diagonality rule. Aggregating across an operation that breaks the rule sends
-    the fidelity to zero rather than merely degrading it.
+    diagonality rule. Aggregating across an operation that breaks the rule
+    leaves the root entangled with its copy and lowers the fidelity by however
+    much that operation moves the root's computational-basis label: an ``X``
+    sends it to about zero, a small rotation only slightly below one. Either
+    fails the check, whose tolerance is ``atol``.
 
     Parameters
     ----------
@@ -509,7 +531,9 @@ def verify_distributed_program(
     a ``swap`` -- and either would fail a comparison of raw state vectors
     although no outcome changes. Comparing outcomes per classical bit also
     checks which bit each measurement writes, which dropping the measurements
-    could not.
+    could not. That model describes a measurement only when every qubit is
+    measured at most once and every classical bit written at most once, so a
+    mapped circuit outside that is refused rather than compared on it.
 
     Parameters
     ----------
@@ -521,8 +545,9 @@ def verify_distributed_program(
     ------
     ValueError
         If the circuit is too wide to simulate -- its qubits plus one ancilla
-        per measured classical bit exceed :data:`MAX_VERIFIABLE_QUBITS` -- or if
-        the artifacts are inconsistent enough that they cannot be merged at all.
+        per measured classical bit exceed :data:`MAX_VERIFIABLE_QUBITS` -- if
+        it measures a qubit or writes a classical bit more than once, or if the
+        artifacts are inconsistent enough that they cannot be merged at all.
     """
     from qiskit.quantum_info import Statevector
 
@@ -532,6 +557,11 @@ def verify_distributed_program(
     # Refuses mid-circuit measurement, reset and classical control, so every
     # measurement left in `mapped` -- and so in `merged` -- is terminating.
     _unitary_part(mapped, label="the mapped circuit")
+    expected_writes = _single_measurement_writes(mapped)
+    if _measurement_writes(merged) != expected_writes:
+        # The programs record a different set of classical bits, or record one
+        # of them a different number of times: not the same computation.
+        return False
 
     width = len(merged.qubits)
     outcome_slots = _outcome_slots(width, mapped, merged)
@@ -604,7 +634,56 @@ def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
             f"{', '.join(sorted(controlled))}, which state-vector comparison "
             "cannot represent"
         )
+    # A store writes a classical bit or variable without touching a qubit, and
+    # names its target inside the operation rather than in its classical
+    # arguments, so the checks above do not see it.
+    if any(instruction.operation.name == "store" for instruction in trimmed.data):
+        raise ValueError(
+            f"cannot verify {label}: it contains a classical store, which "
+            "state-vector comparison cannot represent"
+        )
     return trimmed
+
+
+def _measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
+    """How many measurements write each classical bit of ``circuit``."""
+    writes: dict[Any, int] = {}
+    for instruction in circuit.data:
+        if instruction.operation.name == "measure":
+            for clbit in instruction.clbits:
+                writes[clbit] = writes.get(clbit, 0) + 1
+    return writes
+
+
+def _single_measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
+    """Return the bits ``circuit`` measures into, refusing repeated measurement.
+
+    Verification moves each measured qubit into an ancilla for its bit, which
+    reproduces a measurement's outcome only when every qubit is measured once
+    and every bit is written once: a second measurement of the same qubit
+    would read the ``|0>`` left behind, and a second write to the same bit
+    would bring the first value back into play. Either is refused rather than
+    compared on a model that does not describe it.
+    """
+    measured: set[Any] = set()
+    for instruction in circuit.data:
+        if instruction.operation.name != "measure":
+            continue
+        for qubit in instruction.qubits:
+            if qubit in measured:
+                raise ValueError(
+                    "cannot verify a circuit that measures qubit "
+                    f"{circuit.find_bit(qubit).index} more than once"
+                )
+            measured.add(qubit)
+    writes = _measurement_writes(circuit)
+    for clbit, count in writes.items():
+        if count > 1:
+            raise ValueError(
+                "cannot verify a circuit that writes classical bit "
+                f"{circuit.find_bit(clbit).index} with more than one measurement"
+            )
+    return writes
 
 
 def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:

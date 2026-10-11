@@ -902,3 +902,170 @@ def test_verification_fits_in_memory_well_below_the_width_limit() -> None:
     plan = aggregate_remote_operations(qc, arch)
     assert plan.blocks, "the fixture must cross QPUs"
     assert verify_telegate_equivalence(qc, arch, plan)
+
+
+def test_verification_refuses_a_qubit_measured_twice() -> None:
+    """Moving a measured qubit into its bit's ancilla describes one measurement.
+
+    A second measurement of the same qubit would read the ``|0>`` left behind,
+    so a program that dropped it would have verified, and one that measured in
+    the other order would not. The circuit is refused instead.
+    """
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 2)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+    mapped.measure(0, 1)
+    program = split_into_qpus(mapped, arch)
+
+    with pytest.raises(ValueError, match="measures qubit 0 more than once"):
+        verify_distributed_program(
+            mapped, program.local_circuits, program.remote_ops, arch
+        )
+
+
+def test_verification_refuses_two_measurements_into_one_bit() -> None:
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+    mapped.measure(1, 0)
+    program = split_into_qpus(mapped, arch)
+
+    with pytest.raises(ValueError, match="writes classical bit 0 with more than one"):
+        verify_distributed_program(
+            mapped, program.local_circuits, program.remote_ops, arch
+        )
+
+
+def test_verification_rejects_a_program_that_drops_a_measurement() -> None:
+    """A program recording fewer bits than its circuit does not compute it."""
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 2)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+    mapped.measure(1, 1)  # qubit 1 is always 0, so its outcome is predictable
+    program = split_into_qpus(mapped, arch)
+
+    original = program.local_circuits[0]
+    dropped = original.copy_empty_like()
+    for instruction in original.data:
+        if not (
+            instruction.operation.name == "measure"
+            and original.find_bit(instruction.clbits[0]).index == 1
+        ):
+            dropped.append(instruction)
+
+    assert not verify_distributed_program(
+        mapped, {0: dropped, 1: program.local_circuits[1]}, program.remote_ops, arch
+    )
+
+
+def test_both_verifiers_refuse_a_classical_store_with_a_value_error() -> None:
+    """A store names its target inside the operation, so the clbit check missed it."""
+    from qiskit.circuit.classical import expr
+
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.store(mapped.clbits[0], expr.lift(True))
+
+    with pytest.raises(ValueError, match="classical store"):
+        verify_telegate_equivalence(mapped, arch)
+    # The split refuses it first, as it refuses any store.
+    with pytest.raises(ValueError, match="store"):
+        verify_distributed_program(mapped, {}, [], arch)
+
+
+@pytest.mark.parametrize("name", ["cat", "cat_c", "q"])
+@pytest.mark.parametrize("coherent", [True, False])
+def test_telegate_registers_do_not_collide_with_the_circuits_own(
+    name: str, coherent: bool
+) -> None:
+    """A classical register called ``cat`` is a natural name for a cat readout."""
+    from qiskit import ClassicalRegister, QuantumRegister
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(
+        QuantumRegister(arch.n_phys, "data"), ClassicalRegister(2, name)
+    )
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.cx(0, 4)
+    mapped.measure(0, 0)
+    mapped.measure(3, 1)
+
+    program = build_telegate_circuit(mapped, arch, coherent=coherent)
+
+    names = [register.name for register in program.circuit.qregs]
+    names += [register.name for register in program.circuit.cregs]
+    assert len(names) == len(set(names))
+    assert name in [register.name for register in program.circuit.cregs]
+    if coherent:
+        assert verify_telegate_equivalence(mapped, arch)
+    else:
+        qasm3.dumps(program.circuit)
+
+
+def test_telegate_refuses_classical_variables_with_a_value_error() -> None:
+    from qiskit.circuit.classical import expr
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.measure(0, 0)
+    flag = mapped.add_var("flag", expr.lift(mapped.clbits[0]))
+    with mapped.if_test(flag):
+        mapped.x(4)
+
+    with pytest.raises(ValueError, match="classical variables"):
+        build_telegate_circuit(mapped, arch)
+
+
+def test_a_wide_gate_acting_diagonally_on_a_root_keeps_its_cat_copy() -> None:
+    """A Toffoli control commutes with Z, so the copy survives it.
+
+    Closing the root's packet anyway charged a second EPR pair the protocol
+    never needs; the single-block plan below verifies by simulation.
+    """
+    from quport.hypergraph import build_distributable_packets, ebit_cost
+
+    arch = _arch(compute=3)
+    qc = QuantumCircuit(arch.n_phys)
+    qc.h(0)
+    qc.cx(0, 4)
+    qc.ccx(0, 1, 2)  # local to QPU 0, root 0 as a control
+    qc.cx(0, 4)
+
+    part = [arch.qpu_of_phys(phys) for phys in range(arch.n_phys)]
+    plan = aggregate_remote_operations(qc, arch)
+
+    assert ebit_cost(build_distributable_packets(qc), part, 2) == 1
+    assert plan.epr_pairs == 1
+    assert [block.gate_indices for block in plan.blocks] == [(1, 3)]
+    assert verify_telegate_equivalence(qc, arch, plan)
+
+    # The root as the Toffoli's target is non-diagonal: the copy must close.
+    target = QuantumCircuit(arch.n_phys)
+    target.h(0)
+    target.cx(0, 4)
+    target.ccx(1, 2, 0)
+    target.cx(0, 4)
+    assert aggregate_remote_operations(target, arch).epr_pairs == 2
+    assert verify_telegate_equivalence(target, arch)
