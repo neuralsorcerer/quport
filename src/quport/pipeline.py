@@ -178,9 +178,9 @@ def validate_transpiler_settings(cfg: MultiQPUConfig) -> None:
 
     ``MultiQPUConfig`` checks only that they are non-empty strings; Qiskit
     rejects an unknown layout or routing plugin, a basis gate it does not
-    define, or a basis gate on three or more qubits next to a coupling map --
-    which every QuPort pipeline routes on -- but only once ``transpile`` runs,
-    after partitioning. This applies the same rules up front, read from
+    define, or a basis gate on other than one or two qubits next to a coupling
+    map -- which every QuPort pipeline routes on -- but only once ``transpile``
+    runs, after partitioning. This applies the same rules up front, read from
     Qiskit's own registries, so what passes here is what ``transpile`` accepts.
     """
     for stage, method in (
@@ -202,10 +202,10 @@ def validate_transpiler_settings(cfg: MultiQPUConfig) -> None:
             raise ValueError(
                 f"basis_gates entry {gate!r} is not a standard Qiskit gate"
             )
-        if operation.num_qubits > 2:
+        if operation.num_qubits not in (1, 2):
             raise ValueError(
                 f"basis_gates entry {gate!r} acts on {operation.num_qubits} qubits; "
-                "Qiskit routes on a coupling map only with gates on at most two"
+                "Qiskit routes on a coupling map only with gates on one or two"
             )
 
 

@@ -46,7 +46,9 @@ includes the fields only some topologies read (`grid_rows`/`grid_cols` for
 `grid2d`, `inter_degree` for `degree_d`, the switch limits on switch-like
 fabrics), `link_capacity`, and the transpiler settings: `layout_method` and
 `routing_method` must name installed Qiskit plugins, and every `basis_gates`
-entry must be a standard Qiskit gate on at most two qubits.
+entry must be a standard Qiskit gate on one or two qubits (so not
+`global_phase`, which Qiskit refuses next to a coupling map) or a control-flow
+operation such as `if_else`.
 
 `dump_config` writes integral and real values as plain numbers, so a config
 holding a NumPy integer saves and loads back, and it serializes before opening

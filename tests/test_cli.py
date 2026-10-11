@@ -1332,3 +1332,98 @@ def test_a_bad_config_exits_without_a_traceback(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert isinstance(result.exception, SystemExit)
+
+
+def test_input_qasm_loader_reads_what_qiskits_own_exporter_writes(
+    tmp_path: Path,
+) -> None:
+    """``qasm2.dumps`` writes ``sx``, ``swap`` and ``cp``, which qelib1.inc lacks."""
+    circuit = QuantumCircuit(3, 3)
+    circuit.sx(0)
+    circuit.swap(0, 1)
+    circuit.cp(0.25, 1, 2)
+    circuit.rzz(0.5, 0, 2)
+    circuit.measure(range(3), range(3))
+    path = tmp_path / "exported.qasm"
+    path.write_text(qasm2.dumps(circuit), encoding="utf-8")
+
+    loaded = _load_or_random_circuit(
+        input_qasm=str(path), n_logical=None, depth=1, seed=0
+    )
+
+    assert dict(loaded.count_ops()) == dict(circuit.count_ops())
+
+
+def test_input_qasm_loader_reports_a_file_that_is_not_utf8(tmp_path: Path) -> None:
+    path = tmp_path / "latin1.qasm"
+    path.write_bytes(b"OPENQASM 2.0;\n// caf\xe9\nqreg q[1];\n")
+
+    with pytest.raises(typer.BadParameter, match="Unable to read --input-qasm"):
+        _load_or_random_circuit(input_qasm=str(path), n_logical=None, depth=1, seed=0)
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    [
+        ('{"routing_method": "stochastic"}', "routing_method 'stochastic'"),
+        ('{"layout_method": "noise_adaptive"}', "layout_method 'noise_adaptive'"),
+        (
+            '{"basis_gates": ["cx", "rz", "sx", "x", "foo"]}',
+            "'foo' is not a standard Qiskit gate",
+        ),
+        (
+            '{"basis_gates": ["ccx", "cx", "rz", "sx", "x"]}',
+            "'ccx' acts on 3 qubits",
+        ),
+        (
+            '{"basis_gates": ["cx", "rz", "sx", "x", "global_phase"]}',
+            "'global_phase' acts on 0 qubits",
+        ),
+        ('{"basis_gates": ["cx", "rz", "sx", "x", "barrier"]}', "'barrier'"),
+    ],
+)
+def test_transpiler_settings_qiskit_would_refuse_are_reported_at_load(
+    tmp_path: Path, contents: str, expected: str
+) -> None:
+    """Qiskit refuses these too, but only once ``transpile`` runs, after partitioning."""
+    from quport.cli import _load_config_or_default
+
+    config = tmp_path / "cfg.json"
+    config.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(typer.BadParameter, match=re.escape(expected)):
+        _load_config_or_default(str(config))
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        '{"routing_method": "basic", "layout_method": "dense"}',
+        '{"routing_method": "lookahead", "layout_method": "trivial"}',
+        '{"basis_gates": ["cz", "rz", "sx", "x", "measure", "reset", "delay"]}',
+        '{"basis_gates": ["cx", "rz", "sx", "x", "if_else", "for_loop"]}',
+    ],
+)
+def test_transpiler_settings_qiskit_accepts_load(tmp_path: Path, contents: str) -> None:
+    from qiskit import transpile
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.cli import _load_config_or_default
+
+    config = tmp_path / "cfg.json"
+    config.write_text(contents, encoding="utf-8")
+    cfg = _load_config_or_default(str(config))
+
+    # The check must agree with Qiskit's own, on the coupling map it routes on.
+    circuit = QuantumCircuit(3)
+    circuit.h(0)
+    circuit.cx(0, 2)
+    transpile(
+        circuit,
+        coupling_map=MultiQPUArchitecture(cfg).build_coupling_map(),
+        basis_gates=list(cfg.basis_gates),
+        layout_method=cfg.layout_method,
+        routing_method=cfg.routing_method,
+        optimization_level=0,
+        seed_transpiler=0,
+    )
