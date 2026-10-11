@@ -460,8 +460,11 @@ def aggregate_remote_operations(
         qpus = [phys_to_qpu[qubit] for qubit in qubits]
 
         if arity > 2:
-            for qubit in qubits:
-                close_root(qubit)
+            # Only the operands it acts on non-diagonally lose their copies; a
+            # teleport round trip carries a root's cat copies along.
+            for position, qubit in enumerate(qubits):
+                if position not in diagonal:
+                    close_root(qubit)
             host = qpus[0]
             # Every operand off the host is teleported, including two that share
             # a QPU: one EPR pair moves one qubit, so gathering only one of them

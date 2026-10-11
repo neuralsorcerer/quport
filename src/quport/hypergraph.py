@@ -286,10 +286,13 @@ def build_distributable_packets(
             continue
 
         if arity > 2:
-            # A bipartite cat copy cannot merge three or more QPUs, so treat the
-            # whole operation as teleport-served and release every root it touches.
-            for qubit in qubits:
-                close(qubit)
+            # A bipartite cat copy cannot merge three or more QPUs, so the whole
+            # operation is teleport-served. That disturbs only the roots it acts
+            # on non-diagonally: a teleport round trip carries a root's cat
+            # copies along, so a Toffoli control keeps its packet open.
+            for position, qubit in enumerate(qubits):
+                if position not in diagonal:
+                    close(qubit)
             unpackable.append(
                 UnpackableGate(index=index, qubits=tuple(dict.fromkeys(qubits)))
             )
