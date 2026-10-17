@@ -108,9 +108,11 @@ class TelegateProgram:
     blocks / epr_pairs:
         Blocks expanded and EPR pairs they consume, copied from the plan.
     unschedulable_gates:
-        Cross-QPU gates the plan could not serve. They are emitted verbatim, so
-        the circuit stays semantically faithful, but a real machine could not
-        run them as written.
+        Cross-QPU gates the plan leaves unserved -- those it marks
+        unschedulable, and any a plan built for another circuit does not cover.
+        Counted on the emitted circuit: they are emitted verbatim, so the
+        circuit stays semantically faithful, but a real machine could not run
+        them as written.
     measured:
         True when the circuit uses mid-circuit measurement and classical
         feedforward instead of the coherent form.
@@ -165,7 +167,74 @@ def _validate_plan(
         return aggregate_remote_operations(mapped, arch, ports_per_qpu=ports_per_qpu)
     if not isinstance(plan, AggregationPlan):
         raise ValueError("plan must be an AggregationPlan")
+    _require_plan_for(plan, mapped, arch)
     return plan
+
+
+def _require_plan_for(
+    plan: AggregationPlan, mapped: QuantumCircuit, arch: MultiQPUArchitecture
+) -> None:
+    """Refuse a supplied plan that does not describe ``mapped``.
+
+    A plan built for another circuit, or by hand, can name gates that are not
+    there or a root that is not their operand; expanding it would fail deep
+    inside, or rewire the wrong qubits. Everything the expansion relies on is
+    checked here instead.
+    """
+    n_qpus = arch.cfg.n_qpus
+    width = len(mapped.qubits)
+    qindex = {qubit: index for index, qubit in enumerate(mapped.qubits)}
+    seen: set[tuple[str, int, int, tuple[int, ...]]] = set()
+    for ordinal, block in enumerate(plan.blocks):
+        where = f"plan block {ordinal}"
+        if not isinstance(block, RemoteBlock):
+            raise ValueError(f"{where} must be a RemoteBlock")
+        if block.protocol not in ("cat", "teleport"):
+            raise ValueError(f"{where} has unknown protocol {block.protocol!r}")
+        indices = block.gate_indices
+        if (
+            not isinstance(indices, tuple)
+            or not indices
+            or any(type(index) is not int for index in indices)
+            or any(b <= a for a, b in zip(indices, indices[1:]))
+            or indices[0] < 0
+            or indices[-1] >= len(mapped.data)
+        ):
+            raise ValueError(
+                f"{where} must name a non-empty, increasing run of the circuit's "
+                f"{len(mapped.data)} instructions"
+            )
+        root = block.root_phys
+        if type(root) is not int or not 0 <= root < min(width, arch.n_phys):
+            raise ValueError(f"{where} roots a qubit the circuit does not have")
+        if block.root_qpu != arch.qpu_of_phys(root):
+            raise ValueError(f"{where} places its root on the wrong QPU")
+        if (
+            type(block.remote_qpu) is not int
+            or not 0 <= block.remote_qpu < n_qpus
+            or block.remote_qpu == block.root_qpu
+        ):
+            raise ValueError(f"{where} names an invalid remote QPU")
+        for index in indices:
+            instruction = mapped.data[index]
+            operands = [qindex[qubit] for qubit in instruction.qubits]
+            if (
+                is_directive(instruction.operation)
+                or root not in operands
+                or not any(
+                    operand < arch.n_phys
+                    and arch.qpu_of_phys(operand) == block.remote_qpu
+                    for operand in operands
+                )
+            ):
+                raise ValueError(
+                    f"{where} serves instruction {index}, which is not a gate "
+                    f"between its root and QPU {block.remote_qpu}"
+                )
+        key = (block.protocol, root, block.remote_qpu, indices)
+        if key in seen:
+            raise ValueError(f"{where} repeats an earlier block")
+        seen.add(key)
 
 
 def build_telegate_circuit(
@@ -328,6 +397,7 @@ def build_telegate_circuit(
             circuit.reset(copy)
         pool.release(copy)
 
+    unserved = 0
     for index, instruction in enumerate(mapped.data):
         operation = instruction.operation
         qubits = [qindex[qubit] for qubit in instruction.qubits]
@@ -340,14 +410,23 @@ def build_telegate_circuit(
         for block in starts.get(index, ()):
             open_block(block)
 
-        serving = members.get(index)
-        if serving:
-            substitution = {
-                block.root_phys: copy_of[block_key(block)] for block in serving
-            }
-            operands = [substitution.get(qubit, qubit) for qubit in qubits]
-        else:
-            operands = qubits
+        serving = members.get(index) or []
+        substitution = {block.root_phys: copy_of[block_key(block)] for block in serving}
+        operands = [substitution.get(qubit, qubit) for qubit in qubits]
+        # Where each operand sits once the plan has served the gate: a root on
+        # its copy's QPU, everything else where it lives. A gate still spanning
+        # QPUs is emitted verbatim, which no machine can run as written.
+        hosted = {block.root_phys: block.remote_qpu for block in serving}
+        if len(qubits) > 1 and (
+            len(
+                {
+                    hosted[qubit] if qubit in hosted else arch.qpu_of_phys(qubit)
+                    for qubit in qubits
+                }
+            )
+            > 1
+        ):
+            unserved += 1
 
         circuit.append(operation, [circuit.qubits[q] for q in operands], clbits)
 
@@ -365,7 +444,7 @@ def build_telegate_circuit(
         ancillas=tuple(range(n_data, n_data + used)),
         blocks=len(resolved.blocks),
         epr_pairs=resolved.epr_pairs,
-        unschedulable_gates=resolved.unschedulable_gates,
+        unschedulable_gates=unserved,
         measured=not coherent,
     )
 
@@ -458,6 +537,7 @@ def verify_telegate_equivalence(
     from qiskit.quantum_info import Statevector
 
     tolerance = _validated_atol(atol)
+    _require_bound_parameters(mapped)
     program = build_telegate_circuit(
         mapped, arch, plan, coherent=True, ports_per_qpu=ports_per_qpu
     )
@@ -563,9 +643,11 @@ def verify_distributed_program(
     from qiskit.quantum_info import Statevector
 
     tolerance = _validated_atol(atol)
+    _require_bound_parameters(mapped)
     merged = reassemble_distributed_program(
         mapped, local_routed, remote_ops, arch, restore_layout=True
     )
+    _require_bound_parameters(merged)
     # Refuses mid-circuit measurement, reset and classical control, so every
     # measurement left in `mapped` -- and so in `merged` -- is terminating.
     _unitary_part(mapped, label="the mapped circuit")
@@ -612,12 +694,30 @@ def verify_distributed_program(
 _NON_UNITARY_OPS = frozenset({"measure", "reset", "initialize"})
 
 
+def _require_bound_parameters(circuit: QuantumCircuit) -> None:
+    """Refuse a circuit with unbound parameters, which has no state to simulate."""
+    if circuit.parameters:
+        names = ", ".join(sorted(parameter.name for parameter in circuit.parameters))
+        raise ValueError(
+            f"cannot verify a circuit with unbound parameters ({names}); assign "
+            "them values first"
+        )
+
+
+#: The smallest tolerance on ``1 - fidelity`` a verifier accepts. Correct
+#: programs at the verifiable widths land within about ``1e-13`` of a perfect
+#: fidelity from floating-point rounding alone, so anything tighter would fail
+#: them on rounding rather than on what they compute.
+MIN_VERIFICATION_ATOL = 1e-12
+
+
 def _validated_atol(atol: object) -> float:
-    """Return a tolerance on ``1 - fidelity`` that can still fail a check.
+    """Return a tolerance on ``1 - fidelity`` that can still decide a check.
 
     A boolean is not a tolerance, and one of 1 or more -- or an infinite one --
     passes every circuit, while NaN fails every one; each would turn the
-    verification into a constant.
+    verification into a constant. So would one below the simulation's rounding
+    error, from the other side: ``0`` fails even an empty circuit.
     """
     if is_boolean(atol):
         raise ValueError("atol must be numeric, not boolean")
@@ -625,8 +725,11 @@ def _validated_atol(atol: object) -> float:
         value = float(cast(SupportsFloat | SupportsIndex | str, atol))
     except (TypeError, ValueError, OverflowError):
         raise ValueError("atol must be numeric") from None
-    if not math.isfinite(value) or not 0.0 <= value < 1.0:
-        raise ValueError("atol must be a finite tolerance in [0, 1)")
+    if not math.isfinite(value) or not MIN_VERIFICATION_ATOL <= value < 1.0:
+        raise ValueError(
+            f"atol must be a finite tolerance in [{MIN_VERIFICATION_ATOL:g}, 1): "
+            "below that, rounding in the simulation fails correct programs"
+        )
     return value
 
 

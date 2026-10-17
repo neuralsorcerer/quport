@@ -611,6 +611,15 @@ the ground state. `n_ancillas` is a convenience property.
 product input, traces out the ancillas, and compares the data qubits' reduced
 state with the mapped circuit's. It raises for plans with unschedulable gates,
 and for circuits wider than `quport.protocol.MAX_VERIFIABLE_QUBITS` (24).
+A supplied plan must describe the circuit -- each block an increasing run of its
+instructions, every one a gate between the block's root and its remote QPU --
+or `build_telegate_circuit` raises `ValueError`; a cross-QPU gate the plan
+leaves unserved counts toward `unschedulable_gates`.
+
+Both verifiers refuse a circuit with unbound parameters, and take `atol` as a
+tolerance on `1 - fidelity` in `[quport.protocol.MIN_VERIFICATION_ATOL, 1)`:
+correct programs land within about `1e-13` of a perfect fidelity from rounding
+alone, so a tighter tolerance than `1e-12` would fail them.
 
 ### Schedule dataclasses
 

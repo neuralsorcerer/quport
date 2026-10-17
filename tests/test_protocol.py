@@ -1197,3 +1197,118 @@ def test_both_verifiers_accept_a_numpy_integer_seed() -> None:
     )
     with pytest.raises(ValueError, match="seed"):
         verify_telegate_equivalence(mapped, arch, seed=np.bool_(True))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("atol", [0.0, -0.0, 1e-300, 1e-13])
+def test_verifiers_refuse_a_tolerance_below_the_rounding_floor(atol: float) -> None:
+    """At atol=0 even an empty circuit failed: the fidelity is never exactly 1."""
+    from quport.protocol import MIN_VERIFICATION_ATOL, verify_distributed_program
+
+    arch = _arch(compute=2)
+    empty = QuantumCircuit(arch.n_phys)
+    with pytest.raises(ValueError, match="rounding"):
+        verify_telegate_equivalence(empty, arch, atol=atol)
+    with pytest.raises(ValueError, match="rounding"):
+        verify_distributed_program(empty, {}, [], arch, atol=atol)
+    assert verify_telegate_equivalence(empty, arch, atol=MIN_VERIFICATION_ATOL)
+
+
+def test_a_cross_qpu_gate_the_plan_never_serves_counts_as_unschedulable() -> None:
+    """A stale plan used to certify a circuit with a gate left running across QPUs."""
+    from quport.config import LatencyModel
+    from quport.schedule import estimate_entanglement_schedule
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    plan = aggregate_remote_operations(mapped, arch)
+    mapped.h(1)
+    mapped.cx(1, 4)  # the plan was built before this gate existed
+
+    program = build_telegate_circuit(mapped, arch, plan)
+    assert program.unschedulable_gates == 1
+    assert (
+        estimate_entanglement_schedule(
+            mapped, arch, LatencyModel(), plan=plan
+        ).unschedulable_gates
+        == 1
+    )
+    with pytest.raises(ValueError, match="unschedulable"):
+        verify_telegate_equivalence(mapped, arch, plan)
+
+
+def _plan_with(*blocks: RemoteBlock) -> AggregationPlan:
+    return AggregationPlan(
+        blocks=tuple(blocks),
+        remote_gates=len(blocks),
+        epr_pairs=len(blocks),
+        baseline_epr_pairs=len(blocks),
+        unschedulable_gates=0,
+        evictions=0,
+        peak_cat_copies=(0, 1),
+    )
+
+
+def _cat(
+    root: int, *indices: int, root_qpu: int = 0, remote_qpu: int = 1
+) -> RemoteBlock:
+    return RemoteBlock(
+        protocol="cat",
+        root_phys=root,
+        root_qpu=root_qpu,
+        remote_qpu=remote_qpu,
+        gate_indices=tuple(indices),
+        epr_pairs=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "plan",
+    [
+        _plan_with(_cat(0, 0)),  # instruction 0 is the h, not a gate to QPU 1
+        _plan_with(_cat(0, 1), _cat(0, 1)),  # the same block twice
+        _plan_with(_cat(0, 3, 1)),  # out of order
+        _plan_with(_cat(0)),  # serves nothing
+        _plan_with(_cat(0, 1, 99)),  # past the circuit
+        _plan_with(_cat(17, 1)),  # a root the circuit does not have
+        _plan_with(_cat(0, 2)),  # the barrier
+        _plan_with(_cat(0, 1, remote_qpu=0)),  # remote QPU is the root's own
+    ],
+)
+def test_a_plan_that_does_not_describe_the_circuit_is_refused(
+    plan: AggregationPlan,
+) -> None:
+    """These raised KeyError, IndexError or a Qiskit error from deep inside."""
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.barrier()
+    mapped.cx(0, 4)
+
+    with pytest.raises(ValueError, match="plan block"):
+        build_telegate_circuit(mapped, arch, plan)
+    with pytest.raises(ValueError, match="plan block"):
+        verify_telegate_equivalence(mapped, arch, plan)
+
+
+def test_both_verifiers_refuse_unbound_parameters_with_a_value_error() -> None:
+    from qiskit.circuit import Parameter
+
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.rx(Parameter("theta"), 0)
+    program = split_into_qpus(mapped, arch)
+
+    with pytest.raises(ValueError, match="unbound parameters \\(theta\\)"):
+        verify_telegate_equivalence(mapped, arch)
+    with pytest.raises(ValueError, match="unbound parameters \\(theta\\)"):
+        verify_distributed_program(
+            mapped, program.local_circuits, program.remote_ops, arch
+        )
