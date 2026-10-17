@@ -1427,3 +1427,37 @@ def test_transpiler_settings_qiskit_accepts_load(tmp_path: Path, contents: str) 
         optimization_level=0,
         seed_transpiler=0,
     )
+
+
+@pytest.mark.parametrize("in_include", [False, True])
+def test_input_qasm_loader_keeps_a_programs_own_gate_definitions(
+    tmp_path: Path, in_include: bool
+) -> None:
+    """Qiskit's legacy gates fill in names the program leaves undefined only.
+
+    Loading them for every name replaced a program's own ``swap`` with a real
+    SWAP, and rejected an ``rzz`` defined without a parameter.
+    """
+    from qiskit.quantum_info import Operator
+
+    definitions = "gate swap a, b { cx a, b; }\ngate rzz a, b { cz a, b; }\n"
+    body = "qreg q[3];\nx q[0];\nswap q[0], q[1];\nrzz q[1], q[2];\nsx q[2];\n"
+    header = 'OPENQASM 2.0;\ninclude "qelib1.inc";\n'
+    if in_include:
+        (tmp_path / "mine.inc").write_text(definitions, encoding="utf-8")
+        source = header + 'include "mine.inc";\n' + body
+    else:
+        source = header + definitions + body
+    path = tmp_path / "own.qasm"
+    path.write_text(source, encoding="utf-8")
+
+    loaded = _load_or_random_circuit(
+        input_qasm=str(path), n_logical=None, depth=1, seed=0
+    )
+
+    expected = QuantumCircuit(3)
+    expected.x(0)
+    expected.cx(0, 1)
+    expected.cz(1, 2)
+    expected.sx(2)  # still Qiskit's: the program does not define it
+    assert Operator(loaded).equiv(Operator(expected))

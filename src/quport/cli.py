@@ -106,6 +106,37 @@ def _qasm_version(source: str) -> int | None:
     return int(match.group(1))
 
 
+_QASM2_DEFINITION_RE = re.compile(r"\b(?:gate|opaque)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_QASM2_INCLUDE_RE = re.compile(r'\binclude\s+"([^"]+)"\s*;')
+
+
+def _qasm2_defined_gate_names(
+    source: str, include_path: tuple[str, ...], seen: set[str]
+) -> set[str]:
+    """Names an OpenQASM 2 program defines with ``gate`` or ``opaque``.
+
+    Definitions in the files it includes count too, found on ``include_path``
+    as the parser finds them; ``qelib1.inc`` is the parser's own and is skipped.
+    A file that cannot be read is left for the parser to report.
+    """
+    code = re.sub(r"//[^\n]*", "", source)
+    names = set(_QASM2_DEFINITION_RE.findall(code))
+    for included in _QASM2_INCLUDE_RE.findall(code):
+        if included == "qelib1.inc" or included in seen:
+            continue
+        seen.add(included)
+        for directory in include_path:
+            candidate = Path(directory) / included
+            if candidate.is_file():
+                try:
+                    text = candidate.read_text(encoding="utf-8-sig")
+                except (OSError, UnicodeDecodeError):
+                    break
+                names |= _qasm2_defined_gate_names(text, include_path, seen)
+                break
+    return names
+
+
 def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
     """Load an OpenQASM 2/3 circuit with clear errors for optional dependencies."""
     input_path = Path(input_qasm)
@@ -126,10 +157,19 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
         # Qiskit's own exporter writes gates such as `sx`, `swap` and `cp` that
         # the paper-era qelib1.inc lacks; `QuantumCircuit.from_qasm_file` reads
         # them through the legacy definitions, and so must this.
+        # A program's own definition of such a name still wins, though: the
+        # legacy table would otherwise replace it with Qiskit's gate, or
+        # reject it when the signatures differ.
+        include_path = (".", str(input_path.parent))
+        defined = _qasm2_defined_gate_names(source, include_path, set())
         return qasm2.loads(
             source,
-            include_path=(".", str(input_path.parent)),
-            custom_instructions=qasm2.LEGACY_CUSTOM_INSTRUCTIONS,
+            include_path=include_path,
+            custom_instructions=[
+                instruction
+                for instruction in qasm2.LEGACY_CUSTOM_INSTRUCTIONS
+                if instruction.name not in defined
+            ],
         )
 
     def parse_qasm3() -> QuantumCircuit:
