@@ -165,8 +165,18 @@ class MultiQPUConfig:
         if optimization_level > 3:
             raise ValueError("optimization_level must be between 0 and 3")
 
-        _validate_nonempty_string(self.layout_method, label="layout_method")
-        _validate_nonempty_string(self.routing_method, label="routing_method")
+        # Stored stripped, as basis gate names are: Qiskit looks plugins up by
+        # exact name, so a stray space would only fail once transpile runs.
+        object.__setattr__(
+            self,
+            "layout_method",
+            _validate_nonempty_string(self.layout_method, label="layout_method"),
+        )
+        object.__setattr__(
+            self,
+            "routing_method",
+            _validate_nonempty_string(self.routing_method, label="routing_method"),
+        )
 
     def total_physical_qubits(self) -> int:
         return self.n_qpus * (self.compute_qubits_per_qpu + self.comm_qubits_per_qpu)

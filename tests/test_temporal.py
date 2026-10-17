@@ -700,3 +700,28 @@ def test_a_moving_plan_is_strictly_cheaper_than_each_placement_it_contains(
         assert plan.stationary_cost <= held
         if plan.cost.moves:
             assert plan.cost.total < held
+
+
+def test_optimize_temporal_partition_validates_its_seed() -> None:
+    """random.Random refused a NumPy integer and took True as 1."""
+    import numpy as np
+
+    qc = QuantumCircuit(4)
+    qc.cx(0, 2)
+    qc.cx(1, 3)
+    qc.cx(0, 3)
+    qc.cx(1, 2)
+    packets = build_distributable_packets(qc)
+    windows = split_windows(packets, 2)
+
+    numpy_seeded = optimize_temporal_partition(
+        packets, [0, 0, 1, 1], 2, 2, windows, seed=np.int64(3)  # type: ignore[arg-type]
+    )
+    assert numpy_seeded == optimize_temporal_partition(
+        packets, [0, 0, 1, 1], 2, 2, windows, seed=3
+    )
+    for bad in (True, np.bool_(False), 1.5, "3"):
+        with pytest.raises(ValueError, match="seed must be an integer"):
+            optimize_temporal_partition(
+                packets, [0, 0, 1, 1], 2, 2, windows, seed=bad  # type: ignore[arg-type]
+            )

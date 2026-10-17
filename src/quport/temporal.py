@@ -188,9 +188,7 @@ class TemporalResult:
         neighbourhood includes the whole-circuit interval, so the search also
         re-places qubits for the entire circuit, and part of the improvement
         over ``static_cost`` can be better static placement rather than
-        migration. To separate the two, run the same search with a single
-        window -- migration is then impossible by construction -- and compare
-        against that, which is what ``stationary_cost`` records.
+        migration. ``stationary_cost`` separates the two.
     stationary_cost:
         Cost of the best migration-free placement the search reached: the
         single-window search's, or any window's assignment held for the whole
@@ -562,6 +560,11 @@ def optimize_temporal_partition(
     passes_allowed = _validate_nonnegative_int(max_passes, label="max_passes")
 
     n_qubits = decomposition.n_qubits
+    if seed is not None:
+        # random.Random accepts True as 1 and refuses a NumPy integer.
+        if type(seed) is bool or not isinstance(seed, Integral):
+            raise ValueError("seed must be an integer or None")
+        seed = int(seed)
     seed_partition = static_temporal_partition(part, windows)
     starts, last_stop = _validate_temporal_partition(
         seed_partition, n_qubits=n_qubits, n_qpus=n_qpus_value

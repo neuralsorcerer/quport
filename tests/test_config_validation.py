@@ -278,3 +278,11 @@ def test_dump_config_writes_decimal_values_as_numbers(tmp_path, suffix: str) -> 
     loaded = load_config(str(path))
     assert loaded.async_overlap == 0.5
     assert loaded.switch_reconfig_delay == 2.5
+
+
+def test_transpiler_method_names_are_stored_stripped() -> None:
+    """Basis gate names were stripped but plugin names were not, so Qiskit later
+    refused 'sabre ' -- after partitioning."""
+    cfg = MultiQPUConfig(layout_method=" dense", routing_method="sabre ")
+
+    assert (cfg.layout_method, cfg.routing_method) == ("dense", "sabre")
