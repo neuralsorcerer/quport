@@ -1455,3 +1455,40 @@ def test_a_non_sequence_adjacency_is_a_value_error() -> None:
     broken = QpuShortestPaths(dist=paths.dist, next_hop=paths.next_hop, adj=5)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="adjacency must be a sequence of rows"):
         route_link_loads([[0.0, 1.0], [1.0, 0.0]], broken, mode="ecmp")
+
+
+def test_single_path_routing_refuses_next_hops_off_the_graph() -> None:
+    """ECMP checked its distances against the graph; single-path did not."""
+    traffic = [[0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [5.0, 0.0, 0.0]]
+    sp = all_pairs_shortest_paths([[1], [0, 2], [1]])  # path graph, no 0-2 link
+    assert route_link_loads(traffic, sp, "single_path") == {(0, 1): 5.0, (1, 2): 5.0}
+
+    hops = [list(row) for row in sp.next_hop]
+    hops[0][2] = 2
+    hops[2][0] = 0
+    across = QpuShortestPaths(dist=sp.dist, next_hop=hops, adj=sp.adj)
+    with pytest.raises(ValueError, match="not a neighbour one step closer"):
+        route_link_loads(traffic, across, "single_path")
+
+
+def test_single_path_routing_refuses_the_long_way_round() -> None:
+    from quport.network import prepare_routing_tables
+
+    cycle = all_pairs_shortest_paths([[1, 3], [0, 2], [1, 3], [0, 2]])
+    hops = [list(row) for row in cycle.next_hop]
+    hops[0][1] = 3
+    hops[3][1] = 2
+    detour = QpuShortestPaths(dist=cycle.dist, next_hop=hops, adj=cycle.adj)
+    with pytest.raises(ValueError, match="not a neighbour one step closer"):
+        prepare_routing_tables(detour, 4, "single_path")
+
+
+def test_single_path_routing_refuses_a_route_between_disconnected_qpus() -> None:
+    from quport.network import prepare_routing_tables
+
+    sp = all_pairs_shortest_paths([[1], [0], []])
+    hops = [list(row) for row in sp.next_hop]
+    hops[0][2] = 1
+    bridged = QpuShortestPaths(dist=sp.dist, next_hop=hops, adj=sp.adj)
+    with pytest.raises(ValueError, match="does not connect"):
+        prepare_routing_tables(bridged, 3, "single_path")

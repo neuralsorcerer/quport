@@ -692,7 +692,60 @@ def prepare_routing_tables(
                 raise ValueError("shortest-path next_hop must contain integer indices")
             if hop < -1 or hop >= n:
                 raise ValueError("shortest-path next_hop contains invalid indices")
+    if sp.adj is not None:
+        adj_rows = _as_nonstring_sequence(sp.adj, label="shortest-path adjacency")
+        if len(adj_rows) != n:
+            raise ValueError(
+                "shortest-path adjacency dimensions do not match traffic matrix"
+            )
+        _require_shortest_next_hops(
+            cast(Sequence[Sequence[int]], hop_matrix),
+            _normalize_undirected_adjacency(
+                cast(Sequence[Sequence[int]], adj_rows),
+                label="shortest-path adjacency",
+            ),
+        )
     return RoutingTables(n=n, mode=mode, dist=[], neighbors=[], next_hop=hop_matrix)
+
+
+def _require_shortest_next_hops(
+    next_hop: Sequence[Sequence[int]], neighbors: Sequence[Sequence[int]]
+) -> None:
+    """Require every next hop to be a neighbour one step closer to its target.
+
+    Single-path routing follows the next-hop table and nothing else, so a table
+    that steps across a link the graph lacks, or the long way round, would be
+    routed without complaint. When the adjacency is known it is the network,
+    and every route the table describes must be a shortest path through it --
+    what :func:`_require_graph_distances` asks of the distances in ECMP mode.
+    """
+    n = len(next_hop)
+    for dst in range(n):
+        # Distances to ``dst``; the graph is undirected, so a search from it.
+        found = [UNREACHABLE_DISTANCE] * n
+        found[dst] = 0
+        queue = deque([dst])
+        while queue:
+            u = queue.popleft()
+            for v in neighbors[u]:
+                if found[v] == UNREACHABLE_DISTANCE:
+                    found[v] = found[u] + 1
+                    queue.append(v)
+        for src in range(n):
+            if src == dst:
+                continue
+            hop = next_hop[src][dst]
+            if found[src] == UNREACHABLE_DISTANCE:
+                if hop != -1:
+                    raise ValueError(
+                        f"shortest-path next_hop routes QPU {src} towards {dst}, "
+                        "which the graph does not connect"
+                    )
+            elif hop not in neighbors[src] or found[hop] != found[src] - 1:
+                raise ValueError(
+                    f"shortest-path next_hop from QPU {src} towards {dst} is {hop}, "
+                    "not a neighbour one step closer"
+                )
 
 
 def route_prepared_link_loads(
