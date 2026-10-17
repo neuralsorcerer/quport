@@ -537,9 +537,11 @@ Prices letting qubits move between QPUs mid-circuit, in the same e-bit model.
   boundary when its root does not move.
 - `TemporalResult(partition, cost, static_cost, stationary_cost, passes)` with
   `saved` / `reduction` against the seed, and `migration_saved` /
-  `migration_reduction` against the best placement the same search reaches with
-  migration forbidden. `cost.total <= stationary_cost <= static_cost` holds by
-  construction.
+  `migration_reduction` against the best migration-free placement the search
+  reached -- the single-window search's, or any window's assignment held for the
+  whole circuit. `cost.total <= stationary_cost <= static_cost` holds by
+  construction, and a plan that moves qubits is strictly cheaper than every
+  placement it contains.
 
 With one window, or the same assignment in every window, `temporal_ebit_cost`
 returns exactly `ebit_cost` for that assignment.

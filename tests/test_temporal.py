@@ -620,3 +620,83 @@ def test_a_plan_without_moves_reports_no_migration_saving() -> None:
     assert held.cost.total == held.stationary_cost
     assert held.migration_saved == 0
     assert held.migration_reduction == 0.0
+
+
+def test_a_plan_never_loses_to_a_window_assignment_it_contains() -> None:
+    """Phase two re-places qubits too; its windows are stationary placements.
+
+    Here window 0's assignment held for the whole circuit costs 7 with no
+    migration, while the time-varying plan cost 7 with three moves and the
+    single-window search stopped at 9 -- so the plan claimed two pairs saved
+    by migration that a plain re-placement it had found already saved.
+    """
+    qc = QuantumCircuit(8)
+    qc.swap(6, 3)
+    qc.cx(2, 7)
+    qc.cz(6, 1)
+    qc.cz(4, 0)
+    qc.swap(4, 5)
+    qc.cx(4, 6)
+    qc.swap(3, 4)
+    qc.cx(5, 2)
+    qc.swap(7, 6)
+    qc.h(0)
+    qc.cx(0, 4)
+    qc.cx(1, 3)
+    qc.cx(0, 5)
+    qc.cx(0, 1)
+    packets = build_distributable_packets(qc)
+    windows = split_windows(packets, 2)
+
+    plan = optimize_temporal_partition(
+        packets, [2, 0, 2, 0, 0, 1, 1, 2], 3, 3, windows, migration_cost=1, seed=311
+    )
+
+    held = [
+        temporal_ebit_cost(
+            packets, static_temporal_partition(assignment, windows), 3
+        ).total
+        for assignment in plan.partition.assignments
+    ]
+    assert plan.stationary_cost <= min(held)
+    assert plan.cost.total <= plan.stationary_cost
+    assert (plan.cost.moves, plan.migration_saved) == (0, 0)
+    assert plan.cost.total == 7
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_a_moving_plan_is_strictly_cheaper_than_each_placement_it_contains(
+    seed: int,
+) -> None:
+    from qiskit import transpile
+
+    from quport.pipeline import random_benchmark_circuit
+
+    rng = random.Random(seed)
+    n = rng.randint(5, 9)
+    qc = transpile(
+        random_benchmark_circuit(n, rng.randint(6, 14), seed),
+        basis_gates=["rz", "sx", "x", "cx"],
+        optimization_level=0,
+        seed_transpiler=0,
+    )
+    packets = build_distributable_packets(qc)
+    part = [qubit % 3 for qubit in range(n)]
+    windows = split_windows(packets, rng.randint(2, 4))
+    plan = optimize_temporal_partition(
+        packets,
+        part,
+        3,
+        -(-n // 3),
+        windows,
+        max_passes=rng.choice([1, 2, 8]),
+        seed=seed,
+    )
+
+    for assignment in set(plan.partition.assignments):
+        held = temporal_ebit_cost(
+            packets, static_temporal_partition(assignment, windows), 3
+        ).total
+        assert plan.stationary_cost <= held
+        if plan.cost.moves:
+            assert plan.cost.total < held

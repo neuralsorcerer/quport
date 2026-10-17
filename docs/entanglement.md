@@ -343,11 +343,13 @@ result, and the report keeps them apart:
 | Field | Meaning |
 |---|---|
 | `static_cost` | the seed placement's cost |
-| `stationary_cost` | best placement the same search reaches with migration forbidden |
+| `stationary_cost` | best migration-free placement the search reached |
 | `cost.total` | best placement with migration allowed |
 
-The temporal phase starts from the stationary optimum, so
-`cost.total <= stationary_cost <= static_cost` holds by construction — a plan
+The temporal phase starts from the stationary optimum, and a plan whose moves
+do not beat each of its windows' assignments held for the whole circuit -- also
+migration-free placements the search reached -- is replaced by the best of them,
+so `cost.total <= stationary_cost <= static_cost` holds by construction — a plan
 that moved qubits can never lose to one that did not. `migration_reduction` is
 the honest headline: it holds the placement search constant and varies only
 whether qubits may move.

@@ -192,10 +192,13 @@ class TemporalResult:
         window -- migration is then impossible by construction -- and compare
         against that, which is what ``stationary_cost`` records.
     stationary_cost:
-        Cost of the best placement the same search reaches with migration
-        forbidden. The temporal phase starts from it, so
-        ``cost.total <= stationary_cost <= static_cost`` always, and the
-        difference between the first two is what migration actually bought.
+        Cost of the best migration-free placement the search reached: the
+        single-window search's, or any window's assignment held for the whole
+        circuit. The temporal phase starts from the first, and a plan that
+        does not beat the best of them is replaced by it, so
+        ``cost.total <= stationary_cost <= static_cost`` always, a plan that
+        moves qubits is strictly cheaper than every placement it contains, and
+        the difference between the first two is what migration actually bought.
     passes:
         Improvement passes performed before the search stalled, over both
         phases.
@@ -620,22 +623,37 @@ def optimize_temporal_partition(
         )
         passes += stationary_passes
 
+    # Every window's assignment, held for the whole circuit, is a stationary
+    # placement the search reached too -- phase two's interval moves re-place
+    # qubits for many windows at once, and can find a better one than phase
+    # one did. The best of them is the honest stationary reference: counting
+    # that re-placement as a migration saving would report migration buying
+    # something no qubit's move bought. And a plan that loses to, or only ties,
+    # one of them is not worth its migrations, so that placement is returned.
+    held_assignment, held_cost = base, stationary_cost
+    for assignment in dict.fromkeys(tuple(window) for window in assignments):
+        candidate = _cost(
+            decomposition,
+            [list(assignment) for _ in windows],
+            starts,
+            last_stop,
+            migration,
+        )
+        if candidate.total < held_cost.total:
+            held_assignment, held_cost = list(assignment), candidate
+    if held_cost.total <= best.total:
+        assignments = [list(held_assignment) for _ in windows]
+        best = _cost(decomposition, assignments, starts, last_stop, migration)
+
     partition = TemporalPartition(
         windows=tuple(windows),
         assignments=tuple(tuple(assignment) for assignment in assignments),
     )
-    # A plan that moves no qubit is itself a stationary placement. Phase two
-    # can reach a better one than phase one did when ``max_passes`` stopped
-    # phase one short; counting that re-placement as a migration saving would
-    # report migration buying something no qubit's move bought.
-    stationary_total = stationary_cost.total
-    if best.moves == 0:
-        stationary_total = min(stationary_total, best.total)
     return TemporalResult(
         partition=partition,
         cost=best,
         static_cost=static_cost,
-        stationary_cost=stationary_total,
+        stationary_cost=held_cost.total,
         passes=passes,
     )
 
