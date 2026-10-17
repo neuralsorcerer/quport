@@ -11,6 +11,7 @@ import importlib.util
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
+from decimal import Decimal
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any, Literal
@@ -81,6 +82,20 @@ def _normalize_basis_gates(value: object) -> tuple[str, ...]:
     return normalized
 
 
+#: The configuration fields that hold an integer (or ``None`` for the grid).
+_INTEGER_FIELDS = (
+    "n_qpus",
+    "compute_qubits_per_qpu",
+    "comm_qubits_per_qpu",
+    "inter_degree",
+    "link_capacity",
+    "switch_parallel_links",
+    "grid_rows",
+    "grid_cols",
+    "optimization_level",
+)
+
+
 @dataclass(frozen=True)
 class MultiQPUConfig:
     """Configuration for the multi-QPU architecture and mapping pipeline."""
@@ -118,6 +133,20 @@ class MultiQPUConfig:
     routing_method: str = "sabre"
 
     def __post_init__(self) -> None:
+        # Integer fields are checked where they are read, by validators and
+        # partitioners that require a plain ``int``. Store any other integral
+        # value -- a NumPy integer, an ``int`` subclass -- as one, so a config
+        # every validator accepts is accepted everywhere, as it is after a
+        # round trip through a file. Booleans are left for those checks to
+        # refuse.
+        for name in _INTEGER_FIELDS:
+            value = getattr(self, name)
+            if (
+                isinstance(value, Integral)
+                and not isinstance(value, bool)
+                and type(value) is not int
+            ):
+                object.__setattr__(self, name, int(value))
         if not isinstance(self.async_classical, bool):
             raise ValueError("async_classical must be a boolean")
         async_overlap = validate_nonnegative_finite_float(
@@ -276,16 +305,17 @@ def load_config(path: str) -> MultiQPUConfig:
 def _plain_value(value: object) -> object:
     """Return ``value`` as the built-in type both encoders accept.
 
-    A config may hold any integral or real number its validators accept --
-    a NumPy integer, an ``int`` subclass -- which the JSON encoder or
-    PyYAML's safe dumper then refuses; they are written as the numbers they
-    are. Sequences (the basis gates) become lists of the same.
+    A config may hold any number its validators accept -- a NumPy float, a
+    ``Fraction``, a ``Decimal``, which they read through ``float()`` -- and the
+    JSON encoder or PyYAML's safe dumper then refuses it; such values are
+    written as the numbers they are. Sequences (the basis gates) become lists
+    of the same.
     """
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, Integral):
         return int(value)
-    if isinstance(value, Real):
+    if isinstance(value, Real | Decimal):
         return float(value)
     if isinstance(value, str):
         return str(value)

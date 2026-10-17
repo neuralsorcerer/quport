@@ -257,3 +257,24 @@ def test_numpy_booleans_are_rejected_like_python_booleans(call: Any) -> None:
 
     with pytest.raises(ValueError, match="boolean"):
         call(np)
+
+
+@pytest.mark.parametrize("suffix", [".json", ".yaml"])
+def test_dump_config_writes_decimal_values_as_numbers(tmp_path, suffix: str) -> None:
+    """Validators read a Decimal through float(); the encoders refused it."""
+    from decimal import Decimal
+
+    from quport.config import dump_config, load_config
+
+    if suffix == ".yaml":
+        pytest.importorskip("yaml")
+    cfg = MultiQPUConfig(
+        async_overlap=Decimal("0.5"),  # type: ignore[arg-type]
+        switch_reconfig_delay=Decimal("2.5"),  # type: ignore[arg-type]
+    )
+    path = tmp_path / f"cfg{suffix}"
+    dump_config(cfg, str(path))
+
+    loaded = load_config(str(path))
+    assert loaded.async_overlap == 0.5
+    assert loaded.switch_reconfig_delay == 2.5

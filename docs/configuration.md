@@ -50,9 +50,13 @@ entry must be a standard Qiskit gate on one or two qubits (so not
 `global_phase`, which Qiskit refuses next to a coupling map) or a control-flow
 operation such as `if_else`.
 
-`dump_config` writes integral and real values as plain numbers, so a config
-holding a NumPy integer saves and loads back, and it serializes before opening
-the file, so a failed write leaves an existing config untouched.
+`MultiQPUConfig` stores any integral value of an integer field -- a NumPy
+integer, an `int` subclass -- as a plain `int`, so such a config works
+everywhere a file-loaded one does. `dump_config` writes real values (a NumPy
+float, a `Fraction`, a `Decimal`) as plain numbers, and it serializes before
+opening the file, so a value the encoder rejects leaves an existing config
+untouched. The write itself is not atomic: a failure partway through it, such
+as a full disk, can leave the file truncated.
 
 ### Derived quantities
 
