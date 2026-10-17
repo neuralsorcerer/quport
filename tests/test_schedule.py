@@ -2405,3 +2405,139 @@ def test_audit_reports_pairs_outside_the_architecture_instead_of_crashing(pair):
     broken = _replace_first_round(plan, index, qpu_pairs=(pair,))
     problems = audit_topology_schedule_plan(broken, arch, model)
     assert any("outside the 3-QPU architecture" in problem for problem in problems)
+
+
+def _feedforward_through(kind: str, arch: MultiQPUArchitecture) -> QuantumCircuit:
+    """QPU 0 measures at t = 50..51; QPU 1 conditions on the result."""
+    from qiskit import ClassicalRegister, QuantumRegister
+
+    bits = ClassicalRegister(2, "c")
+    qc = QuantumCircuit(QuantumRegister(arch.n_phys, "q"), bits)
+    for _ in range(50):
+        qc.x(0)
+    qc.measure(0, bits[0])
+    condition: object
+    if kind == "direct":
+        condition = (bits[0], 1)
+    elif kind == "store clbit":
+        qc.store(bits[1], bits[0])
+        condition = (bits[1], 1)
+    elif kind == "store var":
+        flag = qc.add_var("flag", False)
+        qc.store(flag, bits[0])
+        condition = flag
+    else:  # a block acting on classical data only
+        with qc.if_test((bits[0], 1)):
+            qc.store(bits[1], True)
+        condition = (bits[1], 1)
+    with qc.if_test(condition):  # type: ignore[arg-type]
+        qc.x(arch.cfg.compute_qubits_per_qpu + arch.cfg.comm_qubits_per_qpu)
+    return qc
+
+
+@pytest.mark.parametrize(
+    "kind", ["direct", "store clbit", "store var", "qubit-less if"]
+)
+def test_list_estimators_follow_data_through_classical_stores(kind: str) -> None:
+    """A copied bit or variable carries the measurement's timing with it.
+
+    Skipping a store dropped the dependency, so the conditional on QPU 1 ran
+    at t = 0, before the measurement it reads; the DAG-based estimators, which
+    follow Qiskit's variable wires, never did.
+    """
+    from quport.schedule import estimate_entanglement_schedule
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=3, comm_qubits_per_qpu=1)
+    )
+    model = LatencyModel(oneq=1.0)
+    qc = _feedforward_through(kind, arch)
+
+    assert estimate_parallel_makespan(qc, arch, model).makespan == 52.0
+    assert estimate_entanglement_schedule(qc, arch, model).makespan == 52.0
+    assert estimate_parallel_makespan_layered(qc, arch, model).makespan == 52.0
+
+
+def test_audit_range_checks_penalty_rounds_too() -> None:
+    import dataclasses
+
+    from quport.schedule import TopologySchedulePlan, audit_topology_schedule_plan
+
+    model = LatencyModel()
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+    )
+    qc = QuantumCircuit(2)
+    qc.cx(0, 1)  # no comm ports: one penalty round
+    plan = estimate_topology_schedule_plan(qc, arch, model)
+    assert audit_topology_schedule_plan(plan, arch, model, qc) == ()
+
+    penalty = plan.layers[0].remote_rounds[0]
+    assert penalty.unschedulable_ops == 1
+    forged = TopologySchedulePlan(
+        plan.summary,
+        (
+            dataclasses.replace(
+                plan.layers[0],
+                remote_rounds=(dataclasses.replace(penalty, qpu_pairs=((7, 99),)),),
+            ),
+        ),
+    )
+    problems = audit_topology_schedule_plan(forged, arch, model, qc)
+    assert any("outside the 2-QPU architecture" in problem for problem in problems)
+
+
+def test_audit_refuses_a_real_round_over_an_unreachable_or_self_pair() -> None:
+    """Only a penalty round can stand for an operation no route serves."""
+    import dataclasses
+
+    from quport.schedule import (
+        LayerScheduleTrace,
+        RemoteRoundTrace,
+        TopologySchedulePlan,
+        audit_topology_schedule_plan,
+    )
+
+    model = LatencyModel()
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=1,
+            inter_topology="degree_d",
+            inter_degree=0,
+        )
+    )
+    qc = QuantumCircuit(4)
+    qc.cx(0, 2)
+    plan = estimate_topology_schedule_plan(qc, arch, model)
+    assert plan.layers[0].remote_rounds[0].unschedulable_ops == 1
+
+    def single_round(pair: tuple[int, int], ports: tuple[int, int], duration: float):
+        rnd = RemoteRoundTrace(0, 0, (pair,), duration, ports, (), 0, 0.0, duration)
+        return TopologySchedulePlan(
+            dataclasses.replace(
+                plan.summary, makespan=duration, peak_qpu_ports_used=max(ports)
+            ),
+            (LayerScheduleTrace(0, 0.0, 1, (rnd,), duration, 0.0, duration),),
+        )
+
+    distance = arch.qpu_shortest_paths().dist[0][1]
+    duration = (
+        distance * model.epr_gen
+        + model.classical_rtt * 0.5
+        + model.remote_gate_overhead
+    )
+    problems = audit_topology_schedule_plan(
+        single_round((0, 1), (1, 1), duration), arch, model, qc
+    )
+    assert any("unreachable QPUs" in problem for problem in problems)
+
+    connected = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=2)
+    )
+    plan = estimate_topology_schedule_plan(QuantumCircuit(6), connected, model)
+    problems = audit_topology_schedule_plan(
+        single_round((1, 1), (0, 2), model.classical_rtt * 0.5), connected, model
+    )
+    assert any("name one QPU twice" in problem for problem in problems)

@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, SupportsFloat, SupportsIndex, cast
 
-from qiskit import QuantumCircuit
+from qiskit import ClassicalRegister, QuantumCircuit
+from qiskit.circuit import Clbit, ControlFlowOp
+from qiskit.circuit.classical import expr
 
 from quport._validation import is_boolean
 from quport.aggregation import (
@@ -166,6 +168,40 @@ def _first_remote_partner(qpus: Sequence[int]) -> int | None:
     return next((qpu for qpu in qpus[1:] if qpu != first), None)
 
 
+def _classical_wires(instruction: Any) -> list[Any]:
+    """Every classical bit and variable ``instruction`` reads or writes.
+
+    ``instruction.clbits`` names only the bits an operation takes as arguments.
+    A classical ``store`` names its target and source inside expressions, and
+    a control-flow block can test a variable, or use one in its body, without
+    naming it there either; Qiskit's DAG follows those as wires, and so must a
+    list scheduler, or feedforward through a copied bit starts before the
+    measurement it reads. A variable backed by a bit or register stands for
+    those bits.
+    """
+    wires: list[Any] = list(instruction.clbits)
+    operation = instruction.operation
+    expressions: list[Any] = []
+    if operation.name == "store":
+        expressions += [operation.lvalue, operation.rvalue]
+    if isinstance(operation, ControlFlowOp):
+        for attribute in ("condition", "target"):
+            value = getattr(operation, attribute, None)
+            if isinstance(value, expr.Expr):
+                expressions.append(value)
+        for block in operation.blocks:
+            wires.extend(block.iter_captured_vars())
+    for expression in expressions:
+        for var in expr.iter_vars(expression):
+            if isinstance(var.var, Clbit):
+                wires.append(var.var)
+            elif isinstance(var.var, ClassicalRegister):
+                wires.extend(var.var)
+            else:
+                wires.append(var)
+    return list(dict.fromkeys(wires))
+
+
 def estimate_parallel_makespan(
     mapped: QuantumCircuit,
     arch: MultiQPUArchitecture,
@@ -203,20 +239,25 @@ def estimate_parallel_makespan(
     # here can schedule.
     remote_indices = _cross_qpu_operation_indices(mapped, arch)
     steps = 0
-    # When each classical bit was last touched. A measurement on one QPU and
-    # the conditional on another that reads it share no qubit, so the QPU
-    # timelines alone would let the conditional run first.
-    cindex = {clbit: index for index, clbit in enumerate(mapped.clbits)}
-    clbit_ready = [0.0] * len(mapped.clbits)
+    # When each classical bit and variable was last touched. A measurement on
+    # one QPU and the conditional on another that reads it share no qubit, so
+    # the QPU timelines alone would let the conditional run first.
+    classical_ready: dict[Any, float] = {}
 
     for idx, inst in enumerate(mapped.data):
+        wires = _classical_wires(inst)
+        after = max((classical_ready.get(wire, 0.0) for wire in wires), default=0.0)
+        if not inst.qubits and inst.operation.name != "barrier":
+            # A classical store, or a block acting on classical data only,
+            # takes no QPU time and synchronizes no QPU, but it carries data:
+            # whatever reads what it writes waits for what it read.
+            for wire in wires:
+                classical_ready[wire] = after
+            continue
         # Compiler directives (barriers) synchronize but consume no time; they
         # are never RemoteOps (split_into_qpus handles them separately). A
-        # barrier with no qubits spans the whole machine. A classical store is
-        # a directive too, but it touches no qubit and synchronizes nothing.
+        # barrier with no qubits spans the whole machine.
         if getattr(inst.operation, "_directive", False):
-            if not inst.qubits and inst.operation.name != "barrier":
-                continue
             spanned = set(_instruction_qpus(inst.qubits, qindex, phys_to_qpu))
             if not inst.qubits:
                 spanned = set(range(len(t)))
@@ -227,8 +268,6 @@ def estimate_parallel_makespan(
             continue
         qpus = _instruction_qpus(inst.qubits, qindex, phys_to_qpu)
         name = inst.operation.name
-        bits = [cindex[clbit] for clbit in inst.clbits]
-        after = max((clbit_ready[bit] for bit in bits), default=0.0)
         if idx in remote_indices:
             # Still one remote event, as split_into_qpus counts it, but every
             # QPU holding an operand takes part: a wide operation cannot start
@@ -240,9 +279,6 @@ def estimate_parallel_makespan(
                 t[qpu] = finish
             steps += 1
         else:
-            if len(qpus) == 0:
-                # Ignore 0-qubit directives/metadata operations.
-                continue
             if len(qpus) == 1:
                 qpu = qpus[0]
                 t[qpu] = max(t[qpu], after) + lat.oneq
@@ -264,8 +300,8 @@ def estimate_parallel_makespan(
                 # conservative: serialize on first qpu
                 t[qpus[0]] = max(t[qpus[0]], after) + lat.twoq
                 finish = t[qpus[0]]
-        for bit in bits:
-            clbit_ready[bit] = finish
+        for wire in wires:
+            classical_ready[wire] = finish
 
     return ScheduleSummary(makespan=max(t), steps=steps, remote_ops=len(remote_indices))
 
@@ -1155,7 +1191,18 @@ def audit_topology_schedule_plan(
                     )
                 peak_link = max(peak_link, count)
 
-            if rnd.unschedulable_ops:
+            if any(
+                type(qpu) is not int or not 0 <= qpu < n_qpus
+                for pair in rnd.qpu_pairs
+                for qpu in pair
+            ):
+                # Checked first, for penalty rounds as well: nothing else about
+                # a round can be judged once it names a QPU that does not exist.
+                problems.append(
+                    f"{spot}: pairs {list(rnd.qpu_pairs)} name a QPU outside the "
+                    f"{n_qpus}-QPU architecture"
+                )
+            elif rnd.unschedulable_ops:
                 # A penalty round stands for operations that could not be
                 # placed. It still lists the pair it was going to serve, for
                 # diagnostics, so its operands are named twice and count once.
@@ -1173,14 +1220,17 @@ def audit_topology_schedule_plan(
                 # The estimator only closes a round once it has placed an
                 # operation, so a real round with none can only be padding.
                 problems.append(f"{spot}: places no operation but lasts {rnd.duration}")
-            elif any(
-                type(qpu) is not int or not 0 <= qpu < n_qpus
-                for pair in rnd.qpu_pairs
-                for qpu in pair
-            ):
+            elif any(a == b for a, b in rnd.qpu_pairs):
                 problems.append(
-                    f"{spot}: pairs {list(rnd.qpu_pairs)} name a QPU outside the "
-                    f"{n_qpus}-QPU architecture"
+                    f"{spot}: pairs {list(rnd.qpu_pairs)} name one QPU twice, which "
+                    "is not a remote operation"
+                )
+            elif any(sp.dist[a][b] >= UNREACHABLE_DISTANCE for a, b in rnd.qpu_pairs):
+                # No route joins them, so no round can place the operation; the
+                # estimator charges it as a penalty round instead.
+                problems.append(
+                    f"{spot}: places an operation between unreachable QPUs in "
+                    f"{list(rnd.qpu_pairs)}; only a penalty round can stand for it"
                 )
             else:
                 expected_ports = [0] * n_qpus
@@ -1551,8 +1601,7 @@ def estimate_entanglement_schedule(
             members.setdefault(gate_index, []).append(ordinal)
 
     qubit_ready = [0.0] * n_phys
-    cindex = {clbit: index for index, clbit in enumerate(mapped.clbits)}
-    clbit_ready = [0.0] * len(mapped.clbits)
+    classical_ready: dict[Any, float] = {}
     # A pool never serves more than two acquisitions per block -- a port pool
     # one per block it hosts or roots, a link pool one per distribution, of
     # which a teleport makes two -- and an untouched server is always the
@@ -1677,12 +1726,19 @@ def estimate_entanglement_schedule(
     for index, instruction in enumerate(mapped.data):
         operation = instruction.operation
         qubits = [qindex[qubit] for qubit in instruction.qubits]
+        wires = _classical_wires(instruction)
+        after = max((classical_ready.get(wire, 0.0) for wire in wires), default=0.0)
+
+        if not qubits and operation.name != "barrier":
+            # A classical store, or a block acting on classical data only,
+            # takes no time on any qubit but carries data: whatever reads what
+            # it writes waits for what it read.
+            for wire in wires:
+                classical_ready[wire] = after
+            continue
 
         if is_directive(operation):
-            # A classical store is a directive too, but it touches no qubit and
-            # synchronizes nothing; a barrier with no qubits spans them all.
-            if not qubits and operation.name != "barrier":
-                continue
+            # A barrier with no qubits spans them all.
             targets = qubits if qubits else list(range(n_phys))
             copies = [
                 ordinal for qubit in targets for ordinal in open_blocks.get(qubit, ())
@@ -1697,12 +1753,6 @@ def estimate_entanglement_schedule(
                 for ordinal in copies:
                     runtime[ordinal].ready = sync
             continue
-
-        if not qubits:
-            continue
-
-        bits = [cindex[clbit] for clbit in instruction.clbits]
-        after = max((clbit_ready[bit] for bit in bits), default=0.0)
 
         for ordinal in starts.get(index, ()):
             establish(ordinal)
@@ -1725,8 +1775,8 @@ def estimate_entanglement_schedule(
                     runtime[ordinal].ready = finish
                 for qubit in qubits:
                     qubit_ready[qubit] = finish
-                for bit in bits:
-                    clbit_ready[bit] = finish
+                for wire in wires:
+                    classical_ready[wire] = finish
                 for ordinal in ends.get(index, ()):
                     release(ordinal)
                 continue
@@ -1743,8 +1793,8 @@ def estimate_entanglement_schedule(
             for qubit in qubits:
                 if qubit not in roots:
                     qubit_ready[qubit] = finish
-            for bit in bits:
-                clbit_ready[bit] = finish
+            for wire in wires:
+                classical_ready[wire] = finish
             qpu_busy[host] += duration
 
             for ordinal in ends.get(index, ()):
@@ -1760,8 +1810,8 @@ def estimate_entanglement_schedule(
             finish = start + UNSCHEDULABLE_PENALTY
             for qubit in qubits:
                 qubit_ready[qubit] = finish
-            for bit in bits:
-                clbit_ready[bit] = finish
+            for wire in wires:
+                classical_ready[wire] = finish
             continue
 
         qpu = phys_to_qpu[qubits[0]]
@@ -1775,8 +1825,8 @@ def estimate_entanglement_schedule(
         finish = start + duration
         for qubit in qubits:
             qubit_ready[qubit] = finish
-        for bit in bits:
-            clbit_ready[bit] = finish
+        for wire in wires:
+            classical_ready[wire] = finish
         qpu_busy[qpu] += duration
 
     # Any block still holding a port ran past the end of the instruction list.
