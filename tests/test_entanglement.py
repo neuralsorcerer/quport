@@ -231,3 +231,54 @@ def test_measure_and_reset_close_cat_copies() -> None:
 
     assert diagonal_positions(Measure()) == frozenset()
     assert diagonal_positions(Reset()) == frozenset()
+
+
+@pytest.mark.parametrize("name", ["t", "rz", "z", "rzz", "rccx"])
+def test_a_custom_gate_named_like_a_diagonal_gate_is_not_trusted(name: str) -> None:
+    """Names are lookup keys: a custom ``t`` that is really an ``X`` is no ``T``."""
+    from qiskit import QuantumCircuit
+
+    from quport.entanglement import diagonal_positions, is_standard_namesake
+
+    width = {"rzz": 2, "rccx": 3}.get(name, 1)
+    body = QuantumCircuit(width, name=name)
+    body.x(0)
+    impostor = body.to_gate()
+
+    assert is_standard_namesake(impostor)
+    assert diagonal_positions(impostor) == frozenset()
+
+
+def test_a_namesake_does_not_keep_a_cat_copy_alive_end_to_end() -> None:
+    """With ``t`` in the basis, Qiskit kept the custom gate and the plan held a
+    copy across it -- an X on the root -- so compile's own plan failed to verify."""
+    from qiskit import QuantumCircuit
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.compiler import compile_distributed
+    from quport.config import MultiQPUConfig
+    from quport.protocol import verify_telegate_equivalence
+
+    body = QuantumCircuit(1, name="t")
+    body.x(0)
+    flip = body.to_gate()
+    qc = QuantumCircuit(4)
+    qc.h(0)
+    for target in (1, 2, 3):
+        qc.cx(0, target)
+    qc.append(flip, [0])
+    for target in (1, 2, 3):
+        qc.cx(0, target)
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        basis_gates=("rz", "sx", "x", "cx", "t"),
+    )
+
+    res = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+
+    assert res.aggregation.epr_pairs == 2
+    assert verify_telegate_equivalence(
+        res.physical_circuit, MultiQPUArchitecture(cfg), res.aggregation
+    )

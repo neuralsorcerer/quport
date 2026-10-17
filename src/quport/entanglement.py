@@ -53,9 +53,10 @@ destroy it.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from functools import cache
 from typing import Any
 
-from qiskit.circuit import ControlledGate, Operation
+from qiskit.circuit import ControlledGate, Delay, Operation
 
 __all__ = [
     "DIAGONAL_1Q_GATES",
@@ -65,6 +66,7 @@ __all__ = [
     "diagonal_operands",
     "diagonal_positions",
     "is_directive",
+    "is_standard_namesake",
 ]
 
 #: Single-qubit operations that commute with ``Z`` (diagonal in the
@@ -120,6 +122,44 @@ def is_directive(operation: Any) -> bool:
     return bool(getattr(operation, "_directive", False))
 
 
+@cache
+def _standard_gate_names() -> frozenset[str]:
+    """Names of Qiskit's standard gates."""
+    from qiskit.circuit.library import get_standard_gate_name_mapping
+
+    return frozenset(
+        name
+        for name, gate in get_standard_gate_name_mapping().items()
+        if getattr(gate, "_standard_gate", None) is not None
+    )
+
+
+def is_standard_namesake(operation: Any) -> bool:
+    """True for an operation named like a Qiskit standard gate without being one.
+
+    Names are a lookup key, not an identity: a custom gate called ``t`` whose
+    definition is an ``X`` is no ``T`` gate. Qiskit marks its standard gates,
+    so anything carrying one of their names without that mark is a namesake.
+    """
+    name = getattr(operation, "name", None)
+    return (
+        isinstance(name, str)
+        and name in _standard_gate_names()
+        and getattr(operation, "_standard_gate", None) is None
+    )
+
+
+def _is_named_operation(operation: Any) -> bool:
+    """True when ``operation`` is Qiskit's own operation of its name.
+
+    Only then can a table keyed by name speak for it. ``delay`` is not a gate,
+    so it is recognised by its class.
+    """
+    return getattr(operation, "_standard_gate", None) is not None or isinstance(
+        operation, Delay
+    )
+
+
 def _num_qubits(operation: Any) -> int:
     """Return an operation's operand count, defaulting to zero when unknown."""
     num_qubits = getattr(operation, "num_qubits", 0)
@@ -138,13 +178,15 @@ def diagonal_positions(operation: Operation | Any) -> frozenset[int]:
 
     The result is derived from three rules, in order:
 
-    1. An explicit entry in :data:`DIAGONAL_QARG_POSITIONS`.
+    1. An explicit entry in :data:`DIAGONAL_QARG_POSITIONS`, for Qiskit's own
+       gate of that name -- a custom gate that merely shares the name gets
+       none of the tables' entries.
     2. :class:`~qiskit.circuit.ControlledGate` structure. A controlled gate is
        block diagonal in its control basis, so all ``num_ctrl_qubits`` control
        operands are diagonal regardless of ``ctrl_state``; and because
        ``C(U) = P_0 (x) I + P_1 (x) U``, every operand that is diagonal for the
        base gate stays diagonal once controlled.
-    3. :data:`DIAGONAL_1Q_GATES` for single-qubit operations.
+    3. :data:`DIAGONAL_1Q_GATES` for Qiskit's own single-qubit operations.
 
     Anything else is reported as non-diagonal on every operand.
     """
@@ -153,7 +195,8 @@ def diagonal_positions(operation: Operation | Any) -> frozenset[int]:
         return frozenset(range(_num_qubits(operation)))
 
     name = getattr(operation, "name", None)
-    if isinstance(name, str):
+    named = _is_named_operation(operation)
+    if isinstance(name, str) and named:
         explicit = DIAGONAL_QARG_POSITIONS.get(name)
         if explicit is not None:
             return frozenset(explicit)
@@ -170,7 +213,7 @@ def diagonal_positions(operation: Operation | Any) -> frozenset[int]:
             )
         return frozenset(positions)
 
-    if _num_qubits(operation) == 1 and isinstance(name, str):
+    if _num_qubits(operation) == 1 and isinstance(name, str) and named:
         if name in DIAGONAL_1Q_GATES:
             return frozenset({0})
 
