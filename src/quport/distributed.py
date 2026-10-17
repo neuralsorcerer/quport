@@ -577,6 +577,29 @@ def reassemble_distributed_program(
         raise ValueError("local_routed must be a mapping of QPU id to circuit")
     if not isinstance(arch, MultiQPUArchitecture):
         raise ValueError("arch must be a MultiQPUArchitecture")
+    if not isinstance(remote_ops, Sequence) or isinstance(remote_ops, str):
+        raise ValueError("remote_ops must be a sequence of RemoteOp")
+    # A manifest read back from JSON is a list of dicts, and one from other
+    # programs can name instructions the circuit does not have; both would
+    # otherwise fail deep inside the merge.
+    named: set[int] = set()
+    for entry, op in enumerate(remote_ops):
+        if not isinstance(op, RemoteOp):
+            raise ValueError(f"remote_ops[{entry}] must be a RemoteOp")
+        index = _validate_manifest_int(op.index, label=f"remote_ops[{entry}].index")
+        if index >= len(mapped.data):
+            raise ValueError(
+                f"remote_ops[{entry}] names instruction {index}, which the "
+                "mapped circuit does not have"
+            )
+        if index in named:
+            raise ValueError(
+                f"remote_ops[{entry}] names instruction {index}, as an earlier "
+                "entry does"
+            )
+        named.add(index)
+    for qpu in local_routed:
+        _validate_manifest_int(qpu, label="local circuit QPU id")
 
     reject_classical_storage(mapped, what="reassemble_distributed_program")
 

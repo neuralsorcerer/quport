@@ -2216,3 +2216,38 @@ def test_an_unencodable_manifest_leaves_an_existing_bundle_untouched(
         )
 
     assert {path.name: path.read_text() for path in bundle.iterdir()} == before
+
+
+def test_reassembly_validates_its_manifest_entries() -> None:
+    """A manifest read back from JSON, or naming other instructions, crashed deep inside."""
+    import dataclasses
+    import json
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.cx(1, 4)
+    program = split_into_qpus(mapped, arch)
+    ops = program.remote_ops
+
+    cases = [
+        (json.loads(json.dumps([op.to_dict() for op in ops])), "must be a RemoteOp"),
+        ([dataclasses.replace(ops[0], index=10**6), ops[1]], "does not have"),
+        ([ops[0], dataclasses.replace(ops[1], index=ops[0].index)], "earlier entry"),
+        (iter(ops), "sequence of RemoteOp"),
+    ]
+    for manifest, message in cases:
+        with pytest.raises(ValueError, match=message):
+            reassemble_distributed_program(
+                mapped, program.local_circuits, manifest, arch  # type: ignore[arg-type]
+            )
+
+    with pytest.raises(ValueError, match="QPU id must be an integer"):
+        reassemble_distributed_program(
+            mapped, {**program.local_circuits, "x": QuantumCircuit(1)}, ops, arch  # type: ignore[dict-item]
+        )
