@@ -1053,3 +1053,124 @@ def test_a_config_holding_numpy_integers_compiles_everywhere() -> None:
 
     with pytest.raises(ValueError, match="n_qpus"):
         map_and_transpile(qc, MultiQPUConfig(n_qpus=True), seed=0)  # type: ignore[arg-type]
+
+
+def test_basis_translation_keeps_a_custom_gate_that_shares_a_standard_name() -> None:
+    """Qiskit translates by name: a custom ``swap`` that is one CX became three."""
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Operator
+
+    from quport.compiler import compile_distributed
+    from quport.pipeline import _translate_to_basis
+
+    swap_body = QuantumCircuit(2, name="swap")
+    swap_body.cx(0, 1)
+    rzz_body = QuantumCircuit(2, name="rzz")  # no parameter, unlike Qiskit's rzz
+    rzz_body.cz(0, 1)
+    qc = QuantumCircuit(3)
+    qc.x(0)
+    qc.append(swap_body.to_gate(), [0, 1])
+    qc.append(rzz_body.to_gate(), [1, 2])
+    expected = QuantumCircuit(3)
+    expected.x(0)
+    expected.cx(0, 1)
+    expected.cz(1, 2)
+
+    translated = _translate_to_basis(qc, ("rz", "sx", "x", "cx"), 0)
+    assert not translated.parameters
+    assert Operator(translated).equiv(Operator(expected))
+
+    cfg = MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    compiled = compile_distributed(qc, cfg, seed=0)
+    assert not compiled.basis_circuit.parameters
+    assert Operator(compiled.basis_circuit).equiv(Operator(expected))
+
+
+@pytest.mark.parametrize(
+    "entry", ["compile_distributed", "map_and_transpile", "baseline"]
+)
+def test_a_classical_register_named_q_is_refused_before_layout(entry: str) -> None:
+    """Qiskit's layout names the physical register ``q`` and then collides."""
+    from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister
+
+    from quport.compiler import compile_distributed
+    from quport.pipeline import transpile_baseline
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    qc = QuantumCircuit(QuantumRegister(4, "a"), ClassicalRegister(2, "q"))
+    qc.cx(0, 2)
+    qc.measure(0, 0)
+    run = {
+        "compile_distributed": compile_distributed,
+        "map_and_transpile": map_and_transpile,
+        "baseline": transpile_baseline,
+    }[entry]
+    with pytest.raises(ValueError, match="classical register named 'q'"):
+        run(qc, cfg, seed=0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("n_qpus", None), ("n_qpus", "3"), ("compute_qubits_per_qpu", None)],
+)
+def test_pipelines_report_a_non_numeric_size_as_a_value_error(
+    field: str, value: object
+) -> None:
+    """The capacity check ran first and tripped over it as a TypeError."""
+    from qiskit import QuantumCircuit
+
+    from quport.compiler import compile_distributed
+    from quport.pipeline import transpile_baseline
+
+    cfg = MultiQPUConfig(**{field: value})  # type: ignore[arg-type]
+    qc = QuantumCircuit(2)
+    qc.cx(0, 1)
+    for run in (compile_distributed, map_and_transpile, transpile_baseline):
+        with pytest.raises(ValueError, match=f"{field} must be an integer"):
+            run(qc, cfg, seed=0)
+
+
+@pytest.mark.parametrize("entry", ["sweep", "benchmark"])
+def test_an_unusable_out_csv_is_refused_before_any_trial_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    import quport.pipeline as pipeline
+
+    calls = []
+    real = pipeline.map_and_transpile
+
+    def counting(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "map_and_transpile", counting)
+    with pytest.raises(ValueError, match="names a directory"):
+        if entry == "sweep":
+            pipeline.sweep_topologies(
+                n_logical=4,
+                depth=3,
+                trials=1,
+                seed=0,
+                out_csv=str(tmp_path),
+                intra_topologies=("clique",),
+                inter_topologies=("switch",),
+                comm_ports=(1,),
+                compute_per_qpu=2,
+                n_qpus=3,
+                strategies=("balanced",),
+            )
+        else:
+            pipeline.benchmark_random_circuits(
+                MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2),
+                4,
+                3,
+                2,
+                out_csv=str(tmp_path),
+                strategies=("balanced",),
+            )
+    assert calls == []
+
+    with pytest.raises(ValueError, match="filesystem path"):
+        pipeline.sweep_topologies(
+            n_logical=4, depth=3, trials=1, seed=0, out_csv=None  # type: ignore[arg-type]
+        )

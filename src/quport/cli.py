@@ -326,7 +326,7 @@ def _pretty_config(cfg: MultiQPUConfig) -> None:
 def gen_config(
     out: str = typer.Option(
         "quport_config.json",
-        help="Output path. Use a .yaml/.yml suffix for YAML (needs quport[yaml]).",
+        help="Output path. Use a .yaml/.yml suffix for YAML (needs quport\\[yaml]).",
     ),
 ) -> None:
     """Generate an example config file."""
@@ -443,7 +443,7 @@ def sweep(
         help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     plot: str | None = typer.Option(
-        None, help="Optional PNG plot (requires quport[viz])"
+        None, help="Optional PNG plot (requires quport\\[viz])"
     ),
 ) -> None:
     """Sweep multiple topologies and comm-port counts; save summary CSV."""

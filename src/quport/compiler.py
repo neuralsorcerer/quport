@@ -70,6 +70,10 @@ from quport.partition import (
     tpccap_partition,
     tpccap_sa_partition,
 )
+from quport.pipeline import (
+    _expand_standard_namesakes,
+    _refuse_classical_register_named_q,
+)
 from quport.schedule import (
     EntanglementScheduleSummary,
     TopologySchedulePlan,
@@ -89,7 +93,10 @@ def _translate_to_basis(
     and avoids errors like "cy cannot be flipped".
     """
     return transpile(
-        qc, basis_gates=list(basis_gates), optimization_level=0, seed_transpiler=seed
+        _expand_standard_namesakes(qc),
+        basis_gates=list(basis_gates),
+        optimization_level=0,
+        seed_transpiler=seed,
     )
 
 
@@ -184,6 +191,10 @@ def compile_distributed(
     if seed is not None:
         seed = validate_nonnegative_integral(seed, label="seed")
 
+    _refuse_classical_register_named_q(qc)
+    # Building the architecture validates the config's integer fields, which
+    # the capacity check below would otherwise trip over as a TypeError.
+    arch = MultiQPUArchitecture(cfg)
     if qc.num_qubits > cfg.total_physical_qubits():
         raise ValueError(
             f"Logical qubits={qc.num_qubits} exceed physical qubits={cfg.total_physical_qubits()} in config."
@@ -199,8 +210,6 @@ def compile_distributed(
         if is_tpccap
         else 1.0
     )
-
-    arch = MultiQPUArchitecture(cfg)
 
     # 0) Translate into safe basis (prevents direction-fixing errors)
     qc_basis = _translate_to_basis(qc, cfg.basis_gates, seed)

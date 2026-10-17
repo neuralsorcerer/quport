@@ -1461,3 +1461,45 @@ def test_input_qasm_loader_keeps_a_programs_own_gate_definitions(
     expected.cz(1, 2)
     expected.sx(2)  # still Qiskit's: the program does not define it
     assert Operator(loaded).equiv(Operator(expected))
+
+
+@pytest.mark.parametrize(
+    ("command", "extra"), [("gen-config", "[yaml]"), ("sweep", "[viz]")]
+)
+def test_help_keeps_the_bracketed_extras_names(command: str, extra: str) -> None:
+    """Rich read ``quport[yaml]`` as markup and printed ``quport``."""
+    result = CliRunner().invoke(app, [command, "--help"], env={"COLUMNS": "200"})
+
+    assert result.exit_code == 0
+    assert extra in result.output
+
+
+def test_a_qasm_programs_own_gates_survive_compilation(tmp_path: Path) -> None:
+    """Loading kept them, but basis translation swapped in Qiskit's by name."""
+    from qiskit.quantum_info import Operator
+
+    from quport.compiler import compile_distributed
+    from quport.config import MultiQPUConfig
+
+    path = tmp_path / "own.qasm"
+    path.write_text(
+        'OPENQASM 2.0;\ninclude "qelib1.inc";\n'
+        "gate swap a, b { cx a, b; }\ngate rzz a, b { cz a, b; }\n"
+        "qreg q[3];\nx q[0];\nswap q[0], q[1];\nrzz q[1], q[2];\n",
+        encoding="utf-8",
+    )
+    loaded = _load_or_random_circuit(
+        input_qasm=str(path), n_logical=None, depth=1, seed=0
+    )
+    result = compile_distributed(
+        loaded,
+        MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1),
+        seed=0,
+    )
+
+    expected = QuantumCircuit(3)
+    expected.x(0)
+    expected.cx(0, 1)
+    expected.cz(1, 2)
+    assert not result.basis_circuit.parameters
+    assert Operator(result.basis_circuit).equiv(Operator(expected))

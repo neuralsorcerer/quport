@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
+from quport.entanglement import is_standard_namesake
 from quport.hypergraph import build_distributable_packets
 from quport.interaction import (
     extract_temporal_twoq_weights,
@@ -58,6 +60,23 @@ _BENCHMARK_METHOD_IDS = {
 _BENCHMARK_METHOD_LABELS = {
     method_id: strategy for strategy, method_id in _BENCHMARK_METHOD_IDS.items()
 }
+
+
+def _validate_out_csv(out_csv: object, *, label: str = "out_csv") -> str:
+    """Check an output path before a run spends minutes on the results.
+
+    The file is only opened once every trial has run, so a path that can never
+    be written -- not a path at all, empty, or an existing directory -- would
+    otherwise throw the whole run away at the end.
+    """
+    if not isinstance(out_csv, str | os.PathLike):
+        raise ValueError(f"{label} must be a filesystem path")
+    path = os.fspath(out_csv)
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{label} must be a non-empty path")
+    if Path(path).is_dir():
+        raise ValueError(f"{label} {path!r} names a directory, not a file")
+    return path
 
 
 def _open_csv_for_write(out_csv: str) -> TextIO:
@@ -171,8 +190,92 @@ def _translate_to_basis(
     This avoids direction-fixing errors for gates that cannot be auto-flipped by the transpiler.
     """
     return transpile(
-        qc, basis_gates=list(basis_gates), optimization_level=0, seed_transpiler=seed
+        _expand_standard_namesakes(qc),
+        basis_gates=list(basis_gates),
+        optimization_level=0,
+        seed_transpiler=seed,
     )
+
+
+def _refuse_classical_register_named_q(qc: QuantumCircuit) -> None:
+    """Refuse a classical register named ``q`` before laying the circuit out.
+
+    Qiskit's layout stage always names the physical register ``q``, and a
+    circuit cannot hold two registers of one name, so such a circuit fails
+    inside Qiskit once a layout is applied. Renaming it is not an option: a
+    condition on the register refers to it as it is.
+    """
+    if any(creg.name == "q" for creg in qc.cregs):
+        raise ValueError(
+            "the circuit has a classical register named 'q', which collides with "
+            "the physical register Qiskit's layout creates; rename it"
+        )
+
+
+def _expand_standard_namesakes(circuit: QuantumCircuit) -> QuantumCircuit:
+    """Replace each gate named like a Qiskit standard gate, but not one, by its definition.
+
+    Qiskit's basis translation finds a gate's decomposition by its name, so a
+    custom ``swap`` defined as a single CX is translated as a real SWAP, and a
+    parameterless custom ``rzz`` as Qiskit's ``rzz(theta)`` with ``theta``
+    left unbound -- neither computes the circuit. Inlining the definition
+    first keeps what the circuit says; an OpenQASM 2 program that defines its
+    own ``swap`` loads as exactly such a gate. Circuits without one are
+    returned unchanged.
+    """
+    if not _has_standard_namesake(circuit):
+        return circuit
+    out = circuit.copy_empty_like()
+    for instruction in circuit.data:
+        _append_expanded(
+            out,
+            instruction.operation,
+            list(instruction.qubits),
+            list(instruction.clbits),
+        )
+    return out
+
+
+def _has_standard_namesake(circuit: QuantumCircuit) -> bool:
+    for instruction in circuit.data:
+        operation = instruction.operation
+        if is_standard_namesake(operation):
+            return True
+        if isinstance(operation, ControlFlowOp) and any(
+            _has_standard_namesake(block) for block in operation.blocks
+        ):
+            return True
+    return False
+
+
+def _append_expanded(
+    out: QuantumCircuit, operation: Any, qubits: list[Any], clbits: list[Any]
+) -> None:
+    """Append ``operation``, inlining it -- recursively -- if it is a namesake."""
+    if isinstance(operation, ControlFlowOp):
+        operation = operation.replace_blocks(
+            [_expand_standard_namesakes(block) for block in operation.blocks]
+        )
+    elif is_standard_namesake(operation):
+        definition = operation.definition
+        if definition is None:
+            raise ValueError(
+                f"gate {operation.name!r} shares a Qiskit standard gate's name "
+                "without being that gate, and has no definition to translate "
+                "it by; rename it"
+            )
+        qubit_of = dict(zip(definition.qubits, qubits))
+        clbit_of = dict(zip(definition.clbits, clbits))
+        out.global_phase += definition.global_phase
+        for inner in definition.data:
+            _append_expanded(
+                out,
+                inner.operation,
+                [qubit_of[qubit] for qubit in inner.qubits],
+                [clbit_of[clbit] for clbit in inner.clbits],
+            )
+        return
+    out.append(operation, qubits, clbits)
 
 
 def validate_transpiler_settings(cfg: MultiQPUConfig) -> None:
@@ -351,12 +454,15 @@ def map_and_transpile(
     if seed is not None:
         seed = validate_nonnegative_integral(seed, label="seed")
 
+    _refuse_classical_register_named_q(qc)
+    # Building the architecture validates the config's integer fields, which
+    # the capacity check below would otherwise trip over as a TypeError.
+    arch = MultiQPUArchitecture(cfg)
     if qc.num_qubits > cfg.total_physical_qubits():
         raise ValueError(
             f"Logical qubits={qc.num_qubits} exceed physical qubits={cfg.total_physical_qubits()} in config."
         )
 
-    arch = MultiQPUArchitecture(cfg)
     coupling = arch.build_coupling_map()
 
     # Step 0: translate into basis (removes CY, etc.)
@@ -517,12 +623,15 @@ def transpile_baseline(
     if seed is not None:
         seed = validate_nonnegative_integral(seed, label="seed")
 
+    _refuse_classical_register_named_q(qc)
+    # Building the architecture validates the config's integer fields, which
+    # the capacity check below would otherwise trip over as a TypeError.
+    arch = MultiQPUArchitecture(cfg)
     if qc.num_qubits > cfg.total_physical_qubits():
         raise ValueError(
             f"Logical qubits={qc.num_qubits} exceed physical qubits={cfg.total_physical_qubits()} in config."
         )
 
-    arch = MultiQPUArchitecture(cfg)
     coupling = arch.build_coupling_map()
     qc_basis = _translate_to_basis(qc, cfg.basis_gates, seed)
 
@@ -605,6 +714,8 @@ def benchmark_random_circuits(
     """
     latency = latency or LatencyModel()
     rows: list[BenchmarkRow] = []
+    if out_csv:
+        out_csv = _validate_out_csv(out_csv)
 
     n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
     depth_value = validate_nonnegative_integral(depth, label="depth")
@@ -688,6 +799,7 @@ def sweep_topologies(
     strategies: Sequence[str] = ("baseline", "balanced", "tpccap"),
 ) -> None:
     """Sweep multiple topology settings; write summary CSV."""
+    out_csv = _validate_out_csv(out_csv)
     n_logical_value = validate_nonnegative_integral(n_logical, label="n_logical")
     depth_value = validate_nonnegative_integral(depth, label="depth")
     trials_value = validate_nonnegative_integral(trials, label="trials")
