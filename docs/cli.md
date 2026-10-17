@@ -188,10 +188,11 @@ charges `--migration-cost` EPR pairs (one by default) for every qubit whose QPU
 changes between neighbouring windows.
 
 Three costs are printed, because two different effects contribute: the seed
-placement's cost, the best placement the search reaches with migration forbidden,
-and the best with migration allowed. "saved by migration" compares the last two,
-holding the placement search constant, and is the number that answers whether
-teleport-based migration is worth having. Each migration is listed as
+placement's cost, the best migration-free placement the search reached -- with
+migration forbidden, or any window's placement held for the whole circuit -- and
+the best with migration allowed. "saved by migration" compares the last two, so
+re-placement the search found is never credited to migration, and is the number
+that answers whether teleport-based migration is worth having. Each migration is listed as
 `qubit q: QPU a -> b after window w`.
 
 `--out` writes the plan: windows, per-window assignments, migrations, and the

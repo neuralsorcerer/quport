@@ -484,8 +484,19 @@ print(result.aggregation.baseline_epr_pairs)   # without aggregation
 print(result.entanglement_schedule.makespan)
 ```
 
-The same report is available from the CLI:
+The same report is available from the CLI, given the same architecture --
+too wide for `small.json` -- saved as `example.json`:
+
+```json
+{
+  "n_qpus": 4,
+  "compute_qubits_per_qpu": 4,
+  "comm_qubits_per_qpu": 2,
+  "inter_topology": "switch",
+  "optimization_level": 0
+}
+```
 
 ```bash
-quport ebits --n-logical 16 --depth 20 --seed 0 --out entanglement_plan.json
+quport ebits --n-logical 16 --depth 20 --seed 0 --config example.json --out entanglement_plan.json
 ```

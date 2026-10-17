@@ -1337,11 +1337,13 @@ Keep the instance small — the tree is over set partitions.
 quport migrate --n-logical 12 --depth 20 --windows 4 --config small.json --out plan.json
 ```
 
-Prints the seed placement's EPR cost, the best cost with migration forbidden, and
-the best with it allowed, plus every migration as `qubit q: QPU a -> b after
-window w`. The middle column is the control: "saved by migration" compares
-against it, holding the placement search constant. `--migration-cost` prices a
-teleport; set it high enough and the plan collapses to pure re-placement.
+Prints the seed placement's EPR cost, the best migration-free placement the
+search reached (with migration forbidden, or any window's placement held for the
+whole circuit), and the best with migration allowed, plus every migration as
+`qubit q: QPU a -> b after window w`. The middle column is the control: "saved
+by migration" compares against it, so re-placement the search found is never
+counted as migration. `--migration-cost` prices a teleport; set it high enough
+and the plan collapses to pure re-placement.
 
 ### Split a mapped global circuit into local circuits and remote operations
 
