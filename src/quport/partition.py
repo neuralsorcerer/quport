@@ -173,29 +173,36 @@ def _validate_sa_parameters(
     )
 
 
-def _validate_tpccap_parameters(
-    *,
-    comm_ports_per_qpu: int,
-    max_passes: int | None = None,
-    max_candidate_qpus: int | None = None,
-) -> None:
-    """Validate TPCCAP control parameters."""
+def _validate_comm_ports_per_qpu(comm_ports_per_qpu: int) -> None:
+    """Validate the comm-port count both TPCCAP searches share."""
     if type(comm_ports_per_qpu) is not int:
         raise ValueError("comm_ports_per_qpu must be an integer")
     if comm_ports_per_qpu < 0:
         raise ValueError("comm_ports_per_qpu must be non-negative")
 
-    if max_passes is not None:
-        if type(max_passes) is not int:
-            raise ValueError("max_passes must be an integer")
-        if max_passes < 0:
-            raise ValueError("max_passes must be non-negative")
 
-    if max_candidate_qpus is not None:
-        if type(max_candidate_qpus) is not int:
-            raise ValueError("max_candidate_qpus must be an integer")
-        if max_candidate_qpus <= 0:
-            raise ValueError("max_candidate_qpus must be positive")
+def _validate_tpccap_parameters(
+    *,
+    comm_ports_per_qpu: int,
+    max_passes: int,
+    max_candidate_qpus: int,
+) -> None:
+    """Validate TPCCAP control parameters.
+
+    ``None`` is not a pass count or a candidate count; it fails here like any
+    other non-integer rather than inside the search.
+    """
+    _validate_comm_ports_per_qpu(comm_ports_per_qpu)
+
+    if type(max_passes) is not int:
+        raise ValueError("max_passes must be an integer")
+    if max_passes < 0:
+        raise ValueError("max_passes must be non-negative")
+
+    if type(max_candidate_qpus) is not int:
+        raise ValueError("max_candidate_qpus must be an integer")
+    if max_candidate_qpus <= 0:
+        raise ValueError("max_candidate_qpus must be positive")
 
 
 def _validate_tpccap_objective_parameters(
@@ -1160,7 +1167,7 @@ def tpccap_sa_partition(
         temp_end=temp_end,
         p_swap=p_swap,
     )
-    _validate_tpccap_parameters(comm_ports_per_qpu=comm_ports_per_qpu)
+    _validate_comm_ports_per_qpu(comm_ports_per_qpu)
     w_dist, w_port, w_cong = _validate_tpccap_objective_parameters(
         w_dist=w_dist,
         w_port=w_port,

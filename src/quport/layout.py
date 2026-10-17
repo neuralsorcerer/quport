@@ -294,6 +294,10 @@ def build_initial_layout(
     comm_logicals: set[int],
 ) -> list[int]:
     """Map logical qubits to physical qubits given partition + comm selections."""
+    # The shared validator reads ``None`` as "no comm selection"; here one is
+    # required.
+    if not isinstance(comm_logicals, set):
+        raise ValueError("comm_logicals must be a set of logical indices")
     n_logical_value, _n_qpus = _validate_layout_inputs(
         n_logical, qpu_of_logical, arch.cfg.n_qpus, comm_logicals=comm_logicals
     )

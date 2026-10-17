@@ -288,3 +288,15 @@ def test_compute_layout_hints_returns_consistent_layout_hints() -> None:
     assert hints.qpu_of_logical == [0, 0, 1]
     assert hints.comm_logicals == {0, 2}
     assert hints.initial_layout == [2, 0, 5]
+
+
+def test_build_initial_layout_requires_a_comm_selection() -> None:
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import MultiQPUConfig
+    from quport.layout import build_initial_layout
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    )
+    with pytest.raises(ValueError, match="comm_logicals must be a set"):
+        build_initial_layout(arch, 2, [0, 1], None)  # type: ignore[arg-type]

@@ -1712,3 +1712,14 @@ def test_ebit_congestion_diagnostics_come_from_epr_demand() -> None:
         route_link_loads(ebit_traffic_matrix(packets, _res.part, 2), sp, mode="ecmp")
     )
     assert diag.congestion_l2 == pytest.approx(expected.l2_load)
+
+
+@pytest.mark.parametrize("control", ["max_passes", "max_candidate_qpus"])
+def test_tpccap_refuses_none_search_controls_before_searching(control: str) -> None:
+    """None means "not supplied" to the shared validator, so it slipped past it."""
+    from quport.network import all_pairs_shortest_paths
+    from quport.partition import tpccap_partition
+
+    sp = all_pairs_shortest_paths([[1], [0]])
+    with pytest.raises(ValueError, match=f"{control} must be an integer"):
+        tpccap_partition(2, {(0, 1): 1}, 2, 1, 1, sp, **{control: None})
