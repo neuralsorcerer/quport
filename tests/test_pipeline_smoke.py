@@ -887,12 +887,15 @@ def test_global_routing_accepts_a_disconnected_machine_it_does_not_route_across(
     assert res.metrics.remote_2q == 0
 
 
-def test_sweep_checks_every_setting_before_running_any(tmp_path: Path) -> None:
-    """A disconnected setting late in the grid must not discard earlier rows."""
+def test_sweep_names_a_setting_global_routing_cannot_connect(tmp_path: Path) -> None:
+    """The failure says which setting of the grid could not be routed."""
     from quport.pipeline import sweep_topologies
 
     out = tmp_path / "sweep.csv"
-    with pytest.raises(ValueError, match=r"\(intra=clique, inter=ring, ports=0\)"):
+    with pytest.raises(
+        ValueError,
+        match=r"\(intra=clique, inter=ring, ports=0\): global routing cannot connect",
+    ):
         sweep_topologies(
             n_logical=4,
             depth=3,
@@ -920,3 +923,133 @@ def test_a_zero_qubit_benchmark_circuit_is_empty_and_maps() -> None:
     )
     assert map_and_transpile(qc, cfg, seed=0).metrics.remote_2q == 0
     assert compile_distributed(qc, cfg, seed=0).routed_remote_ops == []
+
+
+@pytest.mark.parametrize(
+    ("n_logical", "strategies"),
+    [(1, ("baseline", "balanced", "tpccap")), (4, ("baseline",))],
+)
+def test_sweep_runs_a_disconnected_setting_its_circuits_never_cross(
+    tmp_path: Path, n_logical: int, strategies: tuple[str, ...]
+) -> None:
+    """One qubit has nothing to route; the identity layout keeps four on QPU 0."""
+    from quport.pipeline import benchmark_random_circuits, sweep_topologies
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=4,
+        comm_qubits_per_qpu=0,
+        intra_topology="line",
+        inter_topology="ring",
+    )
+    assert benchmark_random_circuits(
+        cfg, n_logical, 5, 2, seed=0, strategies=strategies
+    )
+
+    out = tmp_path / "sweep.csv"
+    sweep_topologies(
+        n_logical=n_logical,
+        depth=5,
+        trials=2,
+        seed=0,
+        out_csv=str(out),
+        intra_topologies=("line",),
+        inter_topologies=("ring",),
+        comm_ports=(0,),
+        compute_per_qpu=4,
+        n_qpus=2,
+        strategies=strategies,
+    )
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 1 + len(strategies)
+
+
+def _disconnected_cfg(**overrides: object) -> MultiQPUConfig:
+    settings: dict[str, object] = dict(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=0,
+        intra_topology="line",
+        basis_gates=("rz", "sx", "x", "cx", "if_else", "measure"),
+    )
+    settings.update(overrides)
+    return MultiQPUConfig(**settings)  # type: ignore[arg-type]
+
+
+def test_global_routing_accepts_a_block_that_only_acts_locally_on_each_side() -> None:
+    """A control-flow block spans both QPUs but couples nothing across them."""
+    from qiskit import QuantumCircuit
+
+    from quport.pipeline import transpile_baseline
+
+    qc = QuantumCircuit(4, 1)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.cx(2, 3)
+    qc.measure(0, 0)
+    with qc.if_test((qc.clbits[0], 1)):
+        qc.x(1)
+        qc.x(2)
+
+    cfg = _disconnected_cfg()
+    assert (
+        transpile_baseline(qc, cfg, seed=0).mapped_circuit.count_ops()["if_else"] == 1
+    )
+    assert map_and_transpile(qc, cfg, seed=0, strategy="cluster").partition == [
+        0,
+        0,
+        1,
+        1,
+    ]
+
+
+def test_global_routing_explains_a_gate_inside_a_block_it_cannot_route() -> None:
+    from qiskit import QuantumCircuit
+
+    from quport.pipeline import transpile_baseline
+
+    qc = QuantumCircuit(4, 1)
+    qc.measure(0, 0)
+    with qc.if_test((qc.clbits[0], 1)):
+        qc.cx(1, 2)
+
+    with pytest.raises(ValueError, match=r"cannot connect QPUs \[0, 1\]"):
+        transpile_baseline(qc, _disconnected_cfg(), seed=0)
+
+
+def test_global_routing_leaves_a_gate_qiskit_optimizes_away_to_qiskit() -> None:
+    """A self-cancelling pair across the gap never reaches routing at level 3."""
+    from qiskit import QuantumCircuit
+
+    from quport.pipeline import transpile_baseline
+
+    qc = QuantumCircuit(4)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.cx(1, 2)
+    qc.cx(1, 2)
+
+    mapped = transpile_baseline(qc, _disconnected_cfg(optimization_level=3), seed=0)
+    assert mapped.metrics.remote_2q == 0
+
+
+def test_a_config_holding_numpy_integers_compiles_everywhere() -> None:
+    """Validators accepted it, but the partitioners require a plain int."""
+    import numpy as np
+
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(
+        n_qpus=np.int64(2),  # type: ignore[arg-type]
+        compute_qubits_per_qpu=np.int32(3),  # type: ignore[arg-type]
+        comm_qubits_per_qpu=np.uint8(1),  # type: ignore[arg-type]
+        link_capacity=np.int64(2),  # type: ignore[arg-type]
+    )
+    assert type(cfg.n_qpus) is int and type(cfg.comm_qubits_per_qpu) is int
+
+    qc = random_benchmark_circuit(n_logical=4, depth=4, seed=0)
+    for strategy in ("balanced", "cluster", "ebit", "tpccap", "tpccap_sa"):
+        map_and_transpile(qc, cfg, seed=0, strategy=strategy)
+    compile_distributed(qc, cfg, seed=0)
+
+    with pytest.raises(ValueError, match="n_qpus"):
+        map_and_transpile(qc, MultiQPUConfig(n_qpus=True), seed=0)  # type: ignore[arg-type]

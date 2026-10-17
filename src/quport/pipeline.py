@@ -11,12 +11,15 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, TypeAlias, TypeVar, cast
+from typing import Any, TextIO, TypeAlias, TypeVar, cast
 
 from qiskit import QuantumCircuit, transpile
+from qiskit.circuit import ControlFlowOp
 from qiskit.circuit.controlflow import CONTROL_FLOW_OP_NAMES
 from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
 from qiskit.circuit.random import random_circuit
+from qiskit.transpiler import CouplingMap
+from qiskit.transpiler.exceptions import TranspilerError
 from qiskit.transpiler.preset_passmanagers.plugin import list_stage_plugins
 
 from quport._validation import validate_nonnegative_integral
@@ -31,7 +34,6 @@ from quport.interaction import (
 )
 from quport.layout import compute_layout_hints, naive_layout
 from quport.metrics import CircuitMetrics, compute_metrics
-from quport.network import build_qpu_graph, topology_metrics
 from quport.partition import (
     PartitionDiagnostics,
     PartitionResult,
@@ -209,20 +211,61 @@ def validate_transpiler_settings(cfg: MultiQPUConfig) -> None:
             )
 
 
-def _require_routable(
-    qc: QuantumCircuit, layout: Sequence[int], arch: MultiQPUArchitecture
-) -> None:
-    """Refuse a global routing problem Qiskit cannot solve, with a clear reason.
+def _route_globally(
+    qc: QuantumCircuit,
+    cfg: MultiQPUConfig,
+    arch: MultiQPUArchitecture,
+    coupling: CouplingMap,
+    initial_layout: Sequence[int],
+    seed: int | None,
+) -> QuantumCircuit:
+    """Route ``qc`` on the whole machine, explaining a disconnected one.
 
-    Global routing can only move state along coupling-map edges, so every
-    multi-qubit operation needs its operands placed in one connected part of
-    the machine. With no comm ports, or an interconnect that leaves QPUs
-    unreachable, it may not be -- and Qiskit then fails deep inside routing.
+    Global routing can only move state along coupling-map edges, so a gate
+    whose operands sit in parts of the machine no path joins -- with no comm
+    ports, or an interconnect that leaves QPUs unreachable -- cannot be routed,
+    and Qiskit fails deep inside routing. Qiskit is still the judge of that:
+    a gate it optimizes away, or a control-flow block that only applies
+    single-qubit gates on both sides, routes fine. Only when routing fails is
+    the reason looked for, and reported as a ``ValueError`` naming the QPUs.
     The distributed compiler handles the same machine: it schedules such
     operations as unschedulable rather than routing them.
     """
-    n_phys = arch.n_phys
-    parent = list(range(n_phys))
+    try:
+        return transpile(
+            qc,
+            coupling_map=coupling,
+            initial_layout=list(initial_layout),
+            basis_gates=list(cfg.basis_gates),
+            optimization_level=cfg.optimization_level,
+            layout_method=cfg.layout_method,
+            routing_method=cfg.routing_method,
+            seed_transpiler=seed,
+        )
+    except TranspilerError as exc:
+        qpus = _unreachable_interaction(qc, initial_layout, arch, coupling)
+        if qpus is None:
+            raise
+        raise ValueError(
+            f"global routing cannot connect QPUs {qpus}: no inter-QPU path "
+            "joins them (comm_qubits_per_qpu=0 or a disconnected "
+            "inter_topology); compile_distributed schedules such operations "
+            "as unschedulable instead"
+        ) from exc
+
+
+def _unreachable_interaction(
+    qc: QuantumCircuit,
+    layout: Sequence[int],
+    arch: MultiQPUArchitecture,
+    coupling: CouplingMap,
+) -> list[int] | None:
+    """The QPUs of a gate whose operands no coupling-map path joins, if any.
+
+    Gates inside control-flow blocks count too, on the qubits their block
+    is applied to; a block itself is not an interaction.
+    """
+    parent = list(range(arch.n_phys))
 
     def find(node: int) -> int:
         while parent[node] != node:
@@ -230,24 +273,32 @@ def _require_routable(
             node = parent[node]
         return node
 
-    for u, v in arch.build_coupling_map().get_edges():
+    for u, v in coupling.get_edges():
         parent[find(u)] = find(v)
 
-    index = {qubit: position for position, qubit in enumerate(qc.qubits)}
-    for instruction in qc.data:
-        if len(instruction.qubits) < 2 or getattr(
-            instruction.operation, "_directive", False
-        ):
-            continue
-        physical = [layout[index[qubit]] for qubit in instruction.qubits]
-        if len({find(p) for p in physical}) > 1:
-            qpus = sorted({arch.qpu_of_phys(p) for p in physical})
-            raise ValueError(
-                f"global routing cannot connect QPUs {qpus}: no inter-QPU path "
-                "joins them (comm_qubits_per_qpu=0 or a disconnected "
-                "inter_topology); compile_distributed schedules such operations "
-                "as unschedulable instead"
-            )
+    def visit(
+        circuit: QuantumCircuit, physical_of: Mapping[Any, int]
+    ) -> list[int] | None:
+        for instruction in circuit.data:
+            operation = instruction.operation
+            if isinstance(operation, ControlFlowOp):
+                for block in operation.blocks:
+                    inner = {
+                        block_qubit: physical_of[qubit]
+                        for block_qubit, qubit in zip(block.qubits, instruction.qubits)
+                    }
+                    found = visit(block, inner)
+                    if found is not None:
+                        return found
+                continue
+            if len(instruction.qubits) < 2 or getattr(operation, "_directive", False):
+                continue
+            physical = [physical_of[qubit] for qubit in instruction.qubits]
+            if len({find(p) for p in physical}) > 1:
+                return sorted({arch.qpu_of_phys(p) for p in physical})
+        return None
+
+    return visit(qc, dict(zip(qc.qubits, layout)))
 
 
 def map_and_transpile(
@@ -426,20 +477,10 @@ def map_and_transpile(
 
     hints = compute_layout_hints(qc_basis, arch, part, comm_mode=comm_mode)
     mapping_time = time.perf_counter() - t0
-    _require_routable(qc_basis, hints.initial_layout, arch)
 
     # Step 2: transpile on the global coupling map using SABRE
     t1 = time.perf_counter()
-    mapped = transpile(
-        qc_basis,
-        coupling_map=coupling,
-        initial_layout=hints.initial_layout,
-        basis_gates=list(cfg.basis_gates),
-        optimization_level=cfg.optimization_level,
-        layout_method=cfg.layout_method,
-        routing_method=cfg.routing_method,
-        seed_transpiler=seed,
-    )
+    mapped = _route_globally(qc_basis, cfg, arch, coupling, hints.initial_layout, seed)
     transpile_time = time.perf_counter() - t1
 
     metrics = compute_metrics(mapped, arch)
@@ -488,19 +529,9 @@ def transpile_baseline(
     # Optional: initial layout = identity (logical i -> physical i)
     # This baseline is deterministic and exposes inter-QPU penalties.
     init_layout = naive_layout(qc_basis.num_qubits)
-    _require_routable(qc_basis, init_layout, arch)
 
     t0 = time.perf_counter()
-    mapped = transpile(
-        qc_basis,
-        coupling_map=coupling,
-        initial_layout=init_layout,
-        basis_gates=list(cfg.basis_gates),
-        optimization_level=cfg.optimization_level,
-        layout_method=cfg.layout_method,
-        routing_method=cfg.routing_method,
-        seed_transpiler=seed,
-    )
+    mapped = _route_globally(qc_basis, cfg, arch, coupling, init_layout, seed)
     t1 = time.perf_counter()
 
     metrics = compute_metrics(mapped, arch)
@@ -680,57 +711,39 @@ def sweep_topologies(
     latency = LatencyModel()
     summary: list[SweepSummaryRow] = []
 
-    def setting_config(intra: str, inter: str, ports: int) -> MultiQPUConfig:
-        return MultiQPUConfig(
-            n_qpus=n_qpus_value,
-            compute_qubits_per_qpu=compute_per_qpu_value,
-            comm_qubits_per_qpu=ports,
-            intra_topology=cast(IntraTopology, intra),
-            inter_topology=cast(InterTopology, inter),
-            inter_degree=inter_degree_value,
-        )
-
-    # Every setting that runs is routed globally, which needs a connected
-    # machine. Check them all before running any, so a bad setting late in the
-    # grid cannot throw away the ones already computed.
-    disconnected: list[str] = []
     for intra in intra_values:
         for inter in inter_values:
             for ports in comm_port_values:
-                setting = setting_config(intra, inter, ports)
-                if (
-                    n_qpus_value <= 1
-                    or n_logical_value > setting.total_physical_qubits()
-                ):
-                    continue
-                if not topology_metrics(build_qpu_graph(setting)).connected:
-                    disconnected.append(
-                        f"(intra={intra}, inter={inter}, ports={ports})"
-                    )
-    if disconnected:
-        raise ValueError(
-            "sweep_topologies routes every circuit globally, which needs a "
-            "connected inter-QPU network; these settings leave QPUs unreachable: "
-            + ", ".join(disconnected)
-        )
-
-    for intra in intra_values:
-        for inter in inter_values:
-            for ports in comm_port_values:
-                cfg = setting_config(intra, inter, ports)
+                cfg = MultiQPUConfig(
+                    n_qpus=n_qpus_value,
+                    compute_qubits_per_qpu=compute_per_qpu_value,
+                    comm_qubits_per_qpu=ports,
+                    intra_topology=intra,
+                    inter_topology=inter,
+                    inter_degree=inter_degree_value,
+                )
                 if n_logical_value > cfg.total_physical_qubits():
                     continue
 
-                rows = benchmark_random_circuits(
-                    cfg=cfg,
-                    n_logical=n_logical_value,
-                    depth=depth_value,
-                    trials=trials_value,
-                    seed=seed_value,
-                    latency=latency,
-                    out_csv=None,
-                    strategies=selected_strategies,
-                )
+                try:
+                    rows = benchmark_random_circuits(
+                        cfg=cfg,
+                        n_logical=n_logical_value,
+                        depth=depth_value,
+                        trials=trials_value,
+                        seed=seed_value,
+                        latency=latency,
+                        out_csv=None,
+                        strategies=selected_strategies,
+                    )
+                except ValueError as exc:
+                    # Most often a machine global routing cannot connect --
+                    # with no comm ports, say -- which only a circuit that
+                    # needs a path between its QPUs runs into.
+                    raise ValueError(
+                        f"sweep setting (intra={intra}, inter={inter}, "
+                        f"ports={ports}): {exc}"
+                    ) from exc
 
                 rows_snapshot = list(rows)
                 intra_id = intra
