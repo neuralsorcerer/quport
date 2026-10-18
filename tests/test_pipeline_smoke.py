@@ -1276,3 +1276,43 @@ def test_an_out_csv_that_can_never_be_written_is_refused_first(
             strategies=("balanced",),
         )
     assert calls == []
+
+
+def test_global_routing_keeps_two_final_measurements_into_one_bit_in_order() -> None:
+    """Qiskit's routing put the final measurements back in qubit order, so the
+    earlier of two measurements into c[0] decided it."""
+    from qiskit import QuantumCircuit, transpile
+    from qiskit.providers.basic_provider import BasicSimulator
+
+    from quport.pipeline import transpile_baseline
+
+    qc = QuantumCircuit(8, 1)
+    for a, b in ((0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7)):
+        qc.cx(a, b)
+    qc.x(3)
+    qc.cx(0, 3)
+    qc.measure(3, 0)  # 1, overwritten by
+    qc.measure(1, 0)  # 0
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=4,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=0,
+    )
+    simulator = BasicSimulator()
+
+    for mapped in (
+        map_and_transpile(qc, cfg, seed=3, strategy="balanced").mapped_circuit,
+        transpile_baseline(qc, cfg, seed=3).mapped_circuit,
+    ):
+        assert not any(
+            getattr(instruction.operation, "label", None) == "quport_order"
+            for instruction in mapped.data
+        )
+        counts = (
+            simulator.run(transpile(mapped, simulator), shots=64, seed_simulator=1)
+            .result()
+            .get_counts()
+        )
+        assert counts == {"0": 64}

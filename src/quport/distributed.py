@@ -11,7 +11,7 @@ import json
 import math
 import os
 from collections import deque
-from collections.abc import Iterable, Mapping, Sequence, Set
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from functools import cache
 from numbers import Integral
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from qiskit import QuantumCircuit, QuantumRegister
-from qiskit.circuit import Barrier, ControlFlowOp, Store
+from qiskit.circuit import Barrier, ControlFlowOp, Measure, Store
 
 from quport.architecture import MultiQPUArchitecture
 from quport.entanglement import is_directive
@@ -1383,8 +1383,8 @@ def split_into_qpus(
     return DistributedProgram(local_circuits=local, remote_ops=remote_ops)
 
 
-#: Label of the barriers that hold a program's cross-QPU events in order while
-#: it is routed. They exist only for the duration of routing.
+#: Label of the barriers that hold events in order while a circuit is routed.
+#: They exist only for the duration of routing.
 _ORDER_BARRIER_LABEL = "quport_order"
 
 
@@ -1423,33 +1423,104 @@ def _hold_cross_qpu_order(
     can tie them together that way, leaving programs that no execution
     satisfies: a QPU waiting on a bit another QPU writes only after this QPU's
     later event. Each event is therefore tied to the one before it by a
-    labelled barrier over one qubit of each, which
-    :func:`_release_cross_qpu_order` takes out after routing. Events on bits
-    no other program touches need no tie: their own wires order them.
+    labelled barrier, which :func:`_release_order_barriers` takes out after
+    routing. Events on bits no other program touches need no tie: their own
+    wires order them. Measurements into one bit are tied as well; see
+    :func:`_hold_measurement_order`.
     """
     shared = _shared_clbits(mapped, arch)
-    held: dict[int, QuantumCircuit] = {}
-    for qpu, circuit in program.local_circuits.items():
-        out = circuit.copy_empty_like()
-        previous: Any = None
-        for instruction in circuit.data:
-            if instruction.qubits and (
-                _remote_barrier_ordinal(instruction.operation) is not None
-                or not shared.isdisjoint(instruction.clbits)
-            ):
-                if previous is not None and previous not in instruction.qubits:
-                    out.append(
-                        Barrier(2, label=_ORDER_BARRIER_LABEL),
-                        [previous, instruction.qubits[0]],
-                    )
-                previous = instruction.qubits[0]
-            out.append(instruction)
-        held[qpu] = out
-    return held
+
+    def meets_others(instruction: Any) -> bool:
+        return _remote_barrier_ordinal(instruction.operation) is not None or (
+            not shared.isdisjoint(instruction.clbits)
+        )
+
+    return {
+        qpu: _with_order_ties(circuit, meets_others)
+        for qpu, circuit in program.local_circuits.items()
+    }
 
 
-def _release_cross_qpu_order(circuit: QuantumCircuit) -> QuantumCircuit:
-    """Take the barriers :func:`_hold_cross_qpu_order` added out of ``circuit``."""
+def _hold_measurement_order(circuit: QuantumCircuit) -> QuantumCircuit:
+    """A copy of ``circuit`` whose measurements into one bit routing keeps in order.
+
+    Qiskit's routing stage moves the final measurements behind a barrier and
+    puts them back in qubit order, honouring their qubit wires but not their
+    classical ones, so two final measurements into the same bit can swap and
+    leave the earlier outcome in the bit. Tying each measurement to the
+    previous one into its bit with a labelled barrier over both makes their
+    order a qubit dependency, which it keeps;
+    :func:`_release_order_barriers` takes the barriers out after routing.
+    """
+    return _with_order_ties(circuit, lambda instruction: False)
+
+
+def _with_order_ties(
+    circuit: QuantumCircuit, is_event: Callable[[Any], bool]
+) -> QuantumCircuit:
+    """Copy ``circuit``, tying each event to the previous one, and each
+    measurement to the previous measurement into the same bit.
+
+    A tie is a labelled barrier spanning every qubit of both instructions, not
+    one of each: routing drops the idle wires of a control-flow block, and
+    unrolls a custom instruction into pieces on fewer qubits, either of which
+    can cut a tie through a single qubit. Whatever survives of an instruction
+    still touches the barrier, and one left with no qubit at all is ordered by
+    its classical bits alone. Two instructions that share a qubit and that
+    routing keeps whole -- markers and measurements -- are already ordered by it.
+    """
+    out = circuit.copy_empty_like()
+    previous_event: Any = None
+    last_access: dict[Any, Any] = {}
+    for instruction in circuit.data:
+        earlier: list[Any] = []
+        if instruction.qubits and is_event(instruction):
+            if previous_event is not None:
+                earlier.append(previous_event)
+            previous_event = instruction
+        if isinstance(instruction.operation, Measure):
+            for clbit in instruction.clbits:
+                prior = last_access.get(clbit)
+                if (
+                    prior is not None
+                    and isinstance(prior.operation, Measure)
+                    and not any(prior is seen for seen in earlier)
+                ):
+                    earlier.append(prior)
+        earlier = [
+            prior
+            for prior in earlier
+            if not _ordered_by_a_shared_wire(prior, instruction)
+        ]
+        if earlier:
+            tied = list(
+                dict.fromkeys(
+                    [qubit for prior in earlier for qubit in prior.qubits]
+                    + list(instruction.qubits)
+                )
+            )
+            out.append(Barrier(len(tied), label=_ORDER_BARRIER_LABEL), tied)
+        for clbit in instruction.clbits:
+            last_access[clbit] = instruction
+        out.append(instruction)
+    return out
+
+
+def _ordered_by_a_shared_wire(first: Any, second: Any) -> bool:
+    """True when routing cannot separate two instructions it keeps whole."""
+
+    def whole(operation: Any) -> bool:
+        return _is_barrier(operation) or isinstance(operation, Measure)
+
+    return (
+        whole(first.operation)
+        and whole(second.operation)
+        and not set(first.qubits).isdisjoint(second.qubits)
+    )
+
+
+def _release_order_barriers(circuit: QuantumCircuit) -> QuantumCircuit:
+    """Take the barriers the hold functions added out of ``circuit``."""
     circuit.data = [
         instruction
         for instruction in circuit.data

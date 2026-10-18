@@ -1676,6 +1676,11 @@ together the other way round and leave programs no execution satisfies. An
 instruction that acts on no qubit, such as a condition whose body is empty,
 goes into QPU 0's program alone, so it still runs once.
 
+Qiskit's routing stage gathers a circuit's final measurements behind a barrier and
+puts them back in qubit order, which can swap two final measurements into the same
+bit and leave the earlier outcome in it. Every QuPort pipeline ties such
+measurements together while it routes, so the later one still decides the bit.
+
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
 

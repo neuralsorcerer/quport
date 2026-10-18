@@ -2402,7 +2402,7 @@ def test_routing_keeps_a_local_access_after_the_remote_read_it_follows() -> None
 def test_routing_holds_cross_qpu_events_in_order_and_then_lets_go() -> None:
     from qiskit.circuit import Barrier
 
-    from quport.distributed import _hold_cross_qpu_order, _release_cross_qpu_order
+    from quport.distributed import _hold_cross_qpu_order, _release_order_barriers
 
     arch = MultiQPUArchitecture(
         MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=3, comm_qubits_per_qpu=1)
@@ -2434,7 +2434,7 @@ def test_routing_holds_cross_qpu_events_in_order_and_then_lets_go() -> None:
     assert shape(held[1]) == [("if_else", [4]), ("barrier", [4, 5]), ("if_else", [5])]
     order = [i.operation for i in held[0].data if isinstance(i.operation, Barrier)]
     assert [barrier.label for barrier in order] == ["quport_order"]
-    assert shape(_release_cross_qpu_order(held[0])) == shape(program.local_circuits[0])
+    assert shape(_release_order_barriers(held[0])) == shape(program.local_circuits[0])
 
 
 def test_reassembly_keeps_a_block_routing_emptied_of_qubits() -> None:
@@ -2511,6 +2511,80 @@ def test_reassembly_refuses_a_store_that_routing_unrolled_into_a_program() -> No
 
     with pytest.raises(ValueError, match="classical store"):
         reassemble_distributed_program(mapped, routed, program.remote_ops, arch)
+
+
+def test_routing_keeps_the_order_of_a_block_it_contracts() -> None:
+    """The order tie ran through each event's first qubit; routing dropped that
+    idle wire from the block, the block moved ahead of the remote marker, and
+    reassembly refused the routed bundle."""
+    from quport.compiler import compile_distributed
+    from quport.distributed import reassemble_distributed_program
+
+    c = ClassicalRegister(2, "c")
+    qc = QuantumCircuit(QuantumRegister(8, "q"), c)
+    with qc.if_test((c[1], 1)):
+        qc.cx(3, 7)
+        qc.cx(3, 7)
+        qc.x(7)
+    qc.cx(1, 0)
+    with qc.if_test((c, 0)):  # spans two QPUs: a remote op reading c
+        qc.cx(3, 1)
+    qc.cx(3, 7)
+    with qc.if_test((c[1], 1)):  # local, read after the remote op
+        qc.cx(0, 4)
+        qc.cx(0, 4)  # cancels: routing contracts the block off qubit 0
+        qc.x(4)
+    for level in (1, 3):
+        cfg = MultiQPUConfig(
+            n_qpus=3,
+            compute_qubits_per_qpu=3,
+            comm_qubits_per_qpu=1,
+            intra_topology="line",
+            optimization_level=level,
+        )
+        res = compile_distributed(qc, cfg, seed=5031, strategy="cluster")
+
+        reassemble_distributed_program(
+            res.physical_circuit,
+            res.local_routed,
+            res.routed_remote_ops,
+            MultiQPUArchitecture(cfg),
+        )
+
+
+def test_local_routing_keeps_two_final_measurements_into_one_bit_in_order() -> None:
+    """Qiskit's routing put the final measurements back in qubit order, so the
+    earlier of two measurements into c[0] decided it."""
+    from qiskit import transpile
+    from qiskit.providers.basic_provider import BasicSimulator
+
+    from quport.compiler import compile_distributed
+
+    qc = QuantumCircuit(8, 1)
+    for a, b in ((0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7)):
+        qc.cx(a, b)
+    qc.x(3)
+    qc.cx(0, 3)
+    qc.measure(3, 0)  # 1, overwritten by
+    qc.measure(1, 0)  # 0
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=4,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=0,
+    )
+    res = compile_distributed(qc, cfg, seed=3, strategy="balanced")
+    simulator = BasicSimulator()
+
+    for routed in res.local_routed.values():
+        if any(instruction.operation.name == "measure" for instruction in routed.data):
+            counts = (
+                simulator.run(transpile(routed, simulator), shots=64, seed_simulator=1)
+                .result()
+                .get_counts()
+            )
+            assert counts == {"0": 64}
 
 
 def test_a_remote_operation_names_every_operand_and_marker() -> None:

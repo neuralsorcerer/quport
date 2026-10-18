@@ -46,7 +46,7 @@ from quport.distributed import (
     DistributedProgram,
     RemoteOp,
     _hold_cross_qpu_order,
-    _release_cross_qpu_order,
+    _release_order_barriers,
     remap_remote_ops_to_routed,
     split_into_qpus,
 )
@@ -350,7 +350,7 @@ def compile_distributed(
             routing_method=cfg.routing_method,
             seed_transpiler=seed,
         )
-        routed = _release_cross_qpu_order(routed)
+        routed = _release_order_barriers(routed)
         local_routed[qpu_id] = routed
         local_counts[qpu_id] = dict(count_ops(routed))
 
