@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from qiskit import QuantumCircuit, QuantumRegister
-from qiskit.circuit import ControlFlowOp
+from qiskit.circuit import Barrier, ControlFlowOp, Store
 
 from quport.architecture import MultiQPUArchitecture
+from quport.entanglement import is_directive
 
 _PathLike: TypeAlias = str | os.PathLike[str]
 
@@ -361,10 +362,12 @@ def remote_barrier_label(ordinal: int) -> str:
 
 
 def _is_barrier(operation: object) -> bool:
-    """True for a barrier -- not for every directive: a classical store is one."""
-    return bool(getattr(operation, "_directive", False)) and (
-        getattr(operation, "name", None) == "barrier"
-    )
+    """True for Qiskit's barrier, recognised by class rather than by name.
+
+    A custom gate called ``barrier`` is a gate, and the transpiler keeps it as
+    one; treating it as a barrier would drop it from every program.
+    """
+    return isinstance(operation, Barrier)
 
 
 def _barrier_statements(operation: object) -> int:
@@ -641,8 +644,9 @@ def reassemble_distributed_program(
         return [out.clbits[clbit_index(clbit)] for clbit in instruction.clbits]
 
     # Who touches each classical bit, in the mapped circuit's order: a QPU for
-    # a local instruction, a manifest ordinal for a remote one. Instructions
-    # without qubits are left out on both sides, as the merge skips them.
+    # a local instruction, a manifest ordinal for a remote one. An instruction
+    # without qubits belongs to the QPU `split_into_qpus` gives it; one that
+    # routing emptied of qubits stays with the QPU whose program holds it.
     #
     # A program routing decomposed a custom instruction in no longer names it,
     # and holds one access to each bit for every access the instruction's
@@ -658,12 +662,16 @@ def reassemble_distributed_program(
     ordinal_at = {op.index: ordinal for ordinal, op in enumerate(remote_ops)}
     clbit_owners: list[list[tuple[str, int]]] = [[] for _ in mapped.clbits]
     for position, instruction in enumerate(mapped.data):
-        if not instruction.qubits or not instruction.clbits:
+        if not instruction.clbits:
             continue
         ordinal = ordinal_at.get(position)
         accesses: list[int] | None = None
         if ordinal is None:
-            qpu = arch.qpu_of_phys(mapped_at[instruction.qubits[0]])
+            qpu = (
+                arch.qpu_of_phys(mapped_at[instruction.qubits[0]])
+                if instruction.qubits
+                else _QPU_WITHOUT_QUBITS
+            )
             owner = ("local", qpu)
             if instruction.operation.name not in program_names.get(qpu, ()):
                 accesses = _accesses_once_decomposed(instruction.operation)
@@ -701,6 +709,8 @@ def reassemble_distributed_program(
         circuit = local_routed[qpu]
         if not isinstance(circuit, QuantumCircuit):
             raise ValueError(f"local_routed[{qpu!r}] must be a QuantumCircuit")
+        # Routing can unroll a custom instruction into a store of its own.
+        reject_classical_storage(circuit, what="reassemble_distributed_program")
         instructions = list(circuit.data)
         positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
         per_qubit: dict[int, deque[int]] = {}
@@ -714,9 +724,8 @@ def reassemble_distributed_program(
                 ]
             for qubit in instruction.qubits:
                 per_qubit.setdefault(positions[qubit], deque()).append(index)
-            if instruction.qubits:
-                for clbit in instruction.clbits:
-                    per_clbit.setdefault(clbit_index(clbit), deque()).append(index)
+            for clbit in instruction.clbits:
+                per_clbit.setdefault(clbit_index(clbit), deque()).append(index)
         data[qpu] = instructions
         index_of[qpu] = positions
         queues[qpu] = per_qubit
@@ -769,7 +778,16 @@ def reassemble_distributed_program(
             clbit_queues[qpu][clbit].popleft()
         advance_local(qpu, clbits)
 
-    remaining = {qpu: sum(1 for inst in data[qpu] if inst.qubits) for qpu in qpus}
+    def takes_part(instruction: Any) -> bool:
+        """True unless the instruction is a directive acting on no qubit.
+
+        An instruction without qubits still has its classical effect -- a
+        condition whose body routing emptied of qubits still carries its body --
+        so it is merged like any other, ordered by its classical bits alone.
+        """
+        return bool(instruction.qubits) or not is_directive(instruction.operation)
+
+    remaining = {qpu: sum(1 for inst in data[qpu] if takes_part(inst)) for qpu in qpus}
     pending = set(range(len(remote_ops)))
 
     while any(remaining.values()) or pending:
@@ -777,13 +795,13 @@ def reassemble_distributed_program(
 
         for qpu in qpus:
             for index, instruction in enumerate(data[qpu]):
-                if retired[qpu][index] or not instruction.qubits:
+                if retired[qpu][index] or not takes_part(instruction):
                     continue
                 if _remote_barrier_ordinal(instruction.operation) is not None:
                     continue
                 if not leads(qpu, index):
                     continue
-                if not getattr(instruction.operation, "_directive", False):
+                if not is_directive(instruction.operation):
                     out.append(
                         instruction.operation,
                         [out.qubits[index_of[qpu][q]] for q in instruction.qubits],
@@ -861,8 +879,6 @@ def _accesses_once_decomposed(operation: Any) -> list[int] | None:
     slot_of = {clbit: slot for slot, clbit in enumerate(definition.clbits)}
     counts = [0] * len(definition.clbits)
     for inner in definition.data:
-        if not inner.qubits:
-            continue
         nested = _accesses_once_decomposed(inner.operation)
         for slot, clbit in enumerate(inner.clbits):
             counts[slot_of[clbit]] += 1 if nested is None else nested[slot]
@@ -1021,20 +1037,35 @@ def _fresh_register_name(preferred: str, taken: Iterable[str]) -> str:
 
 
 def reject_classical_storage(circuit: QuantumCircuit, *, what: str) -> None:
-    """Refuse classical variables, stretches, and top-level ``store``.
+    """Refuse classical variables, stretches, and ``store`` anywhere.
 
     Each per-QPU program would need its own declaration of a variable, and a
     store touches no qubit -- no QPU owns it, and nothing records the order it
     takes against the other accesses to its target -- so neither can be split
-    and merged back faithfully. Saying so beats a Qiskit error from deep inside,
-    or a store that silently disappears in the round trip.
+    and merged back faithfully. That holds inside a control-flow body too. A
+    store is recognised by class: a gate merely named ``store`` is a gate.
+    Saying so beats a Qiskit error from deep inside, or a store that silently
+    disappears in the round trip.
     """
     if circuit.num_vars or getattr(circuit, "num_stretches", 0):
         raise ValueError(
             f"{what} does not support circuits with classical variables or stretches"
         )
-    if any(instruction.operation.name == "store" for instruction in circuit.data):
+    if _holds_store(circuit):
         raise ValueError(f"{what} does not support classical store instructions")
+
+
+def _holds_store(circuit: QuantumCircuit) -> bool:
+    """True when ``circuit`` stores to a classical target, at any depth."""
+    for instruction in circuit.data:
+        operation = instruction.operation
+        if isinstance(operation, Store):
+            return True
+        if isinstance(operation, ControlFlowOp) and any(
+            _holds_store(block) for block in operation.blocks
+        ):
+            return True
+    return False
 
 
 def _new_local_circuit(mapped: QuantumCircuit, n_phys: int) -> QuantumCircuit:
@@ -1059,6 +1090,10 @@ def _new_local_circuit(mapped: QuantumCircuit, n_phys: int) -> QuantumCircuit:
     return circuit
 
 
+#: The QPU whose program carries the instructions that act on no qubit.
+_QPU_WITHOUT_QUBITS = 0
+
+
 def split_into_qpus(
     mapped: QuantumCircuit, arch: MultiQPUArchitecture
 ) -> DistributedProgram:
@@ -1071,6 +1106,8 @@ def split_into_qpus(
     - Local circuits include 1Q and intra-QPU 2Q operations.
     - For remote ops, local circuits will include barriers on the involved QPUs to make
       synchronization explicit for downstream schedulers.
+    - An instruction acting on no qubit, such as a condition whose body is empty, goes
+      to QPU 0's program only, so it still runs once.
     """
     reject_classical_storage(mapped, what="split_into_qpus")
     n_qpus = arch.cfg.n_qpus
@@ -1133,20 +1170,25 @@ def split_into_qpus(
         qs = [qindex[q] for q in inst.qubits]
 
         if not qs:
-            if op.name == "barrier":
+            if _is_barrier(op):
                 for qpu in range(n_qpus):
                     local[qpu].barrier()
                     barriers_emitted[qpu] += 1
             else:
-                for qpu in range(n_qpus):
-                    append_local(
-                        qpu, op, [], _local_cargs_for_qpu(local, qpu, cargs_idx)
-                    )
+                # No QPU owns an instruction without qubits, but it must still
+                # run exactly once: a copy per program would apply it once per
+                # QPU. QPU 0 takes it, as reassembly expects.
+                append_local(
+                    _QPU_WITHOUT_QUBITS,
+                    op,
+                    [],
+                    _local_cargs_for_qpu(local, _QPU_WITHOUT_QUBITS, cargs_idx),
+                )
             continue
 
         op_qpus = [arch.qpu_of_phys(q) for q in qs]
 
-        if op.name == "barrier":
+        if _is_barrier(op):
             qpu_order, qpu_qubits_barrier = _group_qubits_by_qpu_in_operand_order(
                 qs, op_qpus
             )
@@ -1244,3 +1286,81 @@ def split_into_qpus(
                     emit_marker(qpu, qpu_qubits[qpu], label)
 
     return DistributedProgram(local_circuits=local, remote_ops=remote_ops)
+
+
+#: Label of the barriers that hold a program's cross-QPU events in order while
+#: it is routed. They exist only for the duration of routing.
+_ORDER_BARRIER_LABEL = "quport_order"
+
+
+def _shared_clbits(mapped: QuantumCircuit, arch: MultiQPUArchitecture) -> set[Any]:
+    """Classical bits that more than one QPU, or a remote operation, accesses."""
+    qindex = {qubit: index for index, qubit in enumerate(mapped.qubits)}
+    owners: dict[Any, set[tuple[str, int]]] = {}
+    for position, instruction in enumerate(mapped.data):
+        if not instruction.clbits:
+            continue
+        qpus = {arch.qpu_of_phys(qindex[qubit]) for qubit in instruction.qubits}
+        if not qpus:
+            owner = ("local", _QPU_WITHOUT_QUBITS)
+        elif len(qpus) == 1:
+            owner = ("local", qpus.pop())
+        else:
+            owner = ("remote", position)
+        for clbit in instruction.clbits:
+            owners.setdefault(clbit, set()).add(owner)
+    return {
+        clbit
+        for clbit, who in owners.items()
+        if len(who) > 1 or any(kind == "remote" for kind, _ in who)
+    }
+
+
+def _hold_cross_qpu_order(
+    program: DistributedProgram, mapped: QuantumCircuit, arch: MultiQPUArchitecture
+) -> dict[int, QuantumCircuit]:
+    """Copies of ``program``'s circuits whose cross-QPU events routing keeps in order.
+
+    A program meets the others at its remote markers and at its accesses to
+    classical bits another QPU or a remote operation also uses, and the order
+    between programs is the mapped circuit's. Routing is free to emit two such
+    events that share no wire in the opposite order, and the swaps it then adds
+    can tie them together that way, leaving programs that no execution
+    satisfies: a QPU waiting on a bit another QPU writes only after this QPU's
+    later event. Each event is therefore tied to the one before it by a
+    labelled barrier over one qubit of each, which
+    :func:`_release_cross_qpu_order` takes out after routing. Events on bits
+    no other program touches need no tie: their own wires order them.
+    """
+    shared = _shared_clbits(mapped, arch)
+    held: dict[int, QuantumCircuit] = {}
+    for qpu, circuit in program.local_circuits.items():
+        out = circuit.copy_empty_like()
+        previous: Any = None
+        for instruction in circuit.data:
+            if instruction.qubits and (
+                _remote_barrier_ordinal(instruction.operation) is not None
+                or not shared.isdisjoint(instruction.clbits)
+            ):
+                if previous is not None and previous not in instruction.qubits:
+                    out.append(
+                        Barrier(2, label=_ORDER_BARRIER_LABEL),
+                        [previous, instruction.qubits[0]],
+                    )
+                previous = instruction.qubits[0]
+            out.append(instruction)
+        held[qpu] = out
+    return held
+
+
+def _release_cross_qpu_order(circuit: QuantumCircuit) -> QuantumCircuit:
+    """Take the barriers :func:`_hold_cross_qpu_order` added out of ``circuit``."""
+    circuit.data = [
+        instruction
+        for instruction in circuit.data
+        if not (
+            _is_barrier(instruction.operation)
+            and getattr(instruction.operation, "label", None) == _ORDER_BARRIER_LABEL
+        )
+    ]
+    return circuit

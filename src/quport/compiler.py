@@ -45,6 +45,8 @@ from quport.config import LatencyModel, MultiQPUConfig
 from quport.distributed import (
     DistributedProgram,
     RemoteOp,
+    _hold_cross_qpu_order,
+    _release_cross_qpu_order,
     remap_remote_ops_to_routed,
     split_into_qpus,
 )
@@ -333,7 +335,10 @@ def compile_distributed(
     local_counts: dict[int, dict[str, int]] = {}
 
     identity_layout = list(range(arch.n_phys))
-    for qpu_id, local_qc in program.local_circuits.items():
+    # Routing must not reorder the points where a program meets the others,
+    # which the mapped circuit orders; see `_hold_cross_qpu_order`.
+    held = _hold_cross_qpu_order(program, physical, arch)
+    for qpu_id, local_qc in held.items():
         cm_intra = arch.build_intra_coupling_map(qpu_id)
         routed = transpile(
             local_qc,
@@ -345,6 +350,7 @@ def compile_distributed(
             routing_method=cfg.routing_method,
             seed_transpiler=seed,
         )
+        routed = _release_cross_qpu_order(routed)
         local_routed[qpu_id] = routed
         local_counts[qpu_id] = dict(count_ops(routed))
 

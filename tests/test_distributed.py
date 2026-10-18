@@ -189,8 +189,12 @@ def test_split_into_qpus_multiqubit_remote_op_preserves_qpu_local_operand_order(
     assert [q0_local.find_bit(q).index for q in barrier_inst.qubits] == [0, 1]
 
 
-def test_split_into_qpus_zero_qubit_instruction_is_broadcast() -> None:
+def test_split_into_qpus_puts_a_zero_qubit_instruction_in_one_program() -> None:
+    """No QPU owns it, but it must run once: a copy per program ran it once
+    per QPU, and reassembly then dropped every copy."""
     from qiskit.circuit import Instruction
+
+    from quport.distributed import reassemble_distributed_program
 
     cfg = MultiQPUConfig(
         n_qpus=2,
@@ -207,9 +211,14 @@ def test_split_into_qpus_zero_qubit_instruction_is_broadcast() -> None:
     program = split_into_qpus(mapped, arch)
 
     assert program.remote_ops == []
-    for qpu in range(cfg.n_qpus):
-        local = program.local_circuits[qpu]
-        assert local.count_ops().get("global_sync", 0) == 1
+    assert [
+        program.local_circuits[qpu].count_ops().get("global_sync", 0)
+        for qpu in range(cfg.n_qpus)
+    ] == [1, 0]
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+    assert merged.count_ops().get("global_sync", 0) == 1
 
 
 def test_split_into_qpus_preserves_single_qpu_clbit_operations() -> None:
@@ -236,8 +245,10 @@ def test_split_into_qpus_preserves_single_qpu_clbit_operations() -> None:
     assert program.local_circuits[1].count_ops().get("measure", 0) == 0
 
 
-def test_split_into_qpus_zero_qubit_clbit_instruction_is_broadcast() -> None:
+def test_split_into_qpus_keeps_a_zero_qubit_clbit_instruction_once() -> None:
     from qiskit.circuit import Instruction
+
+    from quport.distributed import reassemble_distributed_program
 
     cfg = MultiQPUConfig(
         n_qpus=2,
@@ -254,10 +265,18 @@ def test_split_into_qpus_zero_qubit_clbit_instruction_is_broadcast() -> None:
     program = split_into_qpus(mapped, arch)
 
     assert program.remote_ops == []
-    for qpu in range(cfg.n_qpus):
-        local = program.local_circuits[qpu]
-        inst = next(i for i in local.data if i.operation.name == "classical_sync")
-        assert [local.find_bit(c).index for c in inst.clbits] == [1]
+    local = program.local_circuits[0]
+    inst = next(i for i in local.data if i.operation.name == "classical_sync")
+    assert [local.find_bit(c).index for c in inst.clbits] == [1]
+    assert not program.local_circuits[1].data
+    merged = reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+    assert [
+        [merged.find_bit(c).index for c in i.clbits]
+        for i in merged.data
+        if i.operation.name == "classical_sync"
+    ] == [[1]]
 
 
 def test_split_into_qpus_remote_op_preserves_clbit_indices() -> None:
@@ -2251,3 +2270,244 @@ def test_reassembly_validates_its_manifest_entries() -> None:
         reassemble_distributed_program(
             mapped, {**program.local_circuits, "x": QuantumCircuit(1)}, ops, arch  # type: ignore[dict-item]
         )
+
+
+def _cx_named(name: str) -> Any:
+    body = QuantumCircuit(2)
+    body.cx(0, 1)
+    gate = body.to_gate()
+    gate.name = name
+    return gate
+
+
+def test_a_gate_named_barrier_is_split_as_a_gate() -> None:
+    """Split replaced it with a real barrier: the gate vanished from every
+    program and its remote operation from the manifest."""
+    from quport.compiler import compile_distributed
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    arch = MultiQPUArchitecture(cfg)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.append(_cx_named("barrier"), [0, 2])
+
+    program = split_into_qpus(mapped, arch)
+
+    assert [op.name for op in program.remote_ops] == ["barrier"]
+    qc = QuantumCircuit(4)
+    qc.h(0)
+    qc.h(2)
+    for _ in range(3):
+        qc.cx(0, 1)
+        qc.cx(2, 3)
+    qc.append(_cx_named("barrier"), [1, 2])
+    res = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+    assert verify_distributed_program(
+        res.physical_circuit, res.local_routed, res.routed_remote_ops, arch
+    )
+
+
+def test_a_gate_named_store_compiles_as_a_gate() -> None:
+    """It was refused as a classical store, so a valid OpenQASM 2 program
+    defining ``gate store`` failed in compile-dist, ebits, optimal and migrate."""
+    from qiskit import qasm2
+
+    from quport.compiler import compile_distributed
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    qc = qasm2.loads(
+        'OPENQASM 2.0;\ninclude "qelib1.inc";\ngate store a { x a; }\nqreg q[2];\n'
+        "creg c[2];\nh q[0];\ncx q[0], q[1];\nstore q[1];\nmeasure q -> c;\n"
+    )
+
+    res = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+
+    assert verify_distributed_program(
+        res.physical_circuit,
+        res.local_routed,
+        res.routed_remote_ops,
+        MultiQPUArchitecture(cfg),
+    )
+
+
+def test_a_store_inside_a_control_flow_body_is_refused() -> None:
+    """Only top-level stores were refused: a nested toggle was copied into every
+    program, so it ran once per QPU, and reassembly then dropped it."""
+    from qiskit.circuit.classical import expr
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    qc = QuantumCircuit(arch.n_phys, 2)
+    qc.h(0)
+    qc.measure(0, 0)
+    with qc.if_test((qc.clbits[0], 1)):
+        with qc.if_test((qc.clbits[0], 1)):
+            qc.store(qc.clbits[1], expr.logic_not(qc.clbits[1]))
+    with qc.if_test((qc.clbits[1], 1)):
+        qc.x(3)
+
+    with pytest.raises(ValueError, match="classical store"):
+        split_into_qpus(qc, arch)
+    with pytest.raises(ValueError, match="classical store"):
+        reassemble_distributed_program(qc, {}, [], arch)
+
+
+def _cross_qpu_compile(qc: QuantumCircuit, **settings: Any) -> Any:
+    from quport.compiler import compile_distributed
+
+    cfg = MultiQPUConfig(**settings)
+    return compile_distributed(qc, cfg, seed=0, strategy="balanced"), (
+        MultiQPUArchitecture(cfg)
+    )
+
+
+def test_routing_keeps_a_local_access_after_the_remote_read_it_follows() -> None:
+    """Routing moved the measurement that overwrites c[0] ahead of the marker
+    of the remote ``if`` that reads it, and chained them with its swaps: the
+    routed programs demanded the bit be overwritten before it was read."""
+    from quport.distributed import reassemble_distributed_program
+
+    qc = QuantumCircuit(6, 1)
+    qc.cx(0, 1)
+    with qc.if_test((qc.clbits[0], 1)):  # spans both QPUs and reads c[0]
+        qc.cx(1, 4)
+        qc.x(2)
+    qc.measure(5, 0)  # local, and overwrites c[0] after the read
+    qc.cx(5, 1)
+    res, arch = _cross_qpu_compile(
+        qc,
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=3,
+    )
+
+    reassemble_distributed_program(
+        res.physical_circuit, res.local_routed, res.routed_remote_ops, arch
+    )
+    for routed in res.local_routed.values():
+        assert not any(
+            instruction.operation.label == "quport_order"
+            for instruction in routed.data
+            if instruction.operation.name == "barrier"
+        )
+
+
+def test_routing_holds_cross_qpu_events_in_order_and_then_lets_go() -> None:
+    from qiskit.circuit import Barrier
+
+    from quport.distributed import _hold_cross_qpu_order, _release_cross_qpu_order
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=3, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys, 3)
+    mapped.measure(0, 0)  # read on QPU 1 below: shared
+    mapped.measure(1, 1)  # read on QPU 1 below: shared
+    mapped.measure(2, 2)  # nobody else reads it: private
+    with mapped.if_test((mapped.clbits[0], 1)):
+        mapped.x(4)
+    with mapped.if_test((mapped.clbits[1], 1)):
+        mapped.x(5)
+    program = split_into_qpus(mapped, arch)
+
+    held = _hold_cross_qpu_order(program, mapped, arch)
+
+    def shape(circuit: QuantumCircuit) -> list[tuple[str, list[int]]]:
+        return [
+            (i.operation.name, [circuit.find_bit(q).index for q in i.qubits])
+            for i in circuit.data
+        ]
+
+    assert shape(held[0]) == [
+        ("measure", [0]),
+        ("barrier", [0, 1]),
+        ("measure", [1]),
+        ("measure", [2]),
+    ]
+    assert shape(held[1]) == [("if_else", [4]), ("barrier", [4, 5]), ("if_else", [5])]
+    order = [i.operation for i in held[0].data if isinstance(i.operation, Barrier)]
+    assert [barrier.label for barrier in order] == ["quport_order"]
+    assert shape(_release_cross_qpu_order(held[0])) == shape(program.local_circuits[0])
+
+
+def test_reassembly_keeps_a_block_routing_emptied_of_qubits() -> None:
+    """Routing contracts a block whose body cancels to no qubits; reassembly
+    skipped every instruction without qubits, so it dropped the block, or
+    stalled when another QPU read the same bit afterwards."""
+    from quport.distributed import reassemble_distributed_program
+
+    settings = {"n_qpus": 2, "compute_qubits_per_qpu": 2, "comm_qubits_per_qpu": 1}
+    single = QuantumCircuit(4, 2)
+    single.h(0)
+    single.measure(0, 0)
+    with single.if_test((single.clbits[0], 1)):
+        single.x(0)
+        single.x(0)
+    single.cx(0, 3)
+    single.cx(1, 2)
+
+    shared = QuantumCircuit(4, 2)
+    shared.h(0)
+    shared.measure(0, 0)
+    with shared.if_test((shared.clbits[0], 1)):
+        shared.x(1)
+        shared.x(1)
+    shared.cx(1, 2)
+    shared.cx(2, 3)
+    shared.cx(0, 3)
+    shared.measure(1, 1)
+    with shared.if_test((shared.clbits[0], 1)):
+        shared.x(3)
+
+    for qc in (single, shared):
+        res, arch = _cross_qpu_compile(qc, optimization_level=3, **settings)
+        emptied = [
+            instruction
+            for routed in res.local_routed.values()
+            for instruction in routed.data
+            if instruction.operation.name == "if_else" and not instruction.qubits
+        ]
+        assert emptied, "the fixture must have routing contract a block"
+
+        merged = reassemble_distributed_program(
+            res.physical_circuit, res.local_routed, res.routed_remote_ops, arch
+        )
+
+        assert merged.count_ops()["if_else"] == qc.count_ops()["if_else"]
+
+
+def test_reassembly_refuses_a_store_that_routing_unrolled_into_a_program() -> None:
+    """A custom instruction can carry a store in its definition; once routing
+    unrolled it, reassembly skipped the store and the toggle was lost."""
+    from qiskit import transpile
+    from qiskit.circuit.classical import expr
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    body = QuantumCircuit(1, 1)
+    body.measure(0, 0)
+    body.store(body.clbits[0], expr.logic_not(body.clbits[0]))
+    readflip = body.to_instruction()
+    readflip.name = "readflip"
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.h(0)
+    mapped.append(readflip, [0], [0])
+    mapped.cx(0, 3)
+    program = split_into_qpus(mapped, arch)
+    routed = {
+        qpu: transpile(local, basis_gates=["rz", "sx", "x", "cx"], optimization_level=1)
+        for qpu, local in program.local_circuits.items()
+    }
+
+    with pytest.raises(ValueError, match="classical store"):
+        reassemble_distributed_program(mapped, routed, program.remote_ops, arch)

@@ -1654,7 +1654,13 @@ Classical bits are shared rather than split: every program refers to the source
 circuit's classical bits, so a conditional on one QPU can read a bit measured on
 another. Each program keeps its own accesses to a bit in order, but nothing in
 the bundle records the order *between* QPUs; that comes from the mapped circuit,
-which is where `reassemble_distributed_program` takes it from.
+which is where `reassemble_distributed_program` takes it from. `compile-dist`
+routes each program with the points where it meets the others -- its remote
+markers and its accesses to bits another program or a remote operation also
+uses -- held in the mapped circuit's order, so routing cannot tie two of them
+together the other way round and leave programs no execution satisfies. An
+instruction that acts on no qubit, such as a condition whose body is empty,
+goes into QPU 0's program alone, so it still runs once.
 
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.

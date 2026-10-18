@@ -171,7 +171,11 @@ Classical bits are not split: every program refers to the source circuit's
 bits, so a conditional on one QPU can read a bit measured on another. Each
 program keeps its own accesses to a bit in order, but the order across QPUs is
 recorded only in the mapped circuit, which is where
-`reassemble_distributed_program` takes it from.
+`reassemble_distributed_program` takes it from. `compile_distributed` routes
+each program with its remote markers and its accesses to bits other programs
+use held in that order, so the routed programs never contradict it. An
+instruction that acts on no qubit goes into QPU 0's program alone, so it runs
+once.
 
 ## Scheduling
 
