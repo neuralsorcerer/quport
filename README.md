@@ -1101,6 +1101,11 @@ For a transpiled or physical circuit, QuPort computes:
 | `n_2q` | Number of two-qubit instructions. |
 | `remote_2q` | Number of two-qubit instructions whose physical endpoints belong to different QPUs. |
 
+The counts include instructions inside control-flow bodies -- once each, in
+every branch, on the qubits the block applies them to -- rather than the block
+itself, so wrapping gates in a `box` or a condition does not hide them. `depth`
+and `size` are Qiskit's, which count a block as one operation.
+
 A two-qubit physical operation on physical qubits $p_{0},p_{1}$ is remote when:
 
 `qpu_of_phys`$(p_{0}) \ne$ `qpu_of_phys`$(p_{1})$.

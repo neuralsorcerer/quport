@@ -686,7 +686,10 @@ CircuitMetrics(swaps, depth, size, n_1q, n_2q, remote_2q)
 
 Returned by `compute_metrics(qc, arch)` and embedded in mapping/distributed results.
 `remote_2q` is derived by comparing the QPU ownership of each two-qubit operation's
-physical operands.
+physical operands. Instructions inside control-flow bodies are counted on the
+qubits the block applies them to, once each and in every branch, instead of the
+block itself; `depth` and `size` are Qiskit's. `count_ops` likewise tallies
+the instructions inside control-flow bodies as well as the blocks.
 
 `swaps` counts instructions literally named `swap`, which makes it basis-dependent.
 The default `basis_gates` of `("rz", "sx", "x", "cx")` has no `swap`, so Qiskit

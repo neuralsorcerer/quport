@@ -170,3 +170,40 @@ def test_a_swap_instruction_counts_toward_both_swaps_and_two_qubit_gates() -> No
     assert metrics.swaps == 1
     assert metrics.n_2q == 1
     assert metrics.n_1q == 0
+
+
+def test_metrics_count_the_gates_inside_control_flow() -> None:
+    """Wrapping gates in a ``box`` took remote_2q from 3 to 0, and SWAPs that
+    routing placed inside a branch were not counted."""
+    from qiskit import QuantumCircuit
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import MultiQPUConfig
+    from quport.metrics import compute_metrics, count_ops
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    plain = QuantumCircuit(arch.n_phys, 1)
+    boxed = QuantumCircuit(arch.n_phys, 1)
+    for _ in range(3):
+        plain.cx(2, 5)
+        plain.swap(1, 2)
+    with boxed.box():
+        for _ in range(3):
+            boxed.cx(2, 5)
+    boxed.measure(0, 0)
+    with boxed.if_test((boxed.clbits[0], 1)) as orelse:
+        boxed.swap(1, 2)
+        boxed.swap(1, 2)
+    with orelse:
+        boxed.swap(1, 2)
+
+    expected = compute_metrics(plain, arch)
+    got = compute_metrics(boxed, arch)
+
+    assert (got.remote_2q, got.n_2q, got.swaps) == (3, 6, 3)
+    assert (expected.remote_2q, expected.n_2q, expected.swaps) == (3, 6, 3)
+    assert got.n_1q == 1
+    assert count_ops(boxed)["swap"] == 3
+    assert count_ops(boxed)["if_else"] == 1
