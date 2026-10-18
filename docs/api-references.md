@@ -282,7 +282,7 @@ registers only.
 
 ```python
 RemoteOp(name, q0_phys, q1_phys, qpu0, qpu1, params, clbits, index,
-         qpu0_marker=None, qpu1_marker=None)
+         qpu0_marker=None, qpu1_marker=None, operands=(), markers=())
 ```
 
 Represents one remote operation placeholder. `to_dict()` validates fields and
@@ -298,7 +298,17 @@ Field meanings:
 - `clbits`: classical bit indices associated with the source instruction;
 - `index`: source instruction index in the physical circuit;
 - `qpu0_marker`, `qpu1_marker`: position of the operation's synchronization
-  barrier among all barriers of each QPU's program (see `split_into_qpus` above).
+  barrier among all barriers of each QPU's program (see `split_into_qpus` above);
+- `operands`: every operand as a `(qpu, phys)` pair, in operand order;
+- `markers`: the marker position on every QPU the operation involves, as
+  `(qpu, marker)` pairs in the order those QPUs first appear among the operands.
+  An operation on three or more qubits can involve more QPUs than `qpu0` and
+  `qpu1`; it is ready only once its marker leads on each of them.
+
+`to_dict()` writes `operands` and `markers` as lists of `{"qpu", "phys"}` and
+`{"qpu", "marker"}` objects. Both are empty for an operation built without them,
+and when present must agree with the endpoint fields. `split_into_qpus` fills
+them, and `remap_remote_ops_to_routed` re-expresses them for routed programs.
 
 ### Writers
 
@@ -578,7 +588,7 @@ A distributed program is a **partial** order. Within a QPU the constraint is per
 qubit, so instructions on disjoint qubits may run in either order, and two QPUs
 can list the same remote operations in opposite orders. Merging follows qubit
 dataflow: an instruction runs once it leads on every qubit it touches, and a
-remote operation once its marker leads on both sides. Classical bits are shared
+remote operation once its marker leads on every QPU in `markers`. Classical bits are shared
 across the programs, and the order of their accesses across QPUs is taken from
 `mapped`: an instruction that touches a classical bit also waits for every
 earlier access to that bit, on any QPU. Reading each program strictly linearly

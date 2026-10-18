@@ -162,8 +162,11 @@ constraint is per qubit, so instructions touching disjoint qubits may run in
 either order, and two QPUs can list the same remote operations in opposite
 orders when those operations sit on disjoint qubits. Advance each program by
 qubit dataflow rather than reading it top to bottom, and pair manifest entries
-with barriers using the `qpu0_marker` / `qpu1_marker` fields rather than by
-position. `reassemble_distributed_program` implements that rule, and
+with barriers using the `markers` field (for a two-qubit operation, the same as
+`qpu0_marker` / `qpu1_marker`) rather than by position: a remote operation is
+ready once its marker leads on every QPU listed there, and `operands` names all
+of its operands, which for an operation on three or more qubits the two
+endpoints do not. `reassemble_distributed_program` implements that rule, and
 `verify_distributed_program` uses it to check that the artifacts still compute
 the circuit they came from.
 

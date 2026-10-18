@@ -2511,3 +2511,110 @@ def test_reassembly_refuses_a_store_that_routing_unrolled_into_a_program() -> No
 
     with pytest.raises(ValueError, match="classical store"):
         reassemble_distributed_program(mapped, routed, program.remote_ops, arch)
+
+
+def test_a_remote_operation_names_every_operand_and_marker() -> None:
+    """The manifest named only two QPUs, so the marker and operand on a third
+    could not be found from the files, and nothing held the operation there."""
+    import json
+    import re
+
+    from qiskit import qasm3
+
+    from quport.compiler import compile_distributed
+    from quport.distributed import remap_remote_ops_to_routed
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(4)
+    mapped.ccx(0, 2, 4)  # QPUs 0, 1 and 2
+    entry = split_into_qpus(mapped, arch).remote_ops[0].to_dict()
+
+    assert entry["operands"] == [
+        {"qpu": 0, "phys": 0},
+        {"qpu": 1, "phys": 2},
+        {"qpu": 2, "phys": 4},
+    ]
+    assert entry["markers"] == [
+        {"qpu": 0, "marker": 0},
+        {"qpu": 1, "marker": 0},
+        {"qpu": 2, "marker": 0},
+    ]
+
+    cfg = MultiQPUConfig(
+        n_qpus=3,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=1,
+    )
+    qc = QuantumCircuit(6, 1)
+    for a, b in ((0, 1), (2, 3), (4, 5)):
+        for _ in range(4):
+            qc.cx(a, b)
+    qc.h(0)
+    qc.measure(0, 0)
+    qc.barrier(5)
+    with qc.if_test((qc.clbits[0], 1)):
+        qc.x(1)
+        qc.x(3)
+        qc.x(5)
+    res = compile_distributed(qc, cfg, seed=1, strategy="balanced")
+    wide = [op for op in res.routed_remote_ops if len(op.markers) == 3]
+    assert wide, "the fixture must have a block across three QPUs"
+    statements = {
+        qpu: [
+            [int(n) for n in re.findall(r"\$(\d+)", arguments)]
+            for arguments in re.findall(r"barrier ([^;]*);", qasm3.dumps(circuit))
+        ]
+        for qpu, circuit in res.local_routed.items()
+    }
+    for op in wide:
+        entry = json.loads(json.dumps(op.to_dict()))
+        for marker in entry["markers"]:
+            mine = [o["phys"] for o in entry["operands"] if o["qpu"] == marker["qpu"]]
+            barrier = statements[marker["qpu"]][marker["marker"]]
+            assert barrier[: len(mine)] == mine
+    assert remap_remote_ops_to_routed(res.routed_remote_ops, res.local_routed) == (
+        res.routed_remote_ops
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"operands": ((0, 1), (1, 3))}, "start with"),
+        ({"operands": ((0, 0), (0, 0), (1, 3))}, "distinct"),
+        ({"operands": ((0, 0), (1, 3, 4))}, "pair"),
+        ({"markers": ((0, 0), (0, 1))}, "each QPU once"),
+        ({"markers": ((1, 0), (0, 0))}, "order"),
+        ({"markers": ((0, 2), (1, 0))}, "qpu0_marker"),
+    ],
+)
+def test_remote_op_refuses_operands_or_markers_that_disagree(
+    change: dict[str, Any], message: str
+) -> None:
+    import dataclasses
+
+    from quport.distributed import RemoteOp
+
+    op = RemoteOp(
+        name="cx",
+        q0_phys=0,
+        q1_phys=3,
+        qpu0=0,
+        qpu1=1,
+        params=(),
+        clbits=(),
+        index=0,
+        qpu0_marker=0,
+        qpu1_marker=0,
+        operands=((0, 0), (1, 3)),
+        markers=((0, 0), (1, 0)),
+    )
+    op.to_dict()
+
+    with pytest.raises(ValueError, match=message):
+        dataclasses.replace(op, **change).to_dict()

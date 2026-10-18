@@ -12,7 +12,7 @@ import math
 import os
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from numbers import Integral
 from pathlib import Path
@@ -164,7 +164,7 @@ def _json_safe_value(value: object, seen: set[int] | None = None) -> Any:
 
 @dataclass(frozen=True)
 class RemoteOp:
-    """A remote (inter-QPU) 2-qubit operation placeholder."""
+    """A remote (inter-QPU) operation placeholder: two-qubit, or wider."""
 
     name: str
     q0_phys: int
@@ -184,6 +184,17 @@ class RemoteOp:
     # the pairing explicit.
     qpu0_marker: int | None = None
     qpu1_marker: int | None = None
+
+    # Every operand, in operand order, as (QPU, physical qubit). The endpoints
+    # above name only the first operand and the first one on another QPU; an
+    # operation on three or more qubits has more, and applying it takes them
+    # all. Empty when not recorded.
+    operands: tuple[tuple[int, int], ...] = ()
+    # Every QPU the operation involves, as (QPU, marker position), in the order
+    # the QPUs first appear among the operands. An operation on three or more
+    # qubits can involve more QPUs than its two endpoints, and it runs only
+    # once its marker leads on each of them. Empty when not recorded.
+    markers: tuple[tuple[int, int], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         """Return a stable, JSON-safe representation of this remote operation."""
@@ -209,6 +220,44 @@ class RemoteOp:
                 self.clbits, label="remote operation clbits"
             )
         ]
+        qpu0_marker = _validate_optional_manifest_int(
+            self.qpu0_marker, label="remote operation qpu0_marker"
+        )
+        qpu1_marker = _validate_optional_manifest_int(
+            self.qpu1_marker, label="remote operation qpu1_marker"
+        )
+        operands = _validate_manifest_pairs(self.operands, label="operands")
+        if operands:
+            if len({phys for _, phys in operands}) != len(operands):
+                raise ValueError("remote operation operands must be distinct qubits")
+            second = next(((q, p) for q, p in operands if q != qpu0), None)
+            if operands[0] != (qpu0, q0_phys) or second != (qpu1, q1_phys):
+                raise ValueError(
+                    "remote operation operands must start with (qpu0, q0_phys) "
+                    "and hold (qpu1, q1_phys) as their first operand on another QPU"
+                )
+        markers = _validate_manifest_pairs(self.markers, label="markers")
+        if markers:
+            marker_of = dict(markers)
+            if len(marker_of) != len(markers):
+                raise ValueError("remote operation markers must name each QPU once")
+            if operands and list(marker_of) != list(
+                dict.fromkeys(qpu for qpu, _ in operands)
+            ):
+                raise ValueError(
+                    "remote operation markers must name the operands' QPUs, in "
+                    "the order they first appear"
+                )
+            for qpu, marker, field in (
+                (qpu0, qpu0_marker, "qpu0_marker"),
+                (qpu1, qpu1_marker, "qpu1_marker"),
+            ):
+                if qpu not in marker_of or (
+                    marker is not None and marker_of[qpu] != marker
+                ):
+                    raise ValueError(
+                        f"remote operation markers must agree with {field}"
+                    )
         return {
             "name": self.name,
             "q0_phys": q0_phys,
@@ -218,13 +267,31 @@ class RemoteOp:
             "params": params,
             "clbits": clbits,
             "index": _validate_manifest_int(self.index, label="remote operation index"),
-            "qpu0_marker": _validate_optional_manifest_int(
-                self.qpu0_marker, label="remote operation qpu0_marker"
-            ),
-            "qpu1_marker": _validate_optional_manifest_int(
-                self.qpu1_marker, label="remote operation qpu1_marker"
-            ),
+            "qpu0_marker": qpu0_marker,
+            "qpu1_marker": qpu1_marker,
+            "operands": [{"qpu": qpu, "phys": phys} for qpu, phys in operands],
+            "markers": [{"qpu": qpu, "marker": marker} for qpu, marker in markers],
         }
+
+
+def _validate_manifest_pairs(value: object, *, label: str) -> list[tuple[int, int]]:
+    """Return a manifest field holding pairs of non-negative integers."""
+    pairs: list[tuple[int, int]] = []
+    for pair in _validate_manifest_sequence(value, label=f"remote operation {label}"):
+        items = _validate_manifest_sequence(
+            pair, label=f"each remote operation {label} entry"
+        )
+        if len(items) != 2:
+            raise ValueError(f"each remote operation {label} entry must be a pair")
+        pairs.append(
+            (
+                _validate_manifest_int(items[0], label=f"remote operation {label} QPU"),
+                _validate_manifest_int(
+                    items[1], label=f"remote operation {label} index"
+                ),
+            )
+        )
+    return pairs
 
 
 @dataclass
@@ -474,23 +541,36 @@ def remap_remote_ops_to_routed(
     for ordinal, op in enumerate(remote_ops):
         if not isinstance(op, RemoteOp):
             raise ValueError(f"remote_ops[{ordinal}] must be a RemoteOp")
-        # The marker's leading qubit is the operation's operand on that QPU:
-        # split_into_qpus emits the barrier over that QPU's operands in operand
-        # order, and both q0_phys and q1_phys are the first such operand.
-        qubit0, marker0 = _routed_marker(markers, ordinal, op.qpu0)
-        qubit1, marker1 = _routed_marker(markers, ordinal, op.qpu1)
+        # split_into_qpus emits each marker over that QPU's operands in operand
+        # order, so its leading qubits are where routing left them: q0_phys and
+        # q1_phys are the first on their QPUs, and the operands are read off in
+        # turn, QPU by QPU.
+        involved = [qpu for qpu, _ in op.markers] or [op.qpu0, op.qpu1]
+        found = {
+            qpu: _routed_marker(markers, ordinal, qpu)
+            for qpu in dict.fromkeys([op.qpu0, op.qpu1, *involved])
+        }
+        cursors: dict[int, int] = {}
+        operands: list[tuple[int, int]] = []
+        for qpu, _ in op.operands:
+            marked = found.setdefault(qpu, _routed_marker(markers, ordinal, qpu))[0]
+            cursor = cursors.get(qpu, 0)
+            if cursor >= len(marked):
+                raise ValueError(
+                    f"the marker for remote operation {ordinal} on QPU {qpu} names "
+                    f"{len(marked)} qubits, fewer than the operation uses there"
+                )
+            cursors[qpu] = cursor + 1
+            operands.append((qpu, marked[cursor]))
         out.append(
-            RemoteOp(
-                name=op.name,
-                q0_phys=qubit0,
-                q1_phys=qubit1,
-                qpu0=op.qpu0,
-                qpu1=op.qpu1,
-                params=op.params,
-                clbits=op.clbits,
-                index=op.index,
-                qpu0_marker=marker0,
-                qpu1_marker=marker1,
+            replace(
+                op,
+                q0_phys=found[op.qpu0][0][0],
+                q1_phys=found[op.qpu1][0][0],
+                qpu0_marker=found[op.qpu0][1],
+                qpu1_marker=found[op.qpu1][1],
+                operands=tuple(operands),
+                markers=tuple((qpu, found[qpu][1]) for qpu, _ in op.markers),
             )
         )
     return out
@@ -498,16 +578,15 @@ def remap_remote_ops_to_routed(
 
 def _routed_marker(
     markers: Mapping[tuple[int, int], tuple[list[int], int]], ordinal: int, qpu: int
-) -> tuple[int, int]:
-    """Return the routed qubit and barrier position for one side of an operation."""
+) -> tuple[list[int], int]:
+    """Return the routed qubits and barrier position of one QPU's marker."""
     entry = markers.get((ordinal, qpu))
     if entry is None or not entry[0]:
         raise ValueError(
             f"routed program for QPU {qpu} has no marker for remote operation "
             f"{ordinal}; the manifest and the routed circuits are out of step"
         )
-    qubits, position = entry
-    return qubits[0], position
+    return entry
 
 
 def reassemble_distributed_program(
@@ -937,6 +1016,13 @@ def _remote_operands(
                 f"{len(marked)} qubits, more than the operation uses there"
             )
 
+    if op.operands and list(op.operands) != list(zip(source_qpus, operands)):
+        raise ValueError(
+            f"remote operation {ordinal} names operands {list(op.operands)}, but "
+            f"the programs put them on {list(zip(source_qpus, operands))}; the "
+            "manifest does not match these programs"
+        )
+
     leading: dict[int, int] = {}
     for position, qpu in enumerate(source_qpus):
         leading.setdefault(qpu, operands[position])
@@ -1229,6 +1315,11 @@ def split_into_qpus(
                         index=idx,
                         qpu0_marker=barriers_emitted[qpu0],
                         qpu1_marker=barriers_emitted[qpu1],
+                        operands=((qpu0, q0), (qpu1, q1)),
+                        markers=(
+                            (qpu0, barriers_emitted[qpu0]),
+                            (qpu1, barriers_emitted[qpu1]),
+                        ),
                     )
                 )
                 # Barriers mark the synchronization points.  They carry a
@@ -1279,6 +1370,10 @@ def split_into_qpus(
                         index=idx,
                         qpu0_marker=barriers_emitted[qpu0],
                         qpu1_marker=barriers_emitted[qpu1],
+                        operands=tuple(zip(op_qpus, qs)),
+                        markers=tuple(
+                            (qpu, barriers_emitted[qpu]) for qpu in qpu_order
+                        ),
                     )
                 )
                 label = remote_barrier_label(len(remote_ops) - 1)

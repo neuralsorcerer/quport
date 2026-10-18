@@ -966,6 +966,7 @@ A remote operation records:
 - two physical qubit indices it acts on: its first operand and the first operand on another QPU;
 - the QPU id owning each of those qubits;
 - which barrier in each of those two QPUs' programs marks it (`qpu0_marker`, `qpu1_marker`);
+- every operand with its QPU (`operands`), and the marker on every QPU the operation involves (`markers`);
 - gate parameters;
 - classical bit indices the operation reads or writes.
 
@@ -1633,12 +1634,20 @@ Remote operation entries have the shape:
   "params": [],
   "clbits": [],
   "qpu0_marker": 3,
-  "qpu1_marker": 5
+  "qpu1_marker": 5,
+  "operands": [{"qpu": 0, "phys": 7}, {"qpu": 9, "phys": 84}],
+  "markers": [{"qpu": 0, "marker": 3}, {"qpu": 9, "marker": 5}]
 }
 ```
 
 `qpu0_marker` and `qpu1_marker` say which barrier in each QPU's emitted program
-marks this operation, counting all barriers from zero. They exist because
+marks this operation, counting all barriers from zero. `operands` lists every
+operand in operand order with its QPU, and `markers` the marker on every QPU the
+operation involves, in the order those QPUs first appear among the operands.
+For a two-qubit operation they repeat the endpoints; an operation on three or
+more qubits can involve more QPUs than its two endpoints, and only these fields
+name its other operands and the markers it waits on. Each marker barrier lists
+that QPU's operands first, in operand order. They exist because
 pairing by position is not safe: barriers on disjoint qubits commute, so
 rebuilding a circuit from its DAG during routing can list them in an order that
 differs from the manifest's, and an emitted QASM file carries no labels to
@@ -1649,7 +1658,7 @@ one**. Two QPUs can list the same pair of remote operations in opposite orders
 when those operations sit on disjoint qubits, and both listings are correct. A
 consumer must therefore advance each program by qubit dataflow -- an instruction
 is ready once it is first in line on every qubit it touches, and a remote
-operation once its marker leads on both sides -- rather than reading the files
+operation once its marker leads on every QPU in `markers` -- rather than reading the files
 strictly top to bottom, which can deadlock.
 `quport.distributed.reassemble_distributed_program` is the reference
 implementation of that rule, and it raises when two programs genuinely
