@@ -1316,3 +1316,53 @@ def test_global_routing_keeps_two_final_measurements_into_one_bit_in_order() -> 
             .get_counts()
         )
         assert counts == {"0": 64}
+
+
+@pytest.mark.parametrize("wrap", ["control", "power", "inverse"])
+def test_basis_translation_keeps_a_namesake_inside_an_annotated_operation(
+    wrap: str,
+) -> None:
+    """Synthesis builds an annotated operation's base by its name, so a custom
+    ``swap`` (one CX) controlled with ``annotated=True`` became a Fredkin."""
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Operator
+
+    from quport.compiler import compile_distributed
+
+    body = QuantumCircuit(2)
+    body.cx(0, 1)
+    fake_swap = body.to_gate()
+    fake_swap.name = "swap"
+    definition_name = fake_swap.definition.name
+    operation = {
+        "control": lambda: fake_swap.control(1, annotated=True),
+        "power": lambda: fake_swap.power(3, annotated=True),
+        "inverse": lambda: fake_swap.inverse(annotated=True),
+    }[wrap]()
+    width = operation.num_qubits
+    qc = QuantumCircuit(width)
+    qc.h(range(width))
+    qc.append(operation, range(width))
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=width, comm_qubits_per_qpu=0)
+
+    mapped = map_and_transpile(qc, cfg, seed=0).mapped_circuit
+    basis = compile_distributed(qc, cfg, seed=0, strategy="balanced").basis_circuit
+
+    assert Operator.from_circuit(mapped).equiv(Operator(qc))
+    assert Operator(basis).equiv(Operator(qc))
+    assert fake_swap.definition.name == definition_name
+
+
+@pytest.mark.parametrize("path", ["results.csv/", "sub/results.csv/.", "x.csv/.."])
+def test_an_out_csv_shaped_like_a_directory_is_refused(path: str) -> None:
+    from quport.pipeline import _validate_out_csv
+
+    with pytest.raises(ValueError, match="names a directory"):
+        _validate_out_csv(path)
+
+
+def test_an_out_csv_the_filesystem_rejects_is_a_value_error() -> None:
+    from quport.pipeline import _validate_out_csv
+
+    with pytest.raises(ValueError, match="cannot be used"):
+        _validate_out_csv("a" * 300 + ".csv")

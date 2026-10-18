@@ -207,3 +207,29 @@ def test_metrics_count_the_gates_inside_control_flow() -> None:
     assert got.n_1q == 1
     assert count_ops(boxed)["swap"] == 3
     assert count_ops(boxed)["if_else"] == 1
+
+
+def test_a_loop_break_is_not_counted_as_a_gate() -> None:
+    """``break_loop`` spans the loop's qubits; it was counted as a remote 2q gate."""
+    from qiskit import QuantumCircuit
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import MultiQPUConfig
+    from quport.metrics import compute_metrics
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    counts = []
+    for jump in (None, "break", "continue"):
+        qc = QuantumCircuit(arch.n_phys, 1)
+        with qc.for_loop(range(3)):
+            qc.x(0)
+            qc.x(3)
+            qc.measure(0, 0)
+            if jump is not None:
+                with qc.if_test((qc.clbits[0], 1)):
+                    qc.break_loop() if jump == "break" else qc.continue_loop()
+        metrics = compute_metrics(qc, arch)
+        counts.append((metrics.n_1q, metrics.n_2q, metrics.remote_2q))
+    assert counts == [(3, 0, 0)] * 3

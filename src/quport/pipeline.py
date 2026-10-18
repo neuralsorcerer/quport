@@ -15,7 +15,13 @@ from pathlib import Path
 from typing import Any, TextIO, TypeAlias, TypeVar, cast
 
 from qiskit import QuantumCircuit, transpile
-from qiskit.circuit import ControlFlowOp
+from qiskit.circuit import (
+    AnnotatedOperation,
+    BreakLoopOp,
+    ContinueLoopOp,
+    ControlFlowOp,
+    Gate,
+)
 from qiskit.circuit.controlflow import CONTROL_FLOW_OP_NAMES
 from qiskit.circuit.library.standard_gates import get_standard_gate_name_mapping
 from qiskit.circuit.random import random_circuit
@@ -78,19 +84,26 @@ def _validate_out_csv(out_csv: object, *, label: str = "out_csv") -> str:
         raise ValueError(f"{label} must be a non-empty path")
     if "\x00" in path:
         raise ValueError(f"{label} must not contain a NUL character")
-    target = Path(path)
-    if target.is_dir():
+    # Path() drops a trailing separator and a final ".", so look at the text:
+    # either names a directory however the rest of the path turns out.
+    if os.path.basename(path) in ("", ".", ".."):
         raise ValueError(f"{label} {path!r} names a directory, not a file")
-    # The directory is created when the file is written, which works only if
-    # the nearest part of the path that already exists is a directory.
-    for ancestor in target.parents:
-        if ancestor.exists():
-            if not ancestor.is_dir():
-                raise ValueError(
-                    f"{label} {path!r} cannot be created: {str(ancestor)!r} "
-                    "is not a directory"
-                )
-            break
+    target = Path(path)
+    try:
+        if target.is_dir():
+            raise ValueError(f"{label} {path!r} names a directory, not a file")
+        # The directory is created when the file is written, which works only
+        # if the nearest part of the path that already exists is a directory.
+        for ancestor in target.parents:
+            if ancestor.exists():
+                if not ancestor.is_dir():
+                    raise ValueError(
+                        f"{label} {path!r} cannot be created: {str(ancestor)!r} "
+                        "is not a directory"
+                    )
+                break
+    except OSError as exc:  # a name too long for the filesystem, for one
+        raise ValueError(f"{label} {path!r} cannot be used: {exc}") from None
     return path
 
 
@@ -266,6 +279,9 @@ def _holds_namesake(operation: Any) -> bool:
         return True
     if isinstance(operation, ControlFlowOp):
         return any(_has_standard_namesake(block) for block in operation.blocks)
+    if isinstance(operation, AnnotatedOperation):
+        # Synthesis builds the controlled or powered base from its name too.
+        return _holds_namesake(operation.base_op)
     definition = _user_definition(operation)
     return definition is not None and _has_standard_namesake(definition)
 
@@ -295,14 +311,11 @@ def _append_expanded(
         operation = operation.replace_blocks(
             [_expand_standard_namesakes(block) for block in operation.blocks]
         )
+    elif isinstance(operation, AnnotatedOperation):
+        if _holds_namesake(operation):
+            operation = _without_namesakes(operation)
     elif _holds_namesake(operation):
-        definition = operation.definition
-        if definition is None:
-            raise ValueError(
-                f"gate {operation.name!r} shares a Qiskit standard gate's name "
-                "without being that gate, and has no definition to translate "
-                "it by; rename it"
-            )
+        definition = _definition_to_expand(operation)
         qubit_of = dict(zip(definition.qubits, qubits))
         clbit_of = dict(zip(definition.clbits, clbits))
         out.global_phase += definition.global_phase
@@ -315,6 +328,39 @@ def _append_expanded(
             )
         return
     out.append(operation, qubits, clbits)
+
+
+def _definition_to_expand(operation: Any) -> QuantumCircuit:
+    """The definition a namesake, or a gate holding one, is replaced by."""
+    definition = operation.definition
+    if definition is None:
+        raise ValueError(
+            f"gate {operation.name!r} shares a Qiskit standard gate's name "
+            "without being that gate, and has no definition to translate "
+            "it by; rename it"
+        )
+    return definition
+
+
+def _without_namesakes(operation: Any) -> Any:
+    """An equivalent of ``operation`` that holds no namesake, kept whole.
+
+    The base of an annotated operation cannot be inlined -- the modifiers
+    apply to it as one gate -- so a base holding a namesake is replaced by a
+    gate built from its expanded definition, under a name no standard gate
+    has, which synthesis can only build from that definition.
+    """
+    if isinstance(operation, AnnotatedOperation):
+        return AnnotatedOperation(
+            _without_namesakes(operation.base_op), operation.modifiers
+        )
+    # A copy: the expansion hands back a definition with nothing to expand.
+    expanded = _expand_standard_namesakes(_definition_to_expand(operation)).copy(
+        name=f"{operation.name}_expanded"
+    )
+    if isinstance(operation, Gate):
+        return expanded.to_gate()
+    return expanded.to_instruction()
 
 
 def validate_transpiler_settings(cfg: MultiQPUConfig) -> None:
@@ -440,7 +486,12 @@ def _unreachable_interaction(
                     if found is not None:
                         return found
                 continue
-            if len(instruction.qubits) < 2 or getattr(operation, "_directive", False):
+            # A loop's break or continue spans the loop's qubits but couples none.
+            if (
+                len(instruction.qubits) < 2
+                or getattr(operation, "_directive", False)
+                or isinstance(operation, (BreakLoopOp, ContinueLoopOp))
+            ):
                 continue
             physical = [physical_of[qubit] for qubit in instruction.qubits]
             if len({find(p) for p in physical}) > 1:

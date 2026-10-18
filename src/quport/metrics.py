@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from qiskit import QuantumCircuit
-from qiskit.circuit import ControlFlowOp, Qubit
+from qiskit.circuit import BreakLoopOp, ContinueLoopOp, ControlFlowOp, Qubit
 
 from quport.architecture import MultiQPUArchitecture
 from quport.interaction import WeightValue, cut_weight
@@ -70,8 +70,11 @@ def compute_metrics(qc: QuantumCircuit, arch: MultiQPUArchitecture) -> CircuitMe
         for inst in circuit.data:
             operation = inst.operation
             # Compiler directives (barriers) consume no runtime resources;
-            # qiskit's own depth()/size() exclude them with the same check.
-            if getattr(operation, "_directive", False):
+            # qiskit's own depth()/size() exclude them with the same check. A
+            # loop's break or continue spans the loop's qubits but is no gate.
+            if getattr(operation, "_directive", False) or isinstance(
+                operation, (BreakLoopOp, ContinueLoopOp)
+            ):
                 continue
             qubits = [qubit_index[qubit] for qubit in inst.qubits]
             if isinstance(operation, ControlFlowOp):
