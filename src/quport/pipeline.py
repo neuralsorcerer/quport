@@ -27,7 +27,7 @@ from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
-from quport.entanglement import is_standard_namesake
+from quport.entanglement import is_standard_gate, is_standard_namesake
 from quport.hypergraph import build_distributable_packets
 from quport.interaction import (
     extract_temporal_twoq_weights,
@@ -66,7 +66,8 @@ def _validate_out_csv(out_csv: object, *, label: str = "out_csv") -> str:
     """Check an output path before a run spends minutes on the results.
 
     The file is only opened once every trial has run, so a path that can never
-    be written -- not a path at all, empty, or an existing directory -- would
+    be written -- not a path at all, empty, holding a NUL, an existing
+    directory, or under a file where its directory should be -- would
     otherwise throw the whole run away at the end.
     """
     if not isinstance(out_csv, str | os.PathLike):
@@ -74,8 +75,21 @@ def _validate_out_csv(out_csv: object, *, label: str = "out_csv") -> str:
     path = os.fspath(out_csv)
     if not isinstance(path, str) or not path:
         raise ValueError(f"{label} must be a non-empty path")
-    if Path(path).is_dir():
+    if "\x00" in path:
+        raise ValueError(f"{label} must not contain a NUL character")
+    target = Path(path)
+    if target.is_dir():
         raise ValueError(f"{label} {path!r} names a directory, not a file")
+    # The directory is created when the file is written, which works only if
+    # the nearest part of the path that already exists is a directory.
+    for ancestor in target.parents:
+        if ancestor.exists():
+            if not ancestor.is_dir():
+                raise ValueError(
+                    f"{label} {path!r} cannot be created: {str(ancestor)!r} "
+                    "is not a directory"
+                )
+            break
     return path
 
 
@@ -237,26 +251,50 @@ def _expand_standard_namesakes(circuit: QuantumCircuit) -> QuantumCircuit:
 
 
 def _has_standard_namesake(circuit: QuantumCircuit) -> bool:
-    for instruction in circuit.data:
-        operation = instruction.operation
-        if is_standard_namesake(operation):
-            return True
-        if isinstance(operation, ControlFlowOp) and any(
-            _has_standard_namesake(block) for block in operation.blocks
-        ):
-            return True
-    return False
+    return any(_holds_namesake(i.operation) for i in circuit.data)
+
+
+def _holds_namesake(operation: Any) -> bool:
+    """True when ``operation`` is a namesake or contains one, at any depth.
+
+    Qiskit unrolls a custom gate before translating what it contains, so a
+    namesake used inside another custom gate reaches the name-keyed lookup
+    just as surely as one written at the top level.
+    """
+    if is_standard_namesake(operation):
+        return True
+    if isinstance(operation, ControlFlowOp):
+        return any(_has_standard_namesake(block) for block in operation.blocks)
+    definition = _user_definition(operation)
+    return definition is not None and _has_standard_namesake(definition)
+
+
+def _user_definition(operation: Any) -> QuantumCircuit | None:
+    """The definition of a user-defined operation, or ``None``.
+
+    Qiskit's own gates -- standard ones and the library's -- are built from
+    Qiskit's gates and never contain a namesake, so their definitions, which
+    can be costly to synthesise, are not opened.
+    """
+    if is_standard_gate(operation) or isinstance(operation, ControlFlowOp):
+        return None
+    # Qiskit's singleton classes are made at runtime and carry no module.
+    module = type(operation).__module__ or ""
+    if module.startswith("qiskit.circuit.library"):
+        return None
+    definition = getattr(operation, "definition", None)
+    return definition if isinstance(definition, QuantumCircuit) else None
 
 
 def _append_expanded(
     out: QuantumCircuit, operation: Any, qubits: list[Any], clbits: list[Any]
 ) -> None:
-    """Append ``operation``, inlining it -- recursively -- if it is a namesake."""
+    """Append ``operation``, inlining it -- recursively -- if it holds a namesake."""
     if isinstance(operation, ControlFlowOp):
         operation = operation.replace_blocks(
             [_expand_standard_namesakes(block) for block in operation.blocks]
         )
-    elif is_standard_namesake(operation):
+    elif _holds_namesake(operation):
         definition = operation.definition
         if definition is None:
             raise ValueError(
@@ -329,8 +367,10 @@ def _route_globally(
     ports, or an interconnect that leaves QPUs unreachable -- cannot be routed,
     and Qiskit fails deep inside routing. Qiskit is still the judge of that:
     a gate it optimizes away, or a control-flow block that only applies
-    single-qubit gates on both sides, routes fine. Only when routing fails is
-    the reason looked for, and reported as a ``ValueError`` naming the QPUs.
+    single-qubit gates on both sides, routes fine. Only when routing fails
+    because operands sit in disconnected components is the reason looked for,
+    and reported as a ``ValueError`` naming the QPUs; any other failure, such
+    as a routing method that cannot handle control flow, is Qiskit's to report.
     The distributed compiler handles the same machine: it schedules such
     operations as unschedulable rather than routing them.
     """
@@ -346,6 +386,8 @@ def _route_globally(
             seed_transpiler=seed,
         )
     except TranspilerError as exc:
+        if "disconnected" not in str(exc):
+            raise
         qpus = _unreachable_interaction(qc, initial_layout, arch, coupling)
         if qpus is None:
             raise

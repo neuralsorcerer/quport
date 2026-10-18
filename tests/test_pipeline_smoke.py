@@ -1174,3 +1174,105 @@ def test_an_unusable_out_csv_is_refused_before_any_trial_runs(
         pipeline.sweep_topologies(
             n_logical=4, depth=3, trials=1, seed=0, out_csv=None  # type: ignore[arg-type]
         )
+
+
+def test_basis_translation_keeps_a_namesake_nested_in_another_custom_gate() -> None:
+    """Qiskit unrolls the wrapper and then translates what it holds by name,
+    so a nested custom ``swap`` became a real SWAP and a nested parameterless
+    ``rzz`` came out as ``rzz(theta)`` with ``theta`` unbound."""
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Operator
+
+    from quport.compiler import compile_distributed
+    from quport.pipeline import _translate_to_basis
+
+    def custom(name: str, definition: QuantumCircuit) -> object:
+        gate = definition.to_gate()
+        gate.name = name
+        return gate
+
+    one_cx = QuantumCircuit(2)
+    one_cx.cx(0, 1)
+    one_cz = QuantumCircuit(2)
+    one_cz.cz(0, 1)
+    wrapped = QuantumCircuit(2)
+    wrapped.append(custom("swap", one_cx), [0, 1])
+    wrapped.append(custom("rzz", one_cz), [0, 1])
+    deeper = QuantumCircuit(2)
+    deeper.append(custom("wrap", wrapped), [0, 1])
+    qc = QuantumCircuit(2)
+    qc.x(0)
+    qc.append(custom("outer", deeper), [0, 1])
+    expected = QuantumCircuit(2)
+    expected.x(0)
+    expected.cx(0, 1)
+    expected.cz(0, 1)
+
+    translated = _translate_to_basis(qc, ("rz", "sx", "x", "cx"), 0)
+    assert not translated.parameters
+    assert Operator(translated).equiv(Operator(expected))
+
+    cfg = MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0)
+    compiled = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+    assert not compiled.basis_circuit.parameters
+    assert Operator(compiled.basis_circuit).equiv(Operator(expected))
+    mapped = map_and_transpile(qc, cfg, seed=0, strategy="balanced").mapped_circuit
+    assert not mapped.parameters
+    assert Operator.from_circuit(mapped).equiv(Operator(expected))
+
+
+def test_global_routing_reports_a_failure_that_is_not_disconnection() -> None:
+    """Routing method ``basic`` cannot handle control flow on any machine;
+    the failure was blamed on the disconnected QPUs instead."""
+    from qiskit import QuantumCircuit
+    from qiskit.transpiler.exceptions import TranspilerError
+
+    from quport.pipeline import transpile_baseline
+
+    qc = QuantumCircuit(4, 1)
+    qc.cx(0, 2)
+    qc.cx(0, 2)
+    qc.measure(1, 0)
+    with qc.if_test((qc.clbits[0], 1)):
+        qc.x(1)
+
+    with pytest.raises(TranspilerError, match="control flow"):
+        transpile_baseline(
+            qc, _disconnected_cfg(routing_method="basic", optimization_level=1), seed=0
+        )
+
+
+@pytest.mark.parametrize("problem", ["under a file", "nul"])
+def test_an_out_csv_that_can_never_be_written_is_refused_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, problem: str
+) -> None:
+    """Every trial ran, and then creating the file failed."""
+    import quport.pipeline as pipeline
+
+    calls = []
+    real = pipeline.map_and_transpile
+
+    def counting(*args: object, **kwargs: object) -> object:
+        calls.append(1)
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(pipeline, "map_and_transpile", counting)
+    blocker = tmp_path / "results.txt"
+    blocker.write_text("", encoding="utf-8")
+    out_csv = (
+        str(blocker / "deeper" / "bench.csv")
+        if problem == "under a file"
+        else str(tmp_path / "a\x00b.csv")
+    )
+    message = "is not a directory" if problem == "under a file" else "NUL"
+
+    with pytest.raises(ValueError, match=message):
+        pipeline.benchmark_random_circuits(
+            MultiQPUConfig(n_qpus=3, compute_qubits_per_qpu=2),
+            4,
+            3,
+            2,
+            out_csv=out_csv,
+            strategies=("balanced",),
+        )
+    assert calls == []
