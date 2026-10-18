@@ -14,7 +14,7 @@ from numbers import Integral
 from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import ClassicalRegister, QuantumCircuit
-from qiskit.circuit import Clbit, ControlFlowOp
+from qiskit.circuit import Barrier, Clbit, ControlFlowOp, Store
 from qiskit.circuit.classical import expr
 
 from quport._validation import is_boolean
@@ -25,7 +25,7 @@ from quport.aggregation import (
 )
 from quport.architecture import MultiQPUArchitecture
 from quport.config import LatencyModel, MultiQPUConfig, validate_epr_success_prob
-from quport.entanglement import is_directive
+from quport.entanglement import is_directive, is_standard_gate
 from quport.network import UNREACHABLE_DISTANCE, QpuEdge, path_edges
 
 UNSCHEDULABLE_PENALTY: float = float(UNREACHABLE_DISTANCE)
@@ -182,7 +182,7 @@ def _classical_wires(instruction: Any) -> list[Any]:
     wires: list[Any] = list(instruction.clbits)
     operation = instruction.operation
     expressions: list[Any] = []
-    if operation.name == "store":
+    if isinstance(operation, Store):
         expressions += [operation.lvalue, operation.rvalue]
     if isinstance(operation, ControlFlowOp):
         for attribute in ("condition", "target"):
@@ -247,7 +247,7 @@ def estimate_parallel_makespan(
     for idx, inst in enumerate(mapped.data):
         wires = _classical_wires(inst)
         after = max((classical_ready.get(wire, 0.0) for wire in wires), default=0.0)
-        if not inst.qubits and inst.operation.name != "barrier":
+        if not inst.qubits and not isinstance(inst.operation, Barrier):
             # A classical store, or a block acting on classical data only,
             # takes no QPU time and synchronizes no QPU, but it carries data:
             # whatever reads what it writes waits for what it read.
@@ -267,7 +267,6 @@ def estimate_parallel_makespan(
                     t[qpu] = sync_time
             continue
         qpus = _instruction_qpus(inst.qubits, qindex, phys_to_qpu)
-        name = inst.operation.name
         if idx in remote_indices:
             # Still one remote event, as split_into_qpus counts it, but every
             # QPU holding an operand takes part: a wide operation cannot start
@@ -286,7 +285,11 @@ def estimate_parallel_makespan(
             elif len(qpus) == 2:
                 qpu0, qpu1 = qpus
                 if qpu0 == qpu1:
-                    duration = lat.swap if name == "swap" else lat.twoq
+                    duration = (
+                        lat.swap
+                        if is_standard_gate(inst.operation, "swap")
+                        else lat.twoq
+                    )
                     t[qpu0] = max(t[qpu0], after) + duration
                     finish = t[qpu0]
                 else:
@@ -365,7 +368,6 @@ def estimate_parallel_makespan_layered(
             # but consume no time and are never remote operations.
             if getattr(node.op, "_directive", False):
                 continue
-            name = node.op.name
             qpus = _instruction_qpus(node.qargs, qindex, phys_to_qpu)
             if len(qpus) == 0:
                 continue
@@ -375,7 +377,7 @@ def estimate_parallel_makespan_layered(
             elif len(qpus) == 2:
                 q0, q1 = qpus
                 if q0 == q1:
-                    if name == "swap":
+                    if is_standard_gate(node.op, "swap"):
                         local_dur[q0] = max(local_dur[q0], lat.swap)
                     else:
                         local_dur[q0] = max(local_dur[q0], lat.twoq)
@@ -833,7 +835,6 @@ def _topology_schedule_plan(
             # but consume no time and are never remote operations.
             if getattr(node.op, "_directive", False):
                 continue
-            name = node.op.name
             qs = [qindex[q] for q in node.qargs]
             if len(qs) == 0:
                 continue
@@ -844,7 +845,7 @@ def _topology_schedule_plan(
                 q0 = phys_to_qpu[qs[0]]
                 q1 = phys_to_qpu[qs[1]]
                 if q0 == q1:
-                    if name == "swap":
+                    if is_standard_gate(node.op, "swap"):
                         local_dur[q0] = max(local_dur[q0], lat.swap)
                     else:
                         local_dur[q0] = max(local_dur[q0], lat.twoq)
@@ -1729,7 +1730,7 @@ def estimate_entanglement_schedule(
         wires = _classical_wires(instruction)
         after = max((classical_ready.get(wire, 0.0) for wire in wires), default=0.0)
 
-        if not qubits and operation.name != "barrier":
+        if not qubits and not isinstance(operation, Barrier):
             # A classical store, or a block acting on classical data only,
             # takes no time on any qubit but carries data: whatever reads what
             # it writes waits for what it read.
@@ -1781,7 +1782,7 @@ def estimate_entanglement_schedule(
                     release(ordinal)
                 continue
             roots = {blocks[ordinal].root_phys for ordinal in ordinals}
-            duration = lat.swap if operation.name == "swap" else lat.twoq
+            duration = lat.swap if is_standard_gate(operation, "swap") else lat.twoq
             start = max(
                 [runtime[ordinal].ready for ordinal in ordinals]
                 + [qubit_ready[qubit] for qubit in qubits if qubit not in roots]
@@ -1817,7 +1818,7 @@ def estimate_entanglement_schedule(
         qpu = phys_to_qpu[qubits[0]]
         if len(qubits) == 1:
             duration = lat.oneq
-        elif operation.name == "swap":
+        elif is_standard_gate(operation, "swap"):
             duration = lat.swap
         else:
             duration = lat.twoq
@@ -1881,7 +1882,7 @@ def _serialised_qubit_time(
             continue
         if len(qubits) == 1:
             duration = lat.oneq
-        elif instruction.operation.name == "swap":
+        elif is_standard_gate(instruction.operation, "swap"):
             duration = lat.swap
         else:
             duration = lat.twoq

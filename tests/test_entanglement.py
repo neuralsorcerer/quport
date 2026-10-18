@@ -282,3 +282,46 @@ def test_a_namesake_does_not_keep_a_cat_copy_alive_end_to_end() -> None:
     assert verify_telegate_equivalence(
         res.physical_circuit, MultiQPUArchitecture(cfg), res.aggregation
     )
+
+
+@pytest.mark.parametrize(
+    ("make", "name"),
+    [("XGate", "t"), ("SwapGate", "rzz"), ("HGate", "rz")],
+)
+def test_a_standard_gate_copied_under_another_name_keeps_its_own_identity(
+    make: str, name: str
+) -> None:
+    """Qiskit's ``X`` copied as ``t`` still carries the X mark; only the name
+    changed, and the diagonality tables used to answer for the name."""
+    from qiskit.circuit import library
+
+    from quport.entanglement import diagonal_positions, is_standard_gate
+
+    renamed = getattr(library, make)().copy(name=name)
+
+    assert diagonal_positions(renamed) == frozenset()
+    assert not is_standard_gate(renamed)
+
+
+def test_a_renamed_x_closes_the_cat_copy_it_would_break() -> None:
+    from qiskit import QuantumCircuit
+    from qiskit.circuit.library import XGate
+
+    from quport.aggregation import aggregate_remote_operations
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import MultiQPUConfig
+    from quport.protocol import verify_telegate_equivalence
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.append(XGate().copy(name="t"), [0])
+    mapped.cx(0, 3)
+
+    plan = aggregate_remote_operations(mapped, arch)
+
+    assert plan.epr_pairs == 2
+    assert verify_telegate_equivalence(mapped, arch, plan)

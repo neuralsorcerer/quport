@@ -636,8 +636,12 @@ it, other than to move it, fails the check. A measurement terminates when nothin
 but barriers acts on its qubit afterwards; a measurement or reset that later
 operations depend on
 genuinely changes what the circuit computes and is refused rather than quietly
-ignored. So is classical control -- an `if` block or other control-flow
-operation -- which has no state-vector evolution to compare.
+ignored, as is one hidden inside a custom instruction's definition. So is
+classical control -- an `if` block or other control-flow
+operation -- which has no state-vector evolution to compare. Measurements,
+resets and barriers are recognised by their Qiskit class, as the simulator
+recognises them, so a unitary gate that merely carries one of those names is
+verified as the gate it is.
 
 ### From plan to circuit, and proving it
 

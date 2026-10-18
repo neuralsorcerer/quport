@@ -66,6 +66,7 @@ __all__ = [
     "diagonal_operands",
     "diagonal_positions",
     "is_directive",
+    "is_standard_gate",
     "is_standard_namesake",
 ]
 
@@ -123,29 +124,45 @@ def is_directive(operation: Any) -> bool:
 
 
 @cache
-def _standard_gate_names() -> frozenset[str]:
-    """Names of Qiskit's standard gates."""
+def _standard_gates_by_name() -> dict[str, Any]:
+    """Qiskit's standard gates, as the ``StandardGate`` mark each name carries."""
     from qiskit.circuit.library import get_standard_gate_name_mapping
 
-    return frozenset(
-        name
+    return {
+        name: gate._standard_gate
         for name, gate in get_standard_gate_name_mapping().items()
         if getattr(gate, "_standard_gate", None) is not None
-    )
+    }
+
+
+def is_standard_gate(operation: Any, name: str | None = None) -> bool:
+    """True when ``operation`` is Qiskit's own standard gate of its name.
+
+    Qiskit marks its standard gates, and the mark must agree with the name:
+    an ``X`` copied under the name ``t`` is still an ``X``. With ``name``, the
+    operation must also be that gate.
+    """
+    standard = getattr(operation, "_standard_gate", None)
+    own = getattr(operation, "name", None)
+    if standard is None or not isinstance(own, str):
+        return False
+    if name is not None and own != name:
+        return False
+    return bool(_standard_gates_by_name().get(own) == standard)
 
 
 def is_standard_namesake(operation: Any) -> bool:
-    """True for an operation named like a Qiskit standard gate without being one.
+    """True for an operation named like a Qiskit standard gate without being it.
 
     Names are a lookup key, not an identity: a custom gate called ``t`` whose
-    definition is an ``X`` is no ``T`` gate. Qiskit marks its standard gates,
-    so anything carrying one of their names without that mark is a namesake.
+    definition is an ``X`` is no ``T`` gate, and neither is Qiskit's ``X``
+    copied under that name.
     """
     name = getattr(operation, "name", None)
     return (
         isinstance(name, str)
-        and name in _standard_gate_names()
-        and getattr(operation, "_standard_gate", None) is None
+        and name in _standard_gates_by_name()
+        and not is_standard_gate(operation)
     )
 
 
@@ -155,8 +172,8 @@ def _is_named_operation(operation: Any) -> bool:
     Only then can a table keyed by name speak for it. ``delay`` is not a gate,
     so it is recognised by its class.
     """
-    return getattr(operation, "_standard_gate", None) is not None or isinstance(
-        operation, Delay
+    return is_standard_gate(operation) or (
+        isinstance(operation, Delay) and operation.name == "delay"
     )
 
 

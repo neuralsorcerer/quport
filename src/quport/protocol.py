@@ -66,7 +66,16 @@ from numbers import Integral
 from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import QuantumCircuit, QuantumRegister
-from qiskit.circuit import ClassicalRegister, ControlFlowOp
+from qiskit.circuit import (
+    Barrier,
+    ClassicalRegister,
+    ControlFlowOp,
+    Gate,
+    Measure,
+    Reset,
+    Store,
+)
+from qiskit.circuit.library import Initialize
 
 from quport._validation import is_boolean
 from quport.aggregation import AggregationPlan, RemoteBlock, aggregate_remote_operations
@@ -185,6 +194,8 @@ def _require_plan_for(
     width = len(mapped.qubits)
     qindex = {qubit: index for index, qubit in enumerate(mapped.qubits)}
     seen: set[tuple[str, int, int, tuple[int, ...]]] = set()
+    if not isinstance(plan.blocks, Sequence) or isinstance(plan.blocks, str):
+        raise ValueError("plan.blocks must be a sequence of RemoteBlock")
     for ordinal, block in enumerate(plan.blocks):
         where = f"plan block {ordinal}"
         if not isinstance(block, RemoteBlock):
@@ -691,7 +702,43 @@ def verify_distributed_program(
     return bool(fidelity >= 1.0 - tolerance)
 
 
-_NON_UNITARY_OPS = frozenset({"measure", "reset", "initialize"})
+#: Qiskit's non-unitary operations, recognised by class -- as the simulator
+#: recognises them -- so that a unitary gate merely named ``measure`` is a gate.
+_NON_UNITARY_KINDS = (
+    (Measure, "measure"),
+    (Reset, "reset"),
+    (Initialize, "initialize"),
+)
+
+
+def _non_unitary_kind(operation: Any) -> str | None:
+    """Name the measurement, reset or initialization ``operation`` performs.
+
+    A custom instruction can hide one in its definition, which the simulator
+    would apply by sampling an outcome, so definitions are searched too. Gates
+    are unitary by contract, and control flow is refused separately.
+    """
+    for kind, name in _NON_UNITARY_KINDS:
+        if isinstance(operation, kind):
+            return name
+    if isinstance(operation, (Gate, ControlFlowOp, Barrier, Store)):
+        return None
+    definition = getattr(operation, "definition", None)
+    if not isinstance(definition, QuantumCircuit):
+        return None
+    for instruction in definition.data:
+        kind = _non_unitary_kind(instruction.operation)
+        if kind is not None:
+            return kind
+    return None
+
+
+def _describe_non_unitary(operation: Any) -> str | None:
+    """Describe the non-unitary operation ``operation`` is or hides, if any."""
+    kind = _non_unitary_kind(operation)
+    if kind is None or isinstance(operation, (Measure, Reset, Initialize)):
+        return kind
+    return f"{kind} (inside {operation.name})"
 
 
 def _require_bound_parameters(circuit: QuantumCircuit) -> None:
@@ -753,13 +800,14 @@ def _unitary_part(circuit: QuantumCircuit, *, label: str) -> QuantumCircuit:
     stores = False
     for index, instruction in enumerate(circuit.data):
         operation = instruction.operation
-        if index in terminating or operation.name == "barrier":
+        if index in terminating or isinstance(operation, Barrier):
             continue
-        if operation.name in _NON_UNITARY_OPS:
-            surviving.add(operation.name)
+        non_unitary = _describe_non_unitary(operation)
+        if non_unitary is not None:
+            surviving.add(non_unitary)
         elif instruction.clbits or isinstance(operation, ControlFlowOp):
             controlled.add(operation.name)
-        elif operation.name == "store":
+        elif isinstance(operation, Store):
             # A store writes a classical bit or variable without touching a
             # qubit, and names its target inside the operation rather than in
             # its classical arguments, so the check above does not see it.
@@ -802,10 +850,10 @@ def _terminating_measurements(circuit: QuantumCircuit) -> set[int]:
     terminating: set[int] = set()
     for index in range(len(circuit.data) - 1, -1, -1):
         instruction = circuit.data[index]
-        name = instruction.operation.name
-        if name == "barrier":
+        operation = instruction.operation
+        if isinstance(operation, Barrier):
             continue
-        if name == "measure" and used_later.isdisjoint(instruction.qubits):
+        if isinstance(operation, Measure) and used_later.isdisjoint(instruction.qubits):
             terminating.add(index)
             continue
         used_later.update(instruction.qubits)
@@ -816,7 +864,7 @@ def _measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
     """How many measurements write each classical bit of ``circuit``."""
     writes: dict[Any, int] = {}
     for instruction in circuit.data:
-        if instruction.operation.name == "measure":
+        if isinstance(instruction.operation, Measure):
             for clbit in instruction.clbits:
                 writes[clbit] = writes.get(clbit, 0) + 1
     return writes
@@ -834,7 +882,7 @@ def _single_measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
     """
     measured: set[Any] = set()
     for instruction in circuit.data:
-        if instruction.operation.name != "measure":
+        if not isinstance(instruction.operation, Measure):
             continue
         for qubit in instruction.qubits:
             if qubit in measured:
@@ -884,7 +932,7 @@ def _outcome_slots(width: int, *circuits: QuantumCircuit) -> dict[Any, int]:
         clbit
         for circuit in circuits
         for instruction in circuit.data
-        if instruction.operation.name == "measure"
+        if isinstance(instruction.operation, Measure)
         for clbit in instruction.clbits
     }
     order = [clbit for circuit in circuits for clbit in circuit.clbits]
@@ -916,13 +964,14 @@ def _measurements_into_ancillas(
     for instruction in circuit.data:
         operation = instruction.operation
         qubits = [position[qubit] for qubit in instruction.qubits]
-        if operation.name == "measure":
+        if isinstance(operation, Measure):
             out.swap(qubits[0], outcome_slots[instruction.clbits[0]])
             continue
-        if operation.name in _NON_UNITARY_OPS or instruction.clbits:
+        non_unitary = _describe_non_unitary(operation)
+        if non_unitary is not None or instruction.clbits:
             raise ValueError(
-                f"cannot verify a program containing {operation.name}, which "
-                "state-vector comparison cannot represent"
+                f"cannot verify a program containing {non_unitary or operation.name}, "
+                "which state-vector comparison cannot represent"
             )
         out.append(operation, [out.qubits[qubit] for qubit in qubits])
     return out

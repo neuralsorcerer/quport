@@ -570,7 +570,9 @@ does a program that acts on a qubit after measuring it other than to move it.
 Each measured bit counts toward the 24-qubit simulation limit. A measurement is
 terminating when nothing but barriers acts on its qubit afterwards; a circuit with
 mid-circuit measurement, reset, or classical control is refused with
-`ValueError`.
+`ValueError`, including a measurement or reset hidden inside a custom
+instruction. Measurements, resets and barriers are recognised by class, so a
+unitary gate named `measure` is verified as a gate.
 
 A distributed program is a **partial** order. Within a QPU the constraint is per
 qubit, so instructions on disjoint qubits may run in either order, and two QPUs

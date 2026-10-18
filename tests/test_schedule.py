@@ -2541,3 +2541,78 @@ def test_audit_refuses_a_real_round_over_an_unreachable_or_self_pair() -> None:
         single_round((1, 1), (0, 2), model.classical_rtt * 0.5), connected, model
     )
     assert any("name one QPU twice" in problem for problem in problems)
+
+
+def _all_estimators() -> tuple[object, ...]:
+    from quport.schedule import estimate_entanglement_schedule
+
+    return (
+        estimate_parallel_makespan,
+        estimate_parallel_makespan_layered,
+        estimate_parallel_makespan_topology,
+        estimate_entanglement_schedule,
+    )
+
+
+def _named(name: str, body: QuantumCircuit) -> object:
+    gate = body.to_gate()
+    gate.name = name
+    return gate
+
+
+def test_a_gate_named_store_is_scheduled_as_a_gate() -> None:
+    """The list estimators took it for a classical store and read its target."""
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    )
+    flip = QuantumCircuit(1)
+    flip.x(0)
+    spans = {}
+    for name in ("mystore", "store"):
+        qc = QuantumCircuit(arch.n_phys)
+        qc.h(0)
+        qc.cx(0, 1)
+        qc.append(_named(name, flip), [1])
+        spans[name] = [
+            estimate(qc, arch, LatencyModel()).makespan  # type: ignore[operator]
+            for estimate in _all_estimators()
+        ]
+    assert spans["store"] == spans["mystore"]
+
+
+def test_a_zero_qubit_gate_named_barrier_is_scheduled_as_a_gate() -> None:
+    """Taken for a barrier by name, it fell through to code indexing its qubits."""
+    import math
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=1)
+    )
+    spans = {}
+    for name in ("phase", "barrier"):
+        qc = QuantumCircuit(arch.n_phys)
+        qc.h(0)
+        qc.append(_named(name, QuantumCircuit(0, global_phase=math.pi)), [])
+        qc.cx(0, 2)
+        spans[name] = [
+            estimate(qc, arch, LatencyModel()).makespan  # type: ignore[operator]
+            for estimate in _all_estimators()
+        ]
+    assert spans["barrier"] == spans["phase"]
+
+
+def test_only_qiskits_swap_is_charged_swap_latency() -> None:
+    """A custom ``swap`` that is one CX cost three times a CX in every estimator."""
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=1, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0)
+    )
+    one_cx = QuantumCircuit(2)
+    one_cx.cx(0, 1)
+    model = LatencyModel()
+    for gate, expected in ((_named("swap", one_cx), model.twoq), (None, model.swap)):
+        qc = QuantumCircuit(2)
+        if gate is None:
+            qc.swap(0, 1)
+        else:
+            qc.append(gate, [0, 1])
+        for estimate in _all_estimators():
+            assert estimate(qc, arch, model).makespan == expected  # type: ignore[operator]

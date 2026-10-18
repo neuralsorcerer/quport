@@ -1312,3 +1312,104 @@ def test_both_verifiers_refuse_unbound_parameters_with_a_value_error() -> None:
         verify_distributed_program(
             mapped, program.local_circuits, program.remote_ops, arch
         )
+
+
+@pytest.mark.parametrize("blocks", [None, 5, "blocks", "generator"])
+def test_a_plan_whose_blocks_are_not_a_sequence_is_refused(blocks: object) -> None:
+    """These raised a bare TypeError, and a generator was used up by the check."""
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    if blocks == "generator":
+        blocks = (block for block in [_cat(0, 1)])
+    plan = AggregationPlan(
+        blocks=blocks,  # type: ignore[arg-type]
+        remote_gates=1,
+        epr_pairs=1,
+        baseline_epr_pairs=1,
+        unschedulable_gates=0,
+        evictions=0,
+        peak_cat_copies=(0, 1),
+    )
+
+    with pytest.raises(ValueError, match="plan.blocks must be a sequence"):
+        build_telegate_circuit(mapped, arch, plan)
+    with pytest.raises(ValueError, match="plan.blocks must be a sequence"):
+        verify_telegate_equivalence(mapped, arch, plan)
+
+
+def _unitary_named(name: str) -> object:
+    """An ``X`` packaged as a custom gate called ``name``."""
+    body = QuantumCircuit(1)
+    body.x(0)
+    gate = body.to_gate()
+    gate.name = name
+    return gate
+
+
+def test_a_gate_named_barrier_is_not_dropped_from_the_comparison() -> None:
+    """Both sides dropped it by name, so a plan keeping a cat copy open across
+    the X it is passed verification although its fidelity is 0.56."""
+    arch = _arch(compute=1)
+    wrong = _plan_with(_cat(0, 1, 3))
+    for name in ("myx", "barrier"):
+        mapped = QuantumCircuit(arch.n_phys)
+        mapped.h(0)
+        mapped.cx(0, 2)
+        mapped.append(_unitary_named(name), [0])
+        mapped.cx(0, 2)
+
+        assert not verify_telegate_equivalence(mapped, arch, wrong), name
+
+
+@pytest.mark.parametrize("name", ["myx", "measure", "reset"])
+def test_a_unitary_gate_is_verified_whatever_it_is_called(name: str) -> None:
+    """A gate named ``measure`` crashed with IndexError or was refused as a
+    mid-circuit measurement; one named ``reset`` was refused as a reset."""
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1, intra_topology="line"
+    )
+    arch = MultiQPUArchitecture(cfg)
+    for last in (True, False):
+        qc = QuantumCircuit(4)
+        qc.h(0)
+        qc.cx(0, 1)
+        qc.cx(1, 2)
+        qc.append(_unitary_named(name), [3])
+        if not last:
+            qc.cx(2, 3)
+        res = compile_distributed(qc, cfg, seed=1, strategy="balanced")
+
+        assert verify_distributed_program(
+            res.physical_circuit, res.local_routed, res.routed_remote_ops, arch
+        )
+        assert verify_telegate_equivalence(res.physical_circuit, arch, res.aggregation)
+
+
+def test_a_reset_hidden_in_a_custom_instruction_is_refused() -> None:
+    """It passed the name check, and the simulator then sampled it, so the
+    verdict changed from call to call with the same seed."""
+    from quport.distributed import split_into_qpus
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch(compute=1)
+    body = QuantumCircuit(1)
+    body.reset(0)
+    prep = body.to_instruction()
+    prep.name = "prep"
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 2)
+    mapped.append(prep, [0])
+    mapped.cx(2, 3)
+    program = split_into_qpus(mapped, arch)
+
+    with pytest.raises(ValueError, match=r"reset \(inside prep\)"):
+        verify_telegate_equivalence(mapped, arch)
+    with pytest.raises(ValueError, match=r"reset \(inside prep\)"):
+        verify_distributed_program(
+            mapped, program.local_circuits, program.remote_ops, arch
+        )
