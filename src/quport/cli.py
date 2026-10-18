@@ -106,15 +106,18 @@ def _qasm_version(source: str) -> int | None:
     return int(match.group(1))
 
 
-_QASM2_DEFINITION_RE = re.compile(r"\b(?:gate|opaque)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_QASM2_DEFINITION_RE = re.compile(r"\bgate\s+([A-Za-z_][A-Za-z0-9_]*)")
 _QASM2_INCLUDE_RE = re.compile(r'\binclude\s+"([^"]+)"\s*;')
 
 
 def _qasm2_defined_gate_names(
     source: str, include_path: tuple[str, ...], seen: set[str]
 ) -> set[str]:
-    """Names an OpenQASM 2 program defines with ``gate`` or ``opaque``.
+    """Names an OpenQASM 2 program defines with ``gate``.
 
+    An ``opaque`` declaration supplies no definition to keep, so a standard
+    name declared opaque -- a common way to declare native gates -- still reads
+    as Qiskit's gate, as ``QuantumCircuit.from_qasm_file`` reads it.
     Definitions in the files it includes count too, found on ``include_path``
     as the parser finds them; ``qelib1.inc`` is the parser's own and is skipped.
     A file that cannot be read is left for the parser to report.

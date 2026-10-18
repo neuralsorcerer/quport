@@ -1503,3 +1503,31 @@ def test_a_qasm_programs_own_gates_survive_compilation(tmp_path: Path) -> None:
     expected.cz(1, 2)
     assert not result.basis_circuit.parameters
     assert Operator(result.basis_circuit).equiv(Operator(expected))
+
+
+def test_an_opaque_standard_gate_reads_as_qiskits_gate(tmp_path: Path) -> None:
+    """``opaque sx a;`` declares a native gate and supplies no definition, so
+    there is nothing of the program's own to keep; it loaded as a bodiless
+    custom ``sx`` that every pipeline then refused."""
+    from qiskit.circuit.library import SXGate
+
+    path = tmp_path / "native.qasm"
+    path.write_text(
+        'OPENQASM 2.0;\ninclude "qelib1.inc";\nopaque sx a;\n'
+        "qreg q[2];\nsx q[0];\ncx q[0], q[1];\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        json.dumps(
+            {"n_qpus": 1, "compute_qubits_per_qpu": 2, "comm_qubits_per_qpu": 0}
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = _load_or_random_circuit(
+        input_qasm=str(path), n_logical=None, depth=1, seed=0
+    )
+
+    assert isinstance(loaded.data[0].operation, SXGate)
+    _run(["map", "--input-qasm", str(path), "--config", str(config)])
