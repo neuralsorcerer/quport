@@ -2,21 +2,32 @@
 # Visit https://bit.ly/cffinit to generate yours today!
 
 cff-version: 1.2.0
-title: >-
-  QuPort: Topology-, Port-, and Congestion-Aware Compilation for Modular Multi-QPU Quantum Systems
-message: >-
-  If you use this software, please cite it using the
-  metadata from this file.
+message: "If you use QuPort in your research, please cite the article below."
+
+title: "QuPort: Multi-QPU circuit mapping, routing, splitting, scheduling, and benchmarking"
 type: software
+
 authors:
-  - given-names: Soumyadip
-    family-names: Sarkar
-    orcid: 'https://orcid.org/0000-0002-2377-9147'
-  - given-names: Subhasree
-    family-names: Bhattacharjee
-identifiers:
-  - type: doi
-    value: 10.48550/arXiv.2605.12583
-repository-code: 'https://github.com/neuralsorcerer/quport'
-repository: 'https://arxiv.org/abs/2605.12583'
-license: Apache-2.0
+  - family-names: Sarkar
+    given-names: Soumyadip
+  - family-names: Bhattacharjee
+    given-names: Subhasree
+
+repository-code: "https://github.com/neuralsorcerer/quport"
+
+preferred-citation:
+  type: article
+  title: "Quport: topology-, port-, and congestion-aware compilation for modular multi-QPU quantum systems"
+  authors:
+    - family-names: Sarkar
+      given-names: Soumyadip
+    - family-names: Bhattacharjee
+      given-names: Subhasree
+  journal: "The European Physical Journal Plus"
+  year: 2026
+  month: 10
+  volume: 141
+  issue: 10
+  article-number: "1206"
+  doi: "10.1140/epjp/s13360-026-08358-1"
+  url: "https://doi.org/10.1140/epjp/s13360-026-08358-1"

@@ -1793,14 +1793,17 @@ python examples/reproduce_readme_figures.py calibration
 If you use quport in your work and wish to refer to it, please use the following BibTeX entry.
 
 ```bibtex
-@misc{sarkar2026quporttopologyportcongestionaware,
-      title={QuPort: Topology-, Port-, and Congestion-Aware Compilation for Modular Multi-QPU Quantum Systems},
-      author={Soumyadip Sarkar and Subhasree Bhattacharjee},
-      year={2026},
-      eprint={2605.12583},
-      archivePrefix={arXiv},
-      primaryClass={quant-ph},
-      url={https://arxiv.org/abs/2605.12583},
+@article{Sarkar2026QuPort,
+    author    = {Soumyadip Sarkar and Subhasree Bhattacharjee},
+    title     = {Quport: topology-, port-, and congestion-aware compilation for modular multi-QPU quantum systems},
+    journal   = {The European Physical Journal Plus},
+    volume    = {141},
+    number    = {10},
+    pages     = {1206},
+    year      = {2026},
+    publisher = {Springer Nature},
+    doi       = {10.1140/epjp/s13360-026-08358-1},
+    url       = {https://doi.org/10.1140/epjp/s13360-026-08358-1}
 }
 ```
 
