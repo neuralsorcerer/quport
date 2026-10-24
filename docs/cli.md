@@ -221,7 +221,7 @@ benchmark. Output artifacts:
 - `remote_ops.json`: ordered remote operation manifest, in the routed programs' physical-qubit labelling (local routing permutes qubits inside a QPU unless the intra-QPU topology is a clique, so the pre-routing indices would point elsewhere);
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
 - `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
-- `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary (audited before writing, like the schedule trace).
+- `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary (audited before writing, like the schedule trace). Blocks are planned on the physical circuit, before local routing: `root_phys` is a position in that labelling, and `gate_indices` match the manifest's `index` field, whose entry gives the root's routed position at each gate.
 
 The `Local SWAPs:` figure it prints counts instructions named `swap` in the routed
 programs, so under the default `basis_gates`, which contain no `swap`, it reads `0`

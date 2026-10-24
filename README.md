@@ -1723,6 +1723,13 @@ must not fall. Over 672 schedules spanning four topologies, every property held
 in `physical_circuit`. Local routing permutes qubits inside a QPU whenever
 `intra_topology` is not `clique`, so the two labellings differ and only the
 routed one matches the `qpu_<id>_routed.qasm` files shipped beside it.
+
+`entanglement_plan.json` is the other way round: its blocks are planned on the
+physical circuit, so `root_phys` is a position there, before local routing, and
+`gate_indices` are that circuit's instruction indices -- the same numbering as a
+manifest entry's `index`. Routing can move a block's root between its gates, so
+where the root sits at each gate of the block is the manifest entry with that
+`index`, on the block's `root_qpu`.
 `compile_distributed` exposes both: `program.remote_ops` in the pre-routing
 labelling, and `routed_remote_ops` in the shipped one. `quport split`, which
 writes unrouted programs, correctly ships the pre-routing manifest.
