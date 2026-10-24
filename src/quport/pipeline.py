@@ -94,14 +94,24 @@ def _validate_out_csv(out_csv: object, *, label: str = "out_csv") -> str:
             raise ValueError(f"{label} {path!r} names a directory, not a file")
         # The directory is created when the file is written, which works only
         # if the nearest part of the path that already exists is a directory.
+        # A symbolic link counts as existing even when broken or looping: the
+        # directory cannot be created in its place.
         for ancestor in target.parents:
-            if ancestor.exists():
+            if ancestor.is_symlink() or ancestor.exists():
                 if not ancestor.is_dir():
                     raise ValueError(
                         f"{label} {path!r} cannot be created: {str(ancestor)!r} "
                         "is not a directory"
                     )
                 break
+        if target.is_symlink() and not target.exists():
+            # Writing follows the link, so its own target must be creatable.
+            resolved = Path(os.path.realpath(path))
+            if resolved.is_symlink() or not resolved.parent.is_dir():
+                raise ValueError(
+                    f"{label} {path!r} cannot be created: it is a broken "
+                    "symbolic link"
+                )
     except OSError as exc:  # a name too long for the filesystem, for one
         raise ValueError(f"{label} {path!r} cannot be used: {exc}") from None
     return path

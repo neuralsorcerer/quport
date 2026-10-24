@@ -1366,3 +1366,29 @@ def test_an_out_csv_the_filesystem_rejects_is_a_value_error() -> None:
 
     with pytest.raises(ValueError, match="cannot be used"):
         _validate_out_csv("a" * 300 + ".csv")
+
+
+@pytest.mark.parametrize("kind", ["dangling", "loop", "broken file"])
+def test_an_out_csv_through_a_broken_link_is_refused(tmp_path: Path, kind: str) -> None:
+    """mkdir could not create a directory where a broken link stood, and every
+    trial ran first."""
+    import os
+
+    from quport.pipeline import _validate_out_csv
+
+    if kind == "dangling":
+        os.symlink(tmp_path / "missing" / "dir", tmp_path / "link")
+        path = tmp_path / "link" / "x.csv"
+    elif kind == "loop":
+        os.symlink(tmp_path / "b", tmp_path / "a")
+        os.symlink(tmp_path / "a", tmp_path / "b")
+        path = tmp_path / "a" / "x.csv"
+    else:
+        os.symlink(tmp_path / "missing" / "x.csv", tmp_path / "out.csv")
+        path = tmp_path / "out.csv"
+
+    with pytest.raises(ValueError, match="cannot be created"):
+        _validate_out_csv(str(path))
+
+    os.symlink(tmp_path / "target.csv", tmp_path / "fine.csv")
+    assert _validate_out_csv(str(tmp_path / "fine.csv"))
