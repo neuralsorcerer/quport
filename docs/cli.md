@@ -15,7 +15,11 @@ custom workflows, use the Python API documented in [API reference](api-reference
   benchmark with `--n-logical` or
   load a user OpenQASM 2/3 circuit with `--input-qasm path/to/circuit.qasm`.
   OpenQASM 2 loads with Qiskit's built-in parser; OpenQASM 3 requires Qiskit's
-  optional `qiskit_qasm3_import` package.
+  optional `qiskit_qasm3_import` package. As with `QuantumCircuit.from_qasm_file`,
+  gates Qiskit's exporter writes but `qelib1.inc` lacks (`sx`, `swap`, `cp`, ...)
+  read as Qiskit's, while a program's own `gate` definition of any name is kept.
+  A Qiskit standard gate declared `opaque` with that gate's signature -- the usual
+  way to declare a native gate such as `ecr` -- reads as Qiskit's gate.
 
 ## `quport gen-config`
 

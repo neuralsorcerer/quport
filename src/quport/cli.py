@@ -10,6 +10,7 @@ import importlib
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from quport.config import (
     optional_module_available,
 )
 from quport.distributed import _remove_stale_programs, write_remote_ops_json
+from quport.entanglement import is_standard_gate
 from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
 from quport.interaction import extract_twoq_weights
 from quport.network import build_qpu_graph, topology_metrics
@@ -107,23 +109,29 @@ def _qasm_version(source: str) -> int | None:
 
 
 _QASM2_DEFINITION_RE = re.compile(r"\bgate\s+([A-Za-z_][A-Za-z0-9_]*)")
+_QASM2_OPAQUE_RE = re.compile(
+    r"\bopaque\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(([^)]*)\))?\s*([^;]*);"
+)
 _QASM2_INCLUDE_RE = re.compile(r'\binclude\s+"([^"]+)"\s*;')
 
 
-def _qasm2_defined_gate_names(
+def _qasm2_declarations(
     source: str, include_path: tuple[str, ...], seen: set[str]
-) -> set[str]:
-    """Names an OpenQASM 2 program defines with ``gate``.
+) -> tuple[set[str], dict[str, tuple[int, int]]]:
+    """Names an OpenQASM 2 program defines with ``gate``, and its ``opaque`` ones.
 
-    An ``opaque`` declaration supplies no definition to keep, so a standard
-    name declared opaque -- a common way to declare native gates -- still reads
-    as Qiskit's gate, as ``QuantumCircuit.from_qasm_file`` reads it.
-    Definitions in the files it includes count too, found on ``include_path``
-    as the parser finds them; ``qelib1.inc`` is the parser's own and is skipped.
-    A file that cannot be read is left for the parser to report.
+    The opaque declarations come with their signatures, as ``(parameters,
+    qubits)``. Declarations in the files the program includes count too, found
+    on ``include_path`` as the parser finds them; ``qelib1.inc`` is the parser's
+    own and is skipped. A file that cannot be read is left for the parser to
+    report.
     """
     code = re.sub(r"//[^\n]*", "", source)
     names = set(_QASM2_DEFINITION_RE.findall(code))
+    opaque = {
+        name: (_count_qasm2_names(params), _count_qasm2_names(qubits))
+        for name, params, qubits in _QASM2_OPAQUE_RE.findall(code)
+    }
     for included in _QASM2_INCLUDE_RE.findall(code):
         if included == "qelib1.inc" or included in seen:
             continue
@@ -135,9 +143,58 @@ def _qasm2_defined_gate_names(
                     text = candidate.read_text(encoding="utf-8-sig")
                 except (OSError, UnicodeDecodeError):
                     break
-                names |= _qasm2_defined_gate_names(text, include_path, seen)
+                more_names, more_opaque = _qasm2_declarations(text, include_path, seen)
+                names |= more_names
+                opaque.update(more_opaque)
                 break
-    return names
+    return names, opaque
+
+
+def _count_qasm2_names(text: str) -> int:
+    """How many comma-separated names an OpenQASM 2 declaration lists."""
+    return sum(1 for name in text.split(",") if name.strip())
+
+
+def _qasm2_custom_instructions(
+    defined: set[str], opaque: Mapping[str, tuple[int, int]]
+) -> list[qasm2.CustomInstruction]:
+    """The custom instructions an OpenQASM 2 program is read with.
+
+    Qiskit's own exporter writes gates such as ``sx``, ``swap`` and ``cp`` that
+    the paper-era ``qelib1.inc`` lacks; ``QuantumCircuit.from_qasm_file`` reads
+    them through the legacy definitions, and so does this. A program's own
+    ``gate`` definition of such a name wins, though: the legacy table would
+    otherwise replace it with Qiskit's gate, or reject it when the signatures
+    differ.
+
+    An ``opaque`` declaration supplies no definition to keep -- it is how a
+    program declares a native gate -- so a standard gate's name declared opaque
+    reads as Qiskit's gate, provided the signature is that gate's. Read as a
+    bodiless custom gate instead, it could be neither translated nor trusted.
+    """
+    from qiskit.circuit.library import get_standard_gate_name_mapping
+
+    instructions = [
+        instruction
+        for instruction in qasm2.LEGACY_CUSTOM_INSTRUCTIONS
+        if instruction.name not in defined
+    ]
+    legacy = {instruction.name for instruction in instructions}
+    standard = get_standard_gate_name_mapping()
+    for name, (num_params, num_qubits) in opaque.items():
+        gate = standard.get(name)
+        if (
+            name in defined
+            or name in legacy
+            or gate is None
+            or not is_standard_gate(gate)
+            or (len(gate.params), gate.num_qubits) != (num_params, num_qubits)
+        ):
+            continue
+        instructions.append(
+            qasm2.CustomInstruction(name, num_params, num_qubits, gate.base_class)
+        )
+    return instructions
 
 
 def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
@@ -157,22 +214,12 @@ def _load_qasm_circuit(input_qasm: str) -> QuantumCircuit:
     def parse_qasm2() -> QuantumCircuit:
         # `qasm2.load` appends the input file's own directory to the include
         # path; keep that, so a program including a sibling file still resolves.
-        # Qiskit's own exporter writes gates such as `sx`, `swap` and `cp` that
-        # the paper-era qelib1.inc lacks; `QuantumCircuit.from_qasm_file` reads
-        # them through the legacy definitions, and so must this.
-        # A program's own definition of such a name still wins, though: the
-        # legacy table would otherwise replace it with Qiskit's gate, or
-        # reject it when the signatures differ.
         include_path = (".", str(input_path.parent))
-        defined = _qasm2_defined_gate_names(source, include_path, set())
+        defined, opaque = _qasm2_declarations(source, include_path, set())
         return qasm2.loads(
             source,
             include_path=include_path,
-            custom_instructions=[
-                instruction
-                for instruction in qasm2.LEGACY_CUSTOM_INSTRUCTIONS
-                if instruction.name not in defined
-            ],
+            custom_instructions=_qasm2_custom_instructions(defined, opaque),
         )
 
     def parse_qasm3() -> QuantumCircuit:

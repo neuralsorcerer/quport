@@ -1533,6 +1533,57 @@ def test_an_opaque_standard_gate_reads_as_qiskits_gate(tmp_path: Path) -> None:
     _run(["map", "--input-qasm", str(path), "--config", str(config)])
 
 
+@pytest.mark.parametrize(
+    ("declaration", "statement", "expected"),
+    [
+        ("opaque ecr a, b;", "ecr q[0], q[1];", "ecr"),
+        ("opaque rzx(theta) a, b;", "rzx(0.3) q[0], q[1];", "rzx"),
+    ],
+)
+def test_an_opaque_standard_gate_outside_the_legacy_table_reads_as_qiskits(
+    tmp_path: Path, declaration: str, statement: str, expected: str
+) -> None:
+    """Qiskit's legacy table lacks ``ecr``, so ``opaque ecr`` loaded as a
+    bodiless custom gate that every pipeline refused."""
+    from qiskit.circuit.library import get_standard_gate_name_mapping
+
+    path = tmp_path / "native.qasm"
+    path.write_text(
+        f'OPENQASM 2.0;\ninclude "qelib1.inc";\n{declaration}\nqreg q[2];\n'
+        f"{statement}\n",
+        encoding="utf-8",
+    )
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        json.dumps(
+            {"n_qpus": 1, "compute_qubits_per_qpu": 2, "comm_qubits_per_qpu": 0}
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = _load_or_random_circuit(
+        input_qasm=str(path), n_logical=None, depth=1, seed=0
+    )
+
+    operation = loaded.data[0].operation
+    assert isinstance(operation, type(get_standard_gate_name_mapping()[expected]))
+    _run(["map", "--input-qasm", str(path), "--config", str(config)])
+
+
+def test_an_opaque_gate_with_another_signature_stays_custom(tmp_path: Path) -> None:
+    path = tmp_path / "odd.qasm"
+    path.write_text(
+        'OPENQASM 2.0;\ninclude "qelib1.inc";\nopaque ecr a;\nqreg q[1];\necr q[0];\n',
+        encoding="utf-8",
+    )
+
+    loaded = _load_or_random_circuit(
+        input_qasm=str(path), n_logical=None, depth=1, seed=0
+    )
+
+    assert loaded.data[0].operation.definition is None
+
+
 @pytest.mark.parametrize("command", ["split", "compile-dist"])
 def test_a_rerun_on_fewer_qpus_leaves_no_stale_programs(
     tmp_path: Path, command: str
