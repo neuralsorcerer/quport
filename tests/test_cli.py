@@ -1531,3 +1531,47 @@ def test_an_opaque_standard_gate_reads_as_qiskits_gate(tmp_path: Path) -> None:
 
     assert isinstance(loaded.data[0].operation, SXGate)
     _run(["map", "--input-qasm", str(path), "--config", str(config)])
+
+
+@pytest.mark.parametrize("command", ["split", "compile-dist"])
+def test_a_rerun_on_fewer_qpus_leaves_no_stale_programs(
+    tmp_path: Path, command: str
+) -> None:
+    """A program written by an earlier run for a QPU the new run lacks was left
+    beside the new bundle, where a consumer globbing the names would read it."""
+    suffix = "_routed" if command == "compile-dist" else ""
+    out_dir = tmp_path / "bundle"
+    for n_qpus in (3, 2):
+        config = tmp_path / f"cfg{n_qpus}.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "n_qpus": n_qpus,
+                    "compute_qubits_per_qpu": 2,
+                    "comm_qubits_per_qpu": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _run(
+            [
+                command,
+                "--n-logical",
+                "4",
+                "--depth",
+                "3",
+                "--seed",
+                "0",
+                "--config",
+                str(config),
+                "--out-dir",
+                str(out_dir),
+            ]
+        )
+    (out_dir / "notes.txt").write_text("mine", encoding="utf-8")
+
+    assert sorted(path.name for path in out_dir.glob("qpu_*.qasm")) == [
+        f"qpu_0{suffix}.qasm",
+        f"qpu_1{suffix}.qasm",
+    ]
+    assert (out_dir / "notes.txt").exists()

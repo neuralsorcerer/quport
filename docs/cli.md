@@ -114,7 +114,9 @@ quport split --n-logical 6 --depth 5 --seed 1 --strategy tpccap --out-dir distri
 ```
 
 Maps a random or `--input-qasm` circuit globally, splits the mapped circuit into
-per-QPU local QASM files, and writes `remote_ops.json`.
+per-QPU local QASM files, and writes `remote_ops.json`. A `qpu_<id>.qasm` an earlier
+run left in the directory, for a QPU this run does not write, is removed, as
+`compile-dist` removes stale `qpu_<id>_routed.qasm` files.
 
 This command is useful for inspecting how a globally routed circuit is decomposed,
 but it is not the preferred distributed-compilation workflow. Prefer `compile-dist`

@@ -2692,3 +2692,34 @@ def test_remote_op_refuses_operands_or_markers_that_disagree(
 
     with pytest.raises(ValueError, match=message):
         dataclasses.replace(op, **change).to_dict()
+
+
+def test_writing_a_bundle_removes_programs_an_earlier_bundle_left() -> None:
+    import tempfile
+
+    from quport.distributed import write_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    out = Path(tempfile.mkdtemp())
+    first = QuantumCircuit(arch.n_phys)
+    first.h(0)
+    first.cx(0, 3)
+    first.x(4)
+    write_distributed_program(split_into_qpus(first, arch), out)
+    (out / "qpu_notes.qasm").write_text("not a program", encoding="utf-8")
+    second = QuantumCircuit(arch.n_phys)
+    second.h(0)
+    second.cx(0, 1)  # QPU 1 now has nothing to do
+
+    written = write_distributed_program(
+        split_into_qpus(second, arch), out, include_empty_circuits=False
+    )
+
+    assert sorted(written) == ["qpu_0", "remote_ops"]
+    assert sorted(path.name for path in out.iterdir()) == [
+        "qpu_0.qasm",
+        "qpu_notes.qasm",
+        "remote_ops.json",
+    ]

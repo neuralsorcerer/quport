@@ -320,6 +320,9 @@ write_distributed_program(program, path, *, include_empty_circuits=True) -> dict
 `write_remote_ops_json` writes a standards-compliant JSON manifest with
 `allow_nan=False`. `write_distributed_program` writes `qpu_<id>.qasm` files and a
 `remote_ops.json` manifest to a directory, validating all artifact inputs before writing.
+A `qpu_<id>.qasm` an earlier bundle left there, for a QPU this one does not write,
+is removed, so the directory holds one bundle: a consumer finds the programs by
+name.
 
 `write_distributed_program` returns a mapping of artifact labels to `Path` objects.
 Keys are stable (`qpu_<id>` and `remote_ops`) so callers can report or post-process

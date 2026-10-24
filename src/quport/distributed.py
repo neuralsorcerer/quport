@@ -10,6 +10,7 @@ import base64
 import json
 import math
 import os
+import re
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
@@ -367,7 +368,9 @@ def write_distributed_program(
     The bundle contains one OpenQASM 3 file per local QPU circuit plus a
     standards-compliant ``remote_ops.json`` manifest.  The returned mapping uses
     stable artifact keys (``qpu_<id>`` and ``remote_ops``) so callers can report
-    or post-process generated files without re-deriving filenames.
+    or post-process generated files without re-deriving filenames.  A
+    ``qpu_<id>.qasm`` an earlier bundle left in the directory, for a QPU this
+    one does not write, is removed: the directory holds one bundle.
     """
     if not isinstance(program, DistributedProgram):
         raise ValueError("program must be a DistributedProgram")
@@ -410,7 +413,34 @@ def write_distributed_program(
     remote_path = out_dir / "remote_ops.json"
     remote_path.write_text(manifest, encoding="utf-8")
     written["remote_ops"] = remote_path
+    _remove_stale_programs(out_dir, written.values())
     return written
+
+
+def _remove_stale_programs(
+    out_dir: _PathLike, written: Iterable[_PathLike], *, suffix: str = ""
+) -> list[Path]:
+    """Remove the per-QPU programs an earlier bundle left in ``out_dir``.
+
+    A consumer finds a bundle's programs by their names, ``qpu_<id><suffix>.qasm``,
+    so one left behind for a QPU the new bundle does not write -- after a run
+    on fewer QPUs, or one that skipped empty programs -- would be read as part
+    of it. Files named so and not among ``written`` are removed; nothing else
+    is touched. Returns the paths removed.
+    """
+    directory = Path(out_dir)
+    keep = {Path(path).resolve() for path in written}
+    pattern = re.compile(rf"qpu_\d+{re.escape(suffix)}\.qasm")
+    removed: list[Path] = []
+    for candidate in sorted(directory.iterdir()):
+        if (
+            pattern.fullmatch(candidate.name)
+            and candidate.is_file()
+            and candidate.resolve() not in keep
+        ):
+            candidate.unlink()
+            removed.append(candidate)
+    return removed
 
 
 #: Prefix of the label QuPort puts on the barriers that mark remote operations.

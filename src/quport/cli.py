@@ -29,7 +29,7 @@ from quport.config import (
     load_config,
     optional_module_available,
 )
-from quport.distributed import write_remote_ops_json
+from quport.distributed import _remove_stale_programs, write_remote_ops_json
 from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
 from quport.interaction import extract_twoq_weights
 from quport.network import build_qpu_graph, topology_metrics
@@ -551,11 +551,13 @@ def split(
     outp.mkdir(parents=True, exist_ok=True)
 
     # write per-QPU QASM3
-    for qpu, c in prog.local_circuits.items():
-        (outp / f"qpu_{qpu}.qasm").write_text(qasm3.dumps(c), encoding="utf-8")
+    programs = [outp / f"qpu_{qpu}.qasm" for qpu in prog.local_circuits]
+    for path, c in zip(programs, prog.local_circuits.values()):
+        path.write_text(qasm3.dumps(c), encoding="utf-8")
 
     # write remote ops
     write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
+    _remove_stale_programs(outp, programs)
 
     _print_path(
         f"Wrote {len(prog.local_circuits)} local circuits and {len(prog.remote_ops)} remote ops to {out_dir}"
@@ -948,8 +950,10 @@ def compile_dist(
     outp = Path(out_dir)
     outp.mkdir(parents=True, exist_ok=True)
 
-    for qpu, c in res.local_routed.items():
-        (outp / f"qpu_{qpu}_routed.qasm").write_text(qasm3.dumps(c), encoding="utf-8")
+    programs = [outp / f"qpu_{qpu}_routed.qasm" for qpu in res.local_routed]
+    for path, c in zip(programs, res.local_routed.values()):
+        path.write_text(qasm3.dumps(c), encoding="utf-8")
+    _remove_stale_programs(outp, programs, suffix="_routed")
 
     # The bundle ships routed programs, so it ships the manifest that matches
     # them: local routing permutes qubits inside a QPU unless the intra-QPU
