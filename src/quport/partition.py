@@ -11,6 +11,7 @@ import math
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Literal, SupportsFloat, SupportsIndex, cast
 
 # The unvalidated e-bit evaluator is used deliberately: the public
@@ -126,6 +127,18 @@ def _coerce_finite_float(value: object, *, label: str) -> float:
     if not math.isfinite(out):
         raise ValueError(f"{label} must be finite")
     return out
+
+
+def _seeded_rng(seed: object) -> random.Random:
+    """A generator for ``seed``: an integer, NumPy's included, or None.
+
+    ``random.Random`` takes ``True`` as seed 1 and refuses a NumPy integer;
+    neither is what a caller means, so both are settled here, as
+    :func:`quport.temporal.optimize_temporal_partition` settles them.
+    """
+    if seed is not None and (is_boolean(seed) or not isinstance(seed, Integral)):
+        raise ValueError("seed must be an integer or None")
+    return random.Random(None if seed is None else int(seed))
 
 
 def _validate_positive_float(value: object, *, label: str) -> float:
@@ -485,7 +498,7 @@ def refine_local_moves(
     seed: int | None = None,
 ) -> tuple[list[int], list[int]]:
     """Greedy refinement: try moving a vertex to another QPU if it reduces cut."""
-    rng = random.Random(seed)
+    rng = _seeded_rng(seed)
     n = len(part)
     n_qpus = len(loads)
 
@@ -824,7 +837,7 @@ def _tpccap_partition_from_normalized(
     congestion_source: CongestionSource = "gates",
 ) -> tuple[PartitionResult, PartitionDiagnostics]:
     """TPCCAP search core operating on validated, normalized weights."""
-    rng = random.Random(seed)
+    rng = _seeded_rng(seed)
 
     base = _balanced_greedy_partition_from_normalized(
         n=n,
@@ -1160,7 +1173,7 @@ def tpccap_sa_partition(
     -------
     (PartitionResult, PartitionDiagnostics, AnnealDiagnostics)
     """
-    rng = random.Random(seed)
+    rng = _seeded_rng(seed)
     steps, temp0, temp_end, p_swap = _validate_sa_parameters(
         steps=steps,
         temp0=temp0,

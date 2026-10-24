@@ -1723,3 +1723,44 @@ def test_tpccap_refuses_none_search_controls_before_searching(control: str) -> N
     sp = all_pairs_shortest_paths([[1], [0]])
     with pytest.raises(ValueError, match=f"{control} must be an integer"):
         tpccap_partition(2, {(0, 1): 1}, 2, 1, 1, sp, **{control: None})
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "tpccap", "tpccap_sa", "ebit"])
+def test_partitioners_take_a_numpy_seed_and_refuse_a_boolean(strategy: str) -> None:
+    """random.Random refused a NumPy integer with TypeError and took True as 1."""
+    import numpy as np
+    from qiskit import QuantumCircuit
+
+    from quport.hypergraph import build_distributable_packets
+    from quport.network import all_pairs_shortest_paths
+    from quport.partition import (
+        balanced_greedy_partition,
+        ebit_partition,
+        tpccap_partition,
+        tpccap_sa_partition,
+    )
+
+    weights = {(0, 1): 1.0, (1, 2): 2.0, (2, 3): 1.0}
+    paths = all_pairs_shortest_paths([[1], [0]])
+    circuit = QuantumCircuit(4)
+    circuit.cx(0, 1)
+    circuit.cx(1, 2)
+    circuit.cx(2, 3)
+    packets = build_distributable_packets(circuit)
+    run = {
+        "balanced": lambda s: balanced_greedy_partition(4, weights, 2, 2, seed=s).part,
+        "tpccap": lambda s: tpccap_partition(4, weights, 2, 2, 1, paths, seed=s)[
+            0
+        ].part,
+        "tpccap_sa": lambda s: tpccap_sa_partition(
+            4, weights, 2, 2, 1, paths, seed=s, steps=10
+        )[0].part,
+        "ebit": lambda s: ebit_partition(4, weights, 2, 2, 1, paths, packets, seed=s)[
+            0
+        ].part,
+    }[strategy]
+
+    assert run(np.int64(3)) == run(3)
+    for bad in (True, 1.5, "3"):
+        with pytest.raises(ValueError, match="seed must be an integer"):
+            run(bad)

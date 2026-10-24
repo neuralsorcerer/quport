@@ -259,7 +259,7 @@ def test_temporal_weight_underflows_to_zero_at_the_documented_step() -> None:
 
     weights = extract_temporal_twoq_weights(circuit, decay=tiny)
 
-    assert weights[(2, 3)] == 0.0
+    assert (2, 3) not in weights  # it was kept as a zero-weight edge
     assert weights[(0, 1)] > 0.0
 
 

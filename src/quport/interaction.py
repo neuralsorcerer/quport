@@ -180,4 +180,6 @@ def extract_temporal_twoq_weights(
         a, b = (i, j) if i < j else (j, i)
         weights[(a, b)] += float(decay_value**t)
         t += 1
-    return dict(weights)
+    # Once decay**t underflows, an edge first seen after that point adds only
+    # zeros; it carries no interaction and is left out of the graph.
+    return {edge: weight for edge, weight in weights.items() if weight > 0.0}
