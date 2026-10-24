@@ -761,3 +761,38 @@ def test_the_linear_estimator_schedules_classical_variables() -> None:
 
     summary = estimate_parallel_makespan(qc, arch, LatencyModel())
     assert summary.remote_ops == 1
+
+
+def test_a_relabelling_inside_one_qpu_leaves_the_makespan_alone() -> None:
+    """A wide gate's teleports were served in order of physical index, so
+    swapping two qubit labels inside one QPU changed which took the link first."""
+    from qiskit import QuantumCircuit
+
+    from quport.aggregation import aggregate_remote_operations
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import LatencyModel, MultiQPUConfig
+    from quport.schedule import estimate_entanglement_schedule
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=2,
+            inter_topology="ring",
+            link_capacity=1,
+        )
+    )
+    spans = []
+    for a, b in ((5, 3), (3, 5)):  # QPU 1 holds 3, 4 and 5
+        qc = QuantumCircuit(arch.n_phys)
+        qc.ccx(0, a, b)
+        qc.cx(b, 0)
+        plan = aggregate_remote_operations(qc, arch)
+        spans.append(
+            (
+                [block.root_phys for block in plan.blocks],
+                estimate_entanglement_schedule(qc, arch, LatencyModel()).makespan,
+            )
+        )
+    assert spans[0][0] == [5, 3, 3] and spans[1][0] == [3, 5, 5]
+    assert spans[0][1] == spans[1][1]

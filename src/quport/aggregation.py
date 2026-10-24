@@ -142,7 +142,8 @@ class AggregationPlan:
     Attributes
     ----------
     blocks:
-        Blocks sorted by ``(start_index, remote_qpu, root_phys)``.
+        Blocks sorted by ``start_index``, then ``remote_qpu``, then the root's
+        position among the operands of the block's first gate.
     remote_gates:
         Cross-QPU operations found in the circuit, whether or not they could be
         served (``unschedulable_gates`` counts the ones that could not).
@@ -547,8 +548,22 @@ def aggregate_remote_operations(
     for key in sorted(open_blocks):
         close(key)
 
+    def operand_position(block: RemoteBlock) -> int:
+        """Where the block's root stands among its first gate's operands."""
+        operands = [qindex[qubit] for qubit in mapped.data[block.start_index].qubits]
+        return operands.index(block.root_phys)
+
+    # Blocks that open at one gate -- the teleports gathering a wide gate's
+    # operands -- go in operand order, not by physical index: the schedule
+    # serves them in plan order, and renumbering qubits inside a QPU must not
+    # change which one takes a shared link first.
     finished.sort(
-        key=lambda block: (block.start_index, block.remote_qpu, block.root_phys)
+        key=lambda block: (
+            block.start_index,
+            block.remote_qpu,
+            operand_position(block),
+            block.root_phys,
+        )
     )
     epr_pairs = sum(block.epr_pairs for block in finished)
 
