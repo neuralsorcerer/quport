@@ -2725,6 +2725,180 @@ def test_writing_a_bundle_removes_programs_an_earlier_bundle_left() -> None:
     ]
 
 
+_SWAP_BASIS = ("rz", "sx", "x", "cx", "swap")
+
+
+def test_markers_stay_in_order_when_routing_could_elide_a_swap() -> None:
+    """From level 2 Qiskit elides a SWAP by renaming every later qubit, which
+    moved a marker off the wire chaining it to the QPU's previous one, and
+    reassembly refused compile_distributed's own routed bundle."""
+    from quport.compiler import compile_distributed
+    from quport.distributed import reassemble_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=3,
+        basis_gates=_SWAP_BASIS,
+    )
+    qc = QuantumCircuit(6)
+    for kind, a, b in [
+        ("swap", 4, 0),
+        ("cx", 3, 4),
+        ("cx", 1, 2),
+        ("cx", 1, 2),
+        ("cx", 3, 4),
+        ("cx", 3, 5),
+        ("swap", 4, 2),
+        ("swap", 1, 5),
+        ("cx", 1, 3),
+    ]:
+        getattr(qc, kind)(a, b)
+    res = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+
+    reassemble_distributed_program(
+        res.physical_circuit,
+        res.local_routed,
+        res.routed_remote_ops,
+        MultiQPUArchitecture(cfg),
+    )
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_a_routed_bundle_holds_its_classical_order_through_an_elided_swap(
+    level: int,
+) -> None:
+    from quport.compiler import compile_distributed
+    from quport.distributed import reassemble_distributed_program
+
+    q = QuantumRegister(6, "q")
+    c = ClassicalRegister(3, "c")
+    qc = QuantumCircuit(q, c)
+    qc.cx(5, 4)
+    with qc.switch(c) as case:
+        with case(0):
+            qc.cx(5, 3)
+        with case(case.DEFAULT):
+            qc.x(5)
+            qc.t(5)
+    qc.measure(2, 0)
+    with qc.if_test((c[0], 0)):
+        qc.measure(2, 2)
+        qc.x(0)
+    qc.cx(5, 4)
+    qc.measure(1, 1)
+    qc.measure(4, 1)
+    qc.swap(2, 5)
+    qc.cx(2, 3)
+    qc.measure(3, 0)
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=2,
+        intra_topology="line",
+        inter_topology="ring",
+        optimization_level=level,
+        basis_gates=_SWAP_BASIS,
+    )
+    res = compile_distributed(qc, cfg, seed=196, strategy="balanced")
+
+    reassemble_distributed_program(
+        res.physical_circuit,
+        res.local_routed,
+        res.routed_remote_ops,
+        MultiQPUArchitecture(cfg),
+    )
+
+
+def _later_measurement_decides() -> QuantumCircuit:
+    """Two measurements into c[0] on one qubit; the later reads H|0>."""
+    qc = QuantumCircuit(4, 1)
+    qc.swap(0, 1)
+    qc.ccx(2, 0, 3)
+    qc.measure(3, 0)  # always 0
+    qc.swap(3, 0)
+    qc.h(3)
+    qc.measure(3, 0)  # 50/50, and the one that must decide c[0]
+    return qc
+
+
+def _counts(circuit: QuantumCircuit) -> dict[str, int]:
+    from qiskit import transpile
+    from qiskit.providers.basic_provider import BasicSimulator
+
+    simulator = BasicSimulator()
+    return dict(
+        simulator.run(transpile(circuit, simulator), shots=400, seed_simulator=7)
+        .result()
+        .get_counts()
+    )
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_routing_keeps_measurements_on_one_qubit_in_order_past_an_elided_swap(
+    level: int,
+) -> None:
+    """The two measurements share a wire, so no tie was added; the elided SWAP
+    then moved the later one off it, and the earlier outcome decided c[0]."""
+    from quport.compiler import compile_distributed
+    from quport.pipeline import map_and_transpile, transpile_baseline
+
+    qc = _later_measurement_decides()
+    small = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=3,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=level,
+        basis_gates=_SWAP_BASIS,
+    )
+    wide = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=4,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=level,
+        basis_gates=_SWAP_BASIS,
+    )
+    routed = compile_distributed(qc, wide, seed=37, strategy="balanced").local_routed
+    outputs = [
+        transpile_baseline(qc, small, seed=37).mapped_circuit,
+        map_and_transpile(qc, small, seed=37, strategy="balanced").mapped_circuit,
+        max(routed.values(), key=lambda circuit: len(circuit.data)),
+    ]
+
+    for output in outputs:
+        counts = _counts(output)
+        assert set(counts) == {"0", "1"}, counts
+        assert min(counts.values()) > 120, counts
+
+
+def test_routing_without_a_held_order_is_plain_transpile() -> None:
+    """Only a circuit holding markers or ties is routed differently."""
+    from qiskit import qasm3, transpile
+    from qiskit.transpiler import CouplingMap
+
+    from quport.distributed import _route_keeping_order
+    from quport.pipeline import random_benchmark_circuit
+
+    qc = random_benchmark_circuit(5, 6, 3)
+    options = dict(
+        coupling_map=CouplingMap.from_line(5),
+        initial_layout=list(range(5)),
+        basis_gates=list(_SWAP_BASIS),
+        optimization_level=3,
+        layout_method="trivial",
+        routing_method="sabre",
+        seed_transpiler=3,
+    )
+
+    assert qasm3.dumps(_route_keeping_order(qc, **options)) == qasm3.dumps(
+        transpile(qc, **options)
+    )
+
+
 def test_reassembly_takes_operands_and_markers_as_lists() -> None:
     """A manifest rebuilt from JSON holds lists; reassembly compared them
     with tuples and called the manifest mismatched."""

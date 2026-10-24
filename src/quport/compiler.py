@@ -47,6 +47,7 @@ from quport.distributed import (
     RemoteOp,
     _hold_cross_qpu_order,
     _release_order_barriers,
+    _route_keeping_order,
     remap_remote_ops_to_routed,
     split_into_qpus,
 )
@@ -340,7 +341,7 @@ def compile_distributed(
     held = _hold_cross_qpu_order(program, physical, arch)
     for qpu_id, local_qc in held.items():
         cm_intra = arch.build_intra_coupling_map(qpu_id)
-        routed = transpile(
+        routed = _route_keeping_order(
             local_qc,
             coupling_map=cm_intra,
             initial_layout=identity_layout,

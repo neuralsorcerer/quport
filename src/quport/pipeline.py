@@ -33,7 +33,11 @@ from quport._validation import validate_nonnegative_integral
 from quport.architecture import MultiQPUArchitecture
 from quport.config import InterTopology, IntraTopology, LatencyModel, MultiQPUConfig
 from quport.cost import CostBreakdown, estimate_cost
-from quport.distributed import _hold_measurement_order, _release_order_barriers
+from quport.distributed import (
+    _hold_measurement_order,
+    _release_order_barriers,
+    _route_keeping_order,
+)
 from quport.entanglement import is_standard_gate, is_standard_namesake
 from quport.hypergraph import build_distributable_packets
 from quport.interaction import (
@@ -434,7 +438,7 @@ def _route_globally(
     # Qiskit's routing stage can swap two final measurements into one bit.
     held = _hold_measurement_order(qc)
     try:
-        routed = transpile(
+        routed = _route_keeping_order(
             held,
             coupling_map=coupling,
             initial_layout=list(initial_layout),

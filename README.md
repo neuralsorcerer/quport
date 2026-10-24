@@ -1686,6 +1686,15 @@ puts them back in qubit order, which can swap two final measurements into the sa
 bit and leave the earlier outcome in it. Every QuPort pipeline ties such
 measurements together while it routes, so the later one still decides the bit.
 
+These ties, and the chain that keeps a QPU's markers in order, are barriers, and
+a barrier orders only the wires it sits on. From `optimization_level` 2, Qiskit
+elides a SWAP -- a `swap` gate when `basis_gates` keeps one, or a block of gates
+equivalent to one -- by renaming every later qubit instead, which would move
+later operations off those wires. A circuit holding markers or ties is therefore
+routed by Qiskit's own preset pass manager for the same settings, with those two
+permutations switched off; such a SWAP stays a SWAP. Any other circuit is
+transpiled exactly as before.
+
 Schedule artifacts are written with `allow_nan=False`, so non-finite values are
 rejected instead of being emitted as Python-specific `NaN`/`Infinity` tokens.
 

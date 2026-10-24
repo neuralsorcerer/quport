@@ -19,7 +19,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, TypeAlias
 
-from qiskit import QuantumCircuit, QuantumRegister
+from qiskit import QuantumCircuit, QuantumRegister, transpile
 from qiskit.circuit import Barrier, ControlFlowOp, Measure, Store
 
 from quport.architecture import MultiQPUArchitecture
@@ -1498,8 +1498,10 @@ def _with_order_ties(
     unrolls a custom instruction into pieces on fewer qubits, either of which
     can cut a tie through a single qubit. Whatever survives of an instruction
     still touches the barrier, and one left with no qubit at all is ordered by
-    its classical bits alone. Two instructions that share a qubit and that
-    routing keeps whole -- markers and measurements -- are already ordered by it.
+    its classical bits alone. Two markers that share a qubit are already ordered
+    by it, since a circuit holding markers is routed keeping its wires (see
+    :func:`_route_keeping_order`); two measurements on one qubit are tied all
+    the same, because without a tie or a marker nothing keeps that wire.
     """
     out = circuit.copy_empty_like()
     previous_event: Any = None
@@ -1539,16 +1541,72 @@ def _with_order_ties(
 
 
 def _ordered_by_a_shared_wire(first: Any, second: Any) -> bool:
-    """True when routing cannot separate two instructions it keeps whole."""
+    """True for two markers on a common qubit, which routing keeps in order.
 
-    def whole(operation: Any) -> bool:
-        return _is_barrier(operation) or isinstance(operation, Measure)
-
+    Routing keeps a marker whole, and routes a circuit holding one without the
+    permutations that would move later operations off the shared wire.
+    """
     return (
-        whole(first.operation)
-        and whole(second.operation)
+        _is_barrier(first.operation)
+        and _is_barrier(second.operation)
         and not set(first.qubits).isdisjoint(second.qubits)
     )
+
+
+def _holds_wire_order(circuit: QuantumCircuit) -> bool:
+    """True when ``circuit`` carries an order that only its wires encode.
+
+    That is a remote marker -- the markers on one QPU are chained through a
+    shared qubit -- or a tie the hold functions added.
+    """
+    return any(
+        _is_barrier(instruction.operation)
+        and (
+            _remote_barrier_ordinal(instruction.operation) is not None
+            or getattr(instruction.operation, "label", None) == _ORDER_BARRIER_LABEL
+        )
+        for instruction in circuit.data
+    )
+
+
+def _route_keeping_order(circuit: QuantumCircuit, **options: Any) -> QuantumCircuit:
+    """Transpile ``circuit`` as ``transpile(circuit, **options)`` does, keeping
+    the order its barriers encode.
+
+    From optimization level 2, Qiskit's init stage elides a SWAP -- a gate, or
+    a block equivalent to one -- by renaming every later qubit instead. That is
+    exact for the state, but it moves the later operations onto other wires,
+    and an order encoded through a shared wire is cut: a QPU's remote markers
+    can then be routed out of order, and two measurements into one bit put
+    back the wrong way round. A circuit that holds such an order is routed by
+    the same preset pass manager with those two permutations switched off; any
+    other is transpiled unchanged.
+    """
+    if not _holds_wire_order(circuit):
+        return transpile(circuit, **options)
+
+    from qiskit.transpiler import PassManager
+    from qiskit.transpiler.passes import ElidePermutations, Split2QUnitaries
+    from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+    manager = generate_preset_pass_manager(**options)
+    if manager.init is not None:
+        tasks = []
+        for task in manager.init.to_flow_controller().tasks:
+            if isinstance(task, ElidePermutations):
+                continue
+            if isinstance(task, Split2QUnitaries):
+                task.split_swap = False
+            elif hasattr(task, "tasks"):
+                # Qiskit's init stage is a flat list of passes; a nested one
+                # could hide a permutation this does not reach.
+                raise RuntimeError(
+                    "this Qiskit version nests its init stage; QuPort cannot "
+                    "route it without the passes that elide permutations"
+                )
+            tasks.append(task)
+        manager.init = PassManager(tasks)
+    return manager.run(circuit)
 
 
 def _release_order_barriers(circuit: QuantumCircuit) -> QuantumCircuit:
