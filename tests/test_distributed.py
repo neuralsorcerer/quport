@@ -2723,3 +2723,29 @@ def test_writing_a_bundle_removes_programs_an_earlier_bundle_left() -> None:
         "qpu_notes.qasm",
         "remote_ops.json",
     ]
+
+
+def test_reassembly_takes_operands_and_markers_as_lists() -> None:
+    """A manifest rebuilt from JSON holds lists; reassembly compared them
+    with tuples and called the manifest mismatched."""
+    import dataclasses
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    program = split_into_qpus(mapped, arch)
+    listed = [
+        dataclasses.replace(
+            op,
+            operands=[list(pair) for pair in op.operands],  # type: ignore[arg-type]
+            markers=[list(pair) for pair in op.markers],  # type: ignore[arg-type]
+        )
+        for op in program.remote_ops
+    ]
+
+    reassemble_distributed_program(mapped, program.local_circuits, listed, arch)

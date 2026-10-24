@@ -523,12 +523,12 @@ def remap_remote_ops_to_routed(
     Returns
     -------
     list[RemoteOp]
-        The same operations, in the same order, with ``q0_phys`` and ``q1_phys``
-        replaced by their post-routing positions, and ``qpu0_marker`` and
-        ``qpu1_marker`` by where each marker now sits among the routed
-        program's barriers -- routing can move a marker past another barrier.
-        Every other field, including the global instruction ``index``, is
-        unchanged.
+        The same operations, in the same order, with ``q0_phys``, ``q1_phys``
+        and ``operands`` replaced by their post-routing positions, and
+        ``qpu0_marker``, ``qpu1_marker`` and ``markers`` by where each marker
+        now sits among the routed program's barriers -- routing can move a
+        marker past another barrier. Every other field, including the global
+        instruction ``index``, is unchanged.
 
     Raises
     ------
@@ -643,7 +643,7 @@ def reassemble_distributed_program(
     run in either order, and routing routinely emits them in an order that
     differs from the manifest's. Merging therefore follows qubit dataflow --
     an instruction runs once it is first in line on every qubit it touches --
-    and a remote operation runs once its marker leads on both sides.
+    and a remote operation runs once its marker leads on every QPU it involves.
 
     Classical bits are dataflow too, and they cross QPUs: a conditional on one
     QPU can read a bit measured on another. The per-QPU programs do not record
@@ -1046,9 +1046,11 @@ def _remote_operands(
                 f"{len(marked)} qubits, more than the operation uses there"
             )
 
-    if op.operands and list(op.operands) != list(zip(source_qpus, operands)):
+    # A manifest rebuilt from JSON holds lists where split_into_qpus holds tuples.
+    named = [tuple(pair) for pair in op.operands]
+    if named and named != list(zip(source_qpus, operands)):
         raise ValueError(
-            f"remote operation {ordinal} names operands {list(op.operands)}, but "
+            f"remote operation {ordinal} names operands {named}, but "
             f"the programs put them on {list(zip(source_qpus, operands))}; the "
             "manifest does not match these programs"
         )
