@@ -1923,6 +1923,18 @@ def _serialised_qubit_time(
     return max(load, default=0.0)
 
 
+def _budget_over(count: int, makespan: float) -> float:
+    """``count * makespan``: the busy time ``count`` channels can accrue.
+
+    A budget beyond float range -- the documented way to lift a constraint is
+    a large one -- allows unbounded busy time.
+    """
+    try:
+        return float(count) * makespan
+    except OverflowError:
+        return math.inf
+
+
 def audit_entanglement_schedule(
     summary: EntanglementScheduleSummary,
     mapped: QuantumCircuit,
@@ -1987,16 +1999,18 @@ def audit_entanglement_schedule(
                 f"QPU {qpu} holds {peak} cat copies at once, budget is {ports[qpu]}"
             )
     for qpu, busy in enumerate(summary.port_busy_time[:n_qpus]):
-        if busy > ports[qpu] * makespan + 1e-6:
+        allowed = _budget_over(ports[qpu], makespan)
+        if busy > allowed + 1e-6:
             problems.append(
                 f"QPU {qpu} accrues {busy} port-busy time, but {ports[qpu]} ports "
-                f"over a {makespan} makespan allow at most {ports[qpu] * makespan}"
+                f"over a {makespan} makespan allow at most {allowed}"
             )
     for edge, busy in summary.link_busy_time:
-        if busy > link_cap * makespan + 1e-6:
+        allowed = _budget_over(link_cap, makespan)
+        if busy > allowed + 1e-6:
             problems.append(
                 f"link {edge} accrues {busy} busy time, but {link_cap} channels "
-                f"over a {makespan} makespan allow at most {link_cap * makespan}"
+                f"over a {makespan} makespan allow at most {allowed}"
             )
 
     total_link = math.fsum(busy for _edge, busy in summary.link_busy_time)

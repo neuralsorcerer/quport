@@ -194,3 +194,19 @@ def test_swap_is_charged_as_an_increment_over_the_two_qubit_cost() -> None:
     assert swap_cost.local == pytest.approx(model.twoq + model.swap)
     assert cx_cost.local == pytest.approx(model.twoq)
     assert swap_cost.local - cx_cost.local == pytest.approx(model.swap)
+
+
+def test_a_count_beyond_float_range_is_a_value_error() -> None:
+    """The finiteness check never ran: converting the count overflowed first."""
+    from quport.config import LatencyModel
+    from quport.cost import estimate_cost
+    from quport.metrics import CircuitMetrics
+
+    huge = 10**400
+    metrics = CircuitMetrics(swaps=0, depth=0, size=0, n_1q=huge, n_2q=0, remote_2q=0)
+    with pytest.raises(ValueError, match="n_1q is too large"):
+        estimate_cost(metrics, LatencyModel())
+    with pytest.raises(ValueError, match="n_1q is too large"):
+        LatencyModel().estimate_latency(huge, 0, 0, 0)
+    with pytest.raises(ValueError, match="hops is too large"):
+        LatencyModel().expected_epr_time(huge)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from quport._validation import (
+    float_count,
     validate_finite_result,
     validate_nonnegative_finite_float,
     validate_nonnegative_integral,
@@ -26,11 +27,16 @@ class CostBreakdown:
 
 
 def estimate_cost(metrics: CircuitMetrics, model: LatencyModel) -> CostBreakdown:
-    n_1q = validate_nonnegative_integral(metrics.n_1q, label="n_1q")
-    n_2q = validate_nonnegative_integral(metrics.n_2q, label="n_2q")
-    swaps = validate_nonnegative_integral(metrics.swaps, label="swaps")
-    remote_2q = validate_nonnegative_integral(metrics.remote_2q, label="remote_2q")
-    depth = validate_nonnegative_integral(metrics.depth, label="depth")
+    n_1q, n_2q, swaps, remote_2q, depth = (
+        float_count(validate_nonnegative_integral(value, label=label), label=label)
+        for value, label in (
+            (metrics.n_1q, "n_1q"),
+            (metrics.n_2q, "n_2q"),
+            (metrics.swaps, "swaps"),
+            (metrics.remote_2q, "remote_2q"),
+            (metrics.depth, "depth"),
+        )
+    )
     validate_nonnegative_integral(metrics.size, label="size")
 
     oneq = validate_nonnegative_finite_float(model.oneq, label="oneq")

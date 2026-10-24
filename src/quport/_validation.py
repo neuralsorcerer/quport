@@ -48,6 +48,18 @@ def validate_nonnegative_finite_float(value: object, *, label: str) -> float:
     return out
 
 
+def float_count(value: int, *, label: str) -> float:
+    """Return a validated count as a float, refusing one beyond float range.
+
+    A count is any non-negative integer, but the cost formulas multiply it by a
+    float, and an integer above about 1.8e308 cannot be converted at all.
+    """
+    try:
+        return float(value)
+    except OverflowError:
+        raise ValueError(f"{label} is too large to compute with") from None
+
+
 def validate_finite_result(value: float, *, label: str) -> float:
     """Return a computed result only if it remains finite."""
     if not math.isfinite(value):

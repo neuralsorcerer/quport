@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from quport._validation import (
+    float_count,
     validate_finite_result,
     validate_nonnegative_finite_float,
     validate_nonnegative_integral,
@@ -227,7 +228,9 @@ class LatencyModel:
         elementary generation cost is charged per hop and scaled by the expected
         attempt count ``1 / epr_success_prob``.
         """
-        hops_value = validate_nonnegative_integral(hops, label="hops")
+        hops_value = float_count(
+            validate_nonnegative_integral(hops, label="hops"), label="hops"
+        )
         epr_gen = validate_nonnegative_finite_float(self.epr_gen, label="epr_gen")
         success = validate_epr_success_prob(self.epr_success_prob)
         return validate_finite_result(
@@ -237,10 +240,15 @@ class LatencyModel:
     def estimate_latency(
         self, n_1q: int, n_2q: int, swaps: int, remote_2q: int, depth: int | None = None
     ) -> float:
-        n_1q_value = validate_nonnegative_integral(n_1q, label="n_1q")
-        n_2q_value = validate_nonnegative_integral(n_2q, label="n_2q")
-        swaps_value = validate_nonnegative_integral(swaps, label="swaps")
-        remote_2q_value = validate_nonnegative_integral(remote_2q, label="remote_2q")
+        n_1q_value, n_2q_value, swaps_value, remote_2q_value = (
+            float_count(validate_nonnegative_integral(value, label=label), label=label)
+            for value, label in (
+                (n_1q, "n_1q"),
+                (n_2q, "n_2q"),
+                (swaps, "swaps"),
+                (remote_2q, "remote_2q"),
+            )
+        )
 
         oneq = validate_nonnegative_finite_float(self.oneq, label="oneq")
         twoq = validate_nonnegative_finite_float(self.twoq, label="twoq")
@@ -257,7 +265,9 @@ class LatencyModel:
         remote = remote_2q_value * (epr_gen + classical_rtt + remote_gate_overhead)
         # Optionally include depth as a soft penalty
         if depth is not None:
-            depth_value = validate_nonnegative_integral(depth, label="depth")
+            depth_value = float_count(
+                validate_nonnegative_integral(depth, label="depth"), label="depth"
+            )
             base += 0.1 * depth_value * twoq
         return validate_finite_result(base + remote, label="estimated latency")
 

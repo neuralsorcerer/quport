@@ -796,3 +796,39 @@ def test_a_relabelling_inside_one_qpu_leaves_the_makespan_alone() -> None:
         )
     assert spans[0][0] == [5, 3, 3] and spans[1][0] == [3, 5, 5]
     assert spans[0][1] == spans[1][1]
+
+
+@pytest.mark.parametrize("field", ["ports", "link_capacity"])
+def test_the_audit_takes_a_budget_beyond_float_range(field: str) -> None:
+    """A large budget is the documented way to lift a constraint; one beyond
+    float range crashed the audit with OverflowError."""
+    from qiskit import QuantumCircuit
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import LatencyModel, MultiQPUConfig
+    from quport.schedule import (
+        audit_entanglement_schedule,
+        estimate_entanglement_schedule,
+    )
+
+    huge = 10**400
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        link_capacity=huge if field == "link_capacity" else 1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    qc = QuantumCircuit(arch.n_phys)
+    qc.cx(0, 2)
+    ports = huge if field == "ports" else None
+    summary = estimate_entanglement_schedule(
+        qc, arch, LatencyModel(), ports_per_qpu=ports
+    )
+
+    assert (
+        audit_entanglement_schedule(
+            summary, qc, arch, LatencyModel(), ports_per_qpu=ports
+        )
+        == ()
+    )
