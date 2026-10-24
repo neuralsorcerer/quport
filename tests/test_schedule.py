@@ -2616,3 +2616,139 @@ def test_only_qiskits_swap_is_charged_swap_latency() -> None:
             qc.append(gate, [0, 1])
         for estimate in _all_estimators():
             assert estimate(qc, arch, model).makespan == expected  # type: ignore[operator]
+
+
+def test_audit_refuses_a_round_over_the_switch_pair_budget() -> None:
+    """Two distinct pairs merged into one round on a 1-pair switch passed."""
+    import dataclasses
+
+    from quport.schedule import audit_topology_schedule_plan
+
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="switch",
+        switch_parallel_links=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    model = LatencyModel()
+    qc = QuantumCircuit(arch.n_phys)
+    qc.cx(0, 2)  # QPUs 0-1
+    qc.cx(4, 6)  # QPUs 2-3, same layer
+    plan = estimate_topology_schedule_plan(qc, arch, model)
+    assert audit_topology_schedule_plan(plan, arch, model, mapped=qc) == ()
+
+    layer = plan.layers[0]
+    first, second = layer.remote_rounds
+    merged = dataclasses.replace(
+        first,
+        qpu_pairs=first.qpu_pairs + second.qpu_pairs,
+        qpu_ports_used=tuple(
+            a + b for a, b in zip(first.qpu_ports_used, second.qpu_ports_used)
+        ),
+        link_utilization=tuple(
+            sorted(first.link_utilization + second.link_utilization)
+        ),
+    )
+    tampered = dataclasses.replace(
+        plan,
+        layers=(
+            dataclasses.replace(
+                layer,
+                remote_rounds=(merged,),
+                duration=merged.duration,
+                end_time=layer.start_time + merged.duration,
+            ),
+        ),
+        summary=dataclasses.replace(
+            plan.summary, makespan=merged.duration, remote_rounds=1
+        ),
+    )
+
+    problems = audit_topology_schedule_plan(tampered, arch, model, mapped=qc)
+    assert any("switch budget is 1" in problem for problem in problems)
+
+
+def test_audit_refuses_a_penalty_round_for_a_servable_operation() -> None:
+    """A penalty round stands only for what no port, link or route can serve;
+    turning a servable cx into one took the makespan from 260 to 1e9 unnoticed."""
+    import dataclasses
+
+    from quport.schedule import UNSCHEDULABLE_PENALTY, audit_topology_schedule_plan
+
+    model = LatencyModel()
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(
+            n_qpus=2,
+            compute_qubits_per_qpu=1,
+            comm_qubits_per_qpu=1,
+            inter_topology="ring",
+        )
+    )
+    qc = QuantumCircuit(arch.n_phys)
+    qc.cx(0, 2)
+    plan = estimate_topology_schedule_plan(qc, arch, model)
+    layer = plan.layers[0]
+    (served,) = layer.remote_rounds
+    penalty = dataclasses.replace(
+        served,
+        duration=UNSCHEDULABLE_PENALTY,
+        unschedulable_ops=1,
+        qpu_ports_used=(0, 0),
+        link_utilization=(),
+        end_time=served.start_time + UNSCHEDULABLE_PENALTY,
+    )
+    tampered = dataclasses.replace(
+        plan,
+        layers=(
+            dataclasses.replace(
+                layer,
+                remote_rounds=(penalty,),
+                duration=UNSCHEDULABLE_PENALTY,
+                end_time=layer.start_time + UNSCHEDULABLE_PENALTY,
+            ),
+        ),
+        summary=dataclasses.replace(
+            plan.summary,
+            makespan=UNSCHEDULABLE_PENALTY,
+            peak_link_util=0,
+            peak_qpu_ports_used=0,
+        ),
+    )
+
+    problems = audit_topology_schedule_plan(tampered, arch, model, mapped=qc)
+    assert any("are there to serve" in problem for problem in problems)
+
+
+def test_audit_refuses_a_penalty_round_that_claims_resources() -> None:
+    import dataclasses
+
+    from quport.schedule import audit_topology_schedule_plan
+
+    model = LatencyModel()
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0)
+    )
+    qc = QuantumCircuit(arch.n_phys)
+    qc.cx(0, 1)
+    plan = estimate_topology_schedule_plan(qc, arch, model)
+    assert audit_topology_schedule_plan(plan, arch, model, mapped=qc) == ()
+    layer = plan.layers[0]
+    (penalty,) = layer.remote_rounds
+    claiming = dataclasses.replace(penalty, link_utilization=(((0, 1), 0),))
+    tampered = dataclasses.replace(
+        plan, layers=(dataclasses.replace(layer, remote_rounds=(claiming,)),)
+    )
+
+    problems = audit_topology_schedule_plan(tampered, arch, model, mapped=qc)
+    assert any("places nothing" in problem for problem in problems)
+
+
+def test_validate_network_limits_reports_a_bad_port_count_as_a_value_error() -> None:
+    from quport.schedule import validate_network_limits
+
+    with pytest.raises(ValueError, match="comm_qubits_per_qpu"):
+        validate_network_limits(
+            MultiQPUConfig(inter_topology="clos", comm_qubits_per_qpu="2")  # type: ignore[arg-type]
+        )

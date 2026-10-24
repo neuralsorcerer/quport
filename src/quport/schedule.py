@@ -630,8 +630,11 @@ def _network_limits(cfg: MultiQPUConfig) -> _NetworkLimits:
     link_capacity = _validated_nonnegative_int(
         getattr(cfg, "link_capacity", 1), label="link_capacity"
     )
+    ports = _validated_nonnegative_int(
+        cfg.comm_qubits_per_qpu, label="comm_qubits_per_qpu"
+    )
     switch_like = cfg.inter_topology in ("switch", "mesh") or (
-        cfg.inter_topology == "clos" and cfg.comm_qubits_per_qpu >= 2
+        cfg.inter_topology == "clos" and ports >= 2
     )
     switch_parallel_links = 1_000_000
     switch_reconfig_delay = 0.0
@@ -1097,8 +1100,11 @@ def audit_topology_schedule_plan(
     - a layer lasts ``max(local_duration, sum of its round durations)``;
     - each round's ``qpu_ports_used`` and ``link_utilization`` are exactly what
       routing its ``qpu_pairs`` over shortest paths consumes, and neither exceeds
-      ``comm_qubits_per_qpu`` or ``link_capacity``;
+      ``comm_qubits_per_qpu`` or ``link_capacity``; on a switch-like fabric a
+      round also holds at most ``switch_parallel_links`` distinct pairs;
     - each round lasts as long as its slowest placed operation;
+    - a penalty round stands only for an operation no port, link, or route
+      could serve, and consumes no port or link;
     - the six summary fields agree with the trace they summarise.
 
     Passing ``mapped`` adds the one check that needs the circuit: that the plan
@@ -1127,6 +1133,13 @@ def audit_topology_schedule_plan(
     link_cap = limits.link_capacity
     reconfig = limits.switch_reconfig_delay
     classical_eff = _effective_classical_rtt(cfg, lat)
+    # The estimator places a remote operation unless one of these holds; only
+    # then does it charge a penalty round instead.
+    nothing_serves = (
+        ports <= 0
+        or link_cap == 0
+        or (limits.switch_like and limits.switch_parallel_links == 0)
+    )
 
     problems: list[str] = []
 
@@ -1217,6 +1230,19 @@ def audit_topology_schedule_plan(
                         f"{spot}: names {len(rnd.qpu_pairs)} pairs for "
                         f"{rnd.unschedulable_ops} unschedulable operations"
                     )
+                elif not nothing_serves and all(
+                    sp.dist[a][b] < UNREACHABLE_DISTANCE for a, b in rnd.qpu_pairs
+                ):
+                    problems.append(
+                        f"{spot}: is a penalty round for {list(rnd.qpu_pairs)}, which "
+                        "a port, a link and a route are there to serve"
+                    )
+                if any(rnd.qpu_ports_used) or rnd.link_utilization:
+                    problems.append(
+                        f"{spot}: a penalty round places nothing, but reports ports "
+                        f"{list(rnd.qpu_ports_used)} and links "
+                        f"{list(rnd.link_utilization)}"
+                    )
             elif not rnd.qpu_pairs:
                 # The estimator only closes a round once it has placed an
                 # operation, so a real round with none can only be padding.
@@ -1234,6 +1260,12 @@ def audit_topology_schedule_plan(
                     f"{list(rnd.qpu_pairs)}; only a penalty round can stand for it"
                 )
             else:
+                distinct = len({tuple(sorted(pair)) for pair in rnd.qpu_pairs})
+                if limits.switch_like and distinct > limits.switch_parallel_links:
+                    problems.append(
+                        f"{spot}: holds {distinct} distinct QPU pairs, the switch "
+                        f"budget is {limits.switch_parallel_links}"
+                    )
                 expected_ports = [0] * n_qpus
                 expected_link: dict[QpuEdge, int] = {}
                 worst = 0.0
