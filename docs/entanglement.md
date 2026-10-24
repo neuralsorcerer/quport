@@ -258,7 +258,8 @@ leave the reduced state mixed and the fidelity below one.
 This is what makes the diagonality rule a tested property rather than a stated
 assumption. A hand-built plan that keeps a cat copy live across an `X` on its
 root — exactly what `aggregate_remote_operations` refuses to emit — drives the
-fidelity to zero, not merely down.
+fidelity far below one, not merely down: to 0.002 with the default input seed,
+and no higher than 0.72 for any seed from 0 to 19.
 
 The command-line examples on this page use a small architecture -- four QPUs of
 three qubits each -- saved as `small.json`:

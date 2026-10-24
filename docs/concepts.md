@@ -193,8 +193,10 @@ QuPort exposes four schedule estimators:
 
 The first three charge one entanglement transaction per cross-QPU gate, and the
 layered and topology-aware estimators also slice the circuit into DAG layers, which
-imposes a global barrier between layers. The fourth does neither, so its makespan is
-usually well below the others on the same circuit; the two families answer different
+imposes a global barrier between layers. The fourth does neither, but holds comm
+ports and links for as long as each block lasts, so its makespan can land on either
+side of theirs: often well below, and above them when a single comm port per QPU,
+the default, makes blocks wait for each other. The two families answer different
 questions and should not be mixed inside one comparison. See
 [Entanglement model](entanglement.md).
 

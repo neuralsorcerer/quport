@@ -87,8 +87,9 @@ def test_verification_fails_when_a_block_spans_a_non_diagonal_root_gate() -> Non
 
     A hand-built plan that keeps one cat copy live across an ``X`` on its root
     is exactly what :mod:`quport.aggregation` refuses to emit. Feeding it in
-    anyway drives the fidelity to zero, which is the evidence that the rule
-    :mod:`quport.entanglement` enforces is the right one.
+    anyway drives the fidelity far below one -- to 0.002 with the default seed,
+    and no higher than 0.72 for seeds 0 to 19 -- which is the evidence that the
+    rule :mod:`quport.entanglement` enforces is the right one.
     """
     arch = _arch(compute=2)
     qc = QuantumCircuit(arch.n_phys)
@@ -120,6 +121,10 @@ def test_verification_fails_when_a_block_spans_a_non_diagonal_root_gate() -> Non
         peak_cat_copies=(0, 1),
     )
     assert not verify_telegate_equivalence(qc, arch, forced)
+    # The figures README quotes: atol=0.99 accepts any fidelity of 0.01 or more.
+    assert not verify_telegate_equivalence(qc, arch, forced, atol=0.99)
+    for seed in range(20):
+        assert not verify_telegate_equivalence(qc, arch, forced, seed=seed, atol=0.28)
 
 
 def test_diagonal_root_gates_inside_a_block_are_safe() -> None:

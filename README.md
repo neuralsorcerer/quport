@@ -683,7 +683,8 @@ unentangled — residual entanglement would show up as a mixed reduced state.
 That check is what makes the diagonality rule a tested property rather than a
 stated assumption. Feeding in a hand-built plan that keeps a cat copy live
 across an `X` on its root — precisely what `aggregate_remote_operations` refuses
-to emit — sends the fidelity to zero, not merely down a little
+to emit — sends the fidelity far below one, not merely down a little: to 0.002
+with the default input seed, and no higher than 0.72 for any seed from 0 to 19
 (`tests/test_protocol.py::test_verification_fails_when_a_block_spans_a_non_diagonal_root_gate`).
 
 ### Measured effect
@@ -1081,9 +1082,13 @@ window. It returns:
 - `peak_ports_in_use`, `port_busy_time`, and `qpu_busy_time` per QPU;
 - `link_busy_time` per inter-QPU link.
 
-Because it neither serializes independent QPUs nor pays per gate, its makespan is
-typically well below the topology-aware figure on the same circuit; the two answer
-different questions and should not be mixed inside one comparison.
+It neither serializes independent QPUs nor pays per gate, but it holds comm ports
+and links for as long as each block lasts, so its makespan is not bounded by the
+topology-aware figure in either direction. It is often well below it; with one comm
+port per QPU, the default, contention can put it above -- run, the `compile-dist`
+example under "Distributed compile" below prints an entanglement-aware makespan of
+124,100 against a topology-aware 118,618. The two answer different questions and
+should not be mixed inside one comparison.
 
 ---
 

@@ -259,9 +259,10 @@ operation metadata. Local one-qubit and intra-QPU two-qubit operations are appen
 to the owning QPU circuit. Cross-QPU operations become `RemoteOp` entries and
 barriers are inserted on involved local circuits to mark synchronization points.
 
-Zero-qubit operations are broadcast to all local circuits unless they are barriers,
-which are represented as barriers. Multi-qubit operations that span multiple QPUs
-are conservatively represented as remote composite operations.
+A zero-qubit barrier becomes a barrier on every local circuit. Any other operation
+that acts on no qubit goes to QPU 0's circuit only, so it still runs once.
+Multi-qubit operations that span multiple QPUs are conservatively represented as
+remote composite operations.
 
 ### `DistributedProgram`
 
