@@ -2752,3 +2752,66 @@ def test_validate_network_limits_reports_a_bad_port_count_as_a_value_error() -> 
         validate_network_limits(
             MultiQPUConfig(inter_topology="clos", comm_qubits_per_qpu="2")  # type: ignore[arg-type]
         )
+
+
+def test_audit_refuses_a_penalty_round_folding_several_operations() -> None:
+    """The estimator charges one penalty round per operation it cannot place.
+    Folding a servable operation into an unservable one's penalty round, or
+    two unservable ones into one, understated the makespan and passed."""
+    import dataclasses
+
+    from quport.schedule import (
+        audit_topology_schedule_plan,
+        estimate_topology_schedule_plan,
+    )
+
+    cfg = MultiQPUConfig(
+        n_qpus=4,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        inter_topology="degree_d",
+        inter_degree=1,
+    )
+    arch = MultiQPUArchitecture(cfg)
+    lat = LatencyModel()
+    sp = arch.qpu_shortest_paths()
+    assert sp.dist[0][2] < UNREACHABLE_DISTANCE <= sp.dist[0][1]
+    first = [arch.block_of_qpu(qpu).compute[0] for qpu in range(4)]
+    port = [arch.block_of_qpu(qpu).comm[0] for qpu in range(4)]
+
+    for partners in ((2, 1), (1, 3)):
+        mapped = QuantumCircuit(arch.n_phys)
+        mapped.cx(first[0], first[partners[0]])
+        mapped.cx(port[0], first[partners[1]])
+        plan = estimate_topology_schedule_plan(mapped, arch, lat)
+        assert audit_topology_schedule_plan(plan, arch, lat, mapped) == ()
+
+        layer = plan.layers[0]
+        penalty = next(rnd for rnd in layer.remote_rounds if rnd.unschedulable_ops)
+        folded = dataclasses.replace(
+            penalty,
+            round_index=0,
+            qpu_pairs=tuple(rnd.qpu_pairs[0] for rnd in layer.remote_rounds),
+            unschedulable_ops=len(layer.remote_rounds),
+        )
+        tampered = dataclasses.replace(
+            plan,
+            layers=(
+                dataclasses.replace(
+                    layer,
+                    remote_rounds=(folded,),
+                    duration=folded.duration,
+                    end_time=layer.start_time + folded.duration,
+                ),
+            ),
+            summary=dataclasses.replace(
+                plan.summary,
+                makespan=folded.duration,
+                remote_rounds=1,
+                peak_link_util=0,
+                peak_qpu_ports_used=0,
+            ),
+        )
+
+        problems = audit_topology_schedule_plan(tampered, arch, lat, mapped)
+        assert any("stands for exactly one" in problem for problem in problems)

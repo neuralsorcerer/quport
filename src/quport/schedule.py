@@ -484,10 +484,11 @@ class RemoteRoundTrace:
         each, and ``qpu_ports_used`` and ``link_utilization`` are exactly what
         those operations consume.
     ``unschedulable_ops > 0``
-        A penalty round for operations no port, link, or route could serve.
-        ``qpu_pairs`` still names them, one entry each, so the count of
-        operations a round accounts for is ``unschedulable_ops or
-        len(qpu_pairs)`` -- never their sum, which would count a penalty
+        A penalty round for an operation no port, link, or route could serve:
+        ``unschedulable_ops`` is 1, and the round lasts one
+        :data:`UNSCHEDULABLE_PENALTY`. ``qpu_pairs`` still names the operation,
+        so the count of operations a round accounts for is ``unschedulable_ops
+        or len(qpu_pairs)`` -- never their sum, which would count a penalty
         operation twice.
     """
 
@@ -1103,8 +1104,8 @@ def audit_topology_schedule_plan(
       ``comm_qubits_per_qpu`` or ``link_capacity``; on a switch-like fabric a
       round also holds at most ``switch_parallel_links`` distinct pairs;
     - each round lasts as long as its slowest placed operation;
-    - a penalty round stands only for an operation no port, link, or route
-      could serve, and consumes no port or link;
+    - a penalty round stands for exactly one operation, which no port, link,
+      or route could serve, and consumes no port or link;
     - the six summary fields agree with the trace they summarise.
 
     Passing ``mapped`` adds the one check that needs the circuit: that the plan
@@ -1217,18 +1218,23 @@ def audit_topology_schedule_plan(
                     f"{n_qpus}-QPU architecture"
                 )
             elif rnd.unschedulable_ops:
-                # A penalty round stands for operations that could not be
-                # placed. It still lists the pair it was going to serve, for
-                # diagnostics, so its operands are named twice and count once.
+                # A penalty round stands for one operation that could not be
+                # placed, and is charged one penalty. It still lists the pair it
+                # was going to serve, for diagnostics, so its operands are named
+                # twice and count once.
                 if not close(rnd.duration, UNSCHEDULABLE_PENALTY):
                     problems.append(
                         f"{spot}: penalty round lasts {rnd.duration}, "
                         f"not {UNSCHEDULABLE_PENALTY}"
                     )
-                if len(rnd.qpu_pairs) != rnd.unschedulable_ops:
+                if rnd.unschedulable_ops != 1 or len(rnd.qpu_pairs) != 1:
+                    # Folding operations into one penalty round charges one
+                    # penalty for several, or hides a servable one beside an
+                    # unservable one.
                     problems.append(
                         f"{spot}: names {len(rnd.qpu_pairs)} pairs for "
-                        f"{rnd.unschedulable_ops} unschedulable operations"
+                        f"{rnd.unschedulable_ops} unschedulable operations; a "
+                        "penalty round stands for exactly one"
                     )
                 elif not nothing_serves and all(
                     sp.dist[a][b] < UNREACHABLE_DISTANCE for a, b in rnd.qpu_pairs
