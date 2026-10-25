@@ -614,6 +614,10 @@ together, have to *be* the circuit they were split from.
 `reassemble_distributed_program` merges them back under the dataflow rule above
 and undoes each QPU's routing permutation, and `verify_distributed_program`
 compares the result against the mapped circuit on a pseudo-random product input.
+Merging runs each remote operation as the mapped circuit has it, so the manifest
+is checked against it too: an entry naming another gate, other parameters, other
+classical bits, or a barrier other than its own marker is refused, since those are
+what a consumer of the emitted files acts on.
 The suite runs this across every intra-QPU topology and optimization level, so it
 covers the routing permutation and the manifest remapping as well as the split.
 
@@ -1855,6 +1859,7 @@ python examples/reproduce_readme_figures.py calibration
 - Emitted protocol circuits expand cat blocks in full; teleport blocks show the state movement as a `swap` in and out of the host ancilla rather than the Bell-measurement gadget, because the return trip needs a mid-circuit reset that would make the program non-unitary and so unverifiable by the same route.
 - State-vector verification is exponential in circuit width and is refused above 24 qubits, and it is refused outright for circuits with mid-circuit measurement, reset, or classical control.
 - Cross-QPU classical feedforward is not marked in the emitted bundle: a program can read a classical bit another QPU writes, and the order of those accesses across QPUs is recorded only in the mapped circuit.
+- A control-flow operation spanning QPUs is listed in the manifest by name, bits and markers, with its bodies rendered as text and its condition left out: the manifest says where it runs, but running it takes the mapped circuit.
 - Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.

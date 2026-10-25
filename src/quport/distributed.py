@@ -710,6 +710,7 @@ def reassemble_distributed_program(
                 "entry does"
             )
         named.add(index)
+        _check_manifest_describes(entry, op, mapped, index)
     for qpu in local_routed:
         _validate_manifest_int(qpu, label="local circuit QPU id")
 
@@ -746,6 +747,10 @@ def reassemble_distributed_program(
     retired: dict[int, list[bool]] = {}
     marker_at: dict[tuple[int, int], int] = {}
     marker_qubits: dict[tuple[int, int], list[int]] = {}
+    # Where each marker sits among its program's barrier statements, which is
+    # how a consumer of the emitted files, whose barriers carry no labels,
+    # finds it.
+    marker_position: dict[tuple[int, int], int] = {}
     mapped_at = {qubit: index for index, qubit in enumerate(mapped.qubits)}
 
     def carried_clbits(instruction: Any) -> list[Any]:
@@ -824,6 +829,7 @@ def reassemble_distributed_program(
         positions = {qubit: index for index, qubit in enumerate(circuit.qubits)}
         per_qubit: dict[int, deque[int]] = {}
         per_clbit: dict[int, deque[int]] = {}
+        barriers_before = 0
         for index, instruction in enumerate(instructions):
             ordinal = _remote_barrier_ordinal(instruction.operation)
             if ordinal is not None:
@@ -831,6 +837,8 @@ def reassemble_distributed_program(
                 marker_qubits[(ordinal, qpu)] = [
                     positions[qubit] for qubit in instruction.qubits
                 ]
+                marker_position[(ordinal, qpu)] = barriers_before
+            barriers_before += _barrier_statements(instruction.operation)
             for qubit in instruction.qubits:
                 per_qubit.setdefault(positions[qubit], deque()).append(index)
             for clbit in instruction.clbits:
@@ -840,6 +848,9 @@ def reassemble_distributed_program(
         queues[qpu] = per_qubit
         clbit_queues[qpu] = per_clbit
         retired[qpu] = [False] * len(instructions)
+
+    for ordinal, op in enumerate(remote_ops):
+        _check_manifest_markers(ordinal, op, mapped, arch, marker_position)
 
     # Each program carries its share of the phase, and routing adds its own.
     for qpu in qpus:
@@ -973,6 +984,81 @@ def reassemble_distributed_program(
     if restore_layout:
         _append_layout_restoration(out, local_routed, arch, width)
     return out
+
+
+def _check_manifest_describes(
+    entry: int, op: RemoteOp, mapped: QuantumCircuit, index: int
+) -> None:
+    """Check that a manifest entry names the gate, parameters and bits it runs.
+
+    Reassembly applies the mapped circuit's own operation, but a consumer of
+    the manifest applies what the entry says, so an entry naming another gate,
+    other parameters or other classical bits describes a different circuit.
+    """
+    source = mapped.data[index]
+    if op.name != source.operation.name:
+        raise ValueError(
+            f"remote_ops[{entry}] names gate {op.name!r}, but instruction {index} "
+            f"is {source.operation.name!r}"
+        )
+    params = getattr(source.operation, "params", [])
+    if _json_safe_sequence(list(op.params), set()) != _json_safe_sequence(
+        list(params), set()
+    ):
+        raise ValueError(
+            f"remote_ops[{entry}] gives parameters {list(op.params)}, but "
+            f"instruction {index} takes {list(params)}"
+        )
+    clbits = [mapped.find_bit(clbit).index for clbit in source.clbits]
+    if list(op.clbits) != clbits:
+        raise ValueError(
+            f"remote_ops[{entry}] names classical bits {list(op.clbits)}, but "
+            f"instruction {index} uses {clbits}"
+        )
+
+
+def _check_manifest_markers(
+    ordinal: int,
+    op: RemoteOp,
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    marker_position: Mapping[tuple[int, int], int],
+) -> None:
+    """Check that a manifest entry points at its own markers.
+
+    The emitted programs' barriers carry no labels, so a consumer finds an
+    operation's marker by its position among a program's barriers; a position
+    naming another barrier pairs the operation with the wrong point in that
+    program.
+    """
+    source = mapped.data[op.index]
+    involved = list(
+        dict.fromkeys(
+            arch.qpu_of_phys(mapped.find_bit(qubit).index) for qubit in source.qubits
+        )
+    )
+    markers = [(qpu, position) for qpu, position in op.markers]
+    if markers and [qpu for qpu, _ in markers] != involved:
+        raise ValueError(
+            f"remote operation {ordinal} lists markers on QPUs "
+            f"{[qpu for qpu, _ in markers]}, but its operands are on {involved}"
+        )
+    named: list[tuple[int, int | None]] = [
+        (op.qpu0, op.qpu0_marker),
+        (op.qpu1, op.qpu1_marker),
+        *markers,
+    ]
+    for qpu, position in named:
+        if position is None:
+            continue
+        actual = marker_position.get((ordinal, qpu))
+        if actual != position:
+            where = "has none" if actual is None else f"has it at barrier {actual}"
+            raise ValueError(
+                f"remote operation {ordinal} puts its marker at barrier "
+                f"{position} on QPU {qpu}, but that program {where}; the "
+                "manifest does not match these programs"
+            )
 
 
 def _accesses_once_decomposed(operation: Any) -> list[int] | None:

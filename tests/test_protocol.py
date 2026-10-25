@@ -462,6 +462,8 @@ def test_routing_cannot_reorder_a_qpus_remote_markers(intra: str) -> None:
 
 def test_reassembly_reports_contradictory_orderings() -> None:
     """A genuine ordering conflict must be reported, not silently reordered."""
+    import dataclasses
+
     from quport.distributed import reassemble_distributed_program, split_into_qpus
 
     cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
@@ -482,12 +484,21 @@ def test_reassembly_reports_contradictory_orderings() -> None:
     ]
     for instruction in reversed(markers):
         reversed_qpu1.append(instruction.operation, instruction.qubits, [])
+    # The manifest follows QPU 1's new barrier order, so only the orders clash.
+    remote_ops = [
+        dataclasses.replace(
+            op,
+            qpu1_marker=1 - op.qpu1_marker,
+            markers=((0, op.qpu0_marker), (1, 1 - op.qpu1_marker)),
+        )
+        for op in program.remote_ops
+    ]
 
     with pytest.raises(ValueError, match="contradictory orders"):
         reassemble_distributed_program(
             mapped,
             {0: program.local_circuits[0], 1: reversed_qpu1},
-            program.remote_ops,
+            remote_ops,
             arch,
             restore_layout=False,
         )
@@ -1417,6 +1428,84 @@ def test_a_reset_hidden_in_a_custom_instruction_is_refused() -> None:
     with pytest.raises(ValueError, match=r"reset \(inside prep\)"):
         verify_distributed_program(
             mapped, program.local_circuits, program.remote_ops, arch
+        )
+
+
+def _fan_out_bundle():
+    """A routed bundle with three remote cx gates, and its inputs."""
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=2,
+        comm_qubits_per_qpu=1,
+        intra_topology="line",
+        optimization_level=1,
+    )
+    qc = QuantumCircuit(6)
+    qc.h(0)
+    for target in range(1, 6):
+        qc.cx(0, target)
+    res = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+    assert len(res.routed_remote_ops) >= 2
+    return res, MultiQPUArchitecture(cfg)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"name": "swap"}, "names gate 'swap'"),
+        ({"params": (2.5,)}, "gives parameters"),
+        ({"clbits": (0,)}, "names classical bits"),
+        ({"qpu0_marker": 5}, "puts its marker at barrier 5"),
+    ],
+    ids=["name", "params", "clbits", "marker"],
+)
+def test_a_manifest_naming_another_gate_or_marker_is_refused(
+    change: dict[str, object], message: str
+) -> None:
+    """A consumer runs what the manifest says, at the barrier it points to;
+    the verifier used to take the gate from the circuit and the marker from its
+    label, so none of these were ever compared."""
+    import dataclasses
+
+    from quport.protocol import verify_distributed_program
+
+    res, arch = _fan_out_bundle()
+    ops = list(res.routed_remote_ops)
+    ops[0] = dataclasses.replace(ops[0], **change)
+
+    assert verify_distributed_program(
+        res.physical_circuit, res.local_routed, res.routed_remote_ops, arch
+    )
+    with pytest.raises(ValueError, match=message):
+        verify_distributed_program(res.physical_circuit, res.local_routed, ops, arch)
+
+
+def test_a_manifest_pointing_two_entries_at_each_others_markers_is_refused() -> None:
+    import dataclasses
+
+    from quport.protocol import verify_distributed_program
+
+    res, arch = _fan_out_bundle()
+    first, second, *rest = res.routed_remote_ops
+    swapped = [
+        dataclasses.replace(
+            first,
+            qpu0_marker=second.qpu0_marker,
+            qpu1_marker=second.qpu1_marker,
+            markers=second.markers,
+        ),
+        dataclasses.replace(
+            second,
+            qpu0_marker=first.qpu0_marker,
+            qpu1_marker=first.qpu1_marker,
+            markers=first.markers,
+        ),
+        *rest,
+    ]
+
+    with pytest.raises(ValueError, match="puts its marker at barrier"):
+        verify_distributed_program(
+            res.physical_circuit, res.local_routed, swapped, arch
         )
 
 
