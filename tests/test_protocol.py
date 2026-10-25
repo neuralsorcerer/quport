@@ -749,7 +749,7 @@ def test_verification_width_counts_the_measured_classical_bits() -> None:
     assert arch.n_phys == MAX_VERIFIABLE_QUBITS
     measured = 1
     mapped = QuantumCircuit(arch.n_phys, measured)
-    mapped.h(0)
+    mapped.h(range(arch.n_phys))
     mapped.measure(0, 0)
     program = split_into_qpus(mapped, arch)
 
@@ -1507,6 +1507,40 @@ def test_a_manifest_pointing_two_entries_at_each_others_markers_is_refused() -> 
         verify_distributed_program(
             res.physical_circuit, res.local_routed, swapped, arch
         )
+
+
+def test_distributed_verification_counts_only_the_qubits_acted_on() -> None:
+    """The merged circuit spans the whole architecture, and every idle qubit
+    used to count against the limit, so the default 90-qubit machine could
+    verify nothing."""
+    from quport.protocol import verify_distributed_program
+
+    cfg = MultiQPUConfig()
+    arch = MultiQPUArchitecture(cfg)
+    assert arch.n_phys > MAX_VERIFIABLE_QUBITS
+    qc = QuantumCircuit(2, 2)
+    qc.h(0)
+    qc.cx(0, 1)
+    qc.measure([0, 1], [0, 1])
+    res = compile_distributed(qc, cfg, seed=0)
+
+    assert verify_distributed_program(
+        res.physical_circuit, res.local_routed, res.routed_remote_ops, arch
+    )
+
+
+@pytest.mark.parametrize("mapped", [None, "qc"])
+def test_verifiers_refuse_a_mapped_argument_that_is_not_a_circuit(
+    mapped: object,
+) -> None:
+    from quport.protocol import verify_distributed_program
+
+    arch = _arch()
+
+    with pytest.raises(ValueError, match="mapped must be a QuantumCircuit"):
+        verify_telegate_equivalence(mapped, arch)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="mapped must be a QuantumCircuit"):
+        verify_distributed_program(mapped, {}, [], arch)  # type: ignore[arg-type]
 
 
 def test_the_emitted_protocol_keeps_the_global_phase() -> None:

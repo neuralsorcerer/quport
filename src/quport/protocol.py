@@ -548,6 +548,8 @@ def verify_telegate_equivalence(
     import numpy as np
     from qiskit.quantum_info import Statevector
 
+    if not isinstance(mapped, QuantumCircuit):
+        raise ValueError("mapped must be a QuantumCircuit")
     tolerance = _validated_atol(atol)
     _require_bound_parameters(mapped)
     program = build_telegate_circuit(
@@ -647,13 +649,16 @@ def verify_distributed_program(
     Raises
     ------
     ValueError
-        If the circuit is too wide to simulate -- its qubits plus one ancilla
-        per measured classical bit exceed :data:`MAX_VERIFIABLE_QUBITS` -- if
+        If the circuit is too wide to simulate -- the qubits the programs or
+        the circuit act on, plus one ancilla per measured classical bit,
+        exceed :data:`MAX_VERIFIABLE_QUBITS` -- if
         it measures a qubit or writes a classical bit more than once, or if the
         artifacts are inconsistent enough that they cannot be merged at all.
     """
     from qiskit.quantum_info import Statevector
 
+    if not isinstance(mapped, QuantumCircuit):
+        raise ValueError("mapped must be a QuantumCircuit")
     tolerance = _validated_atol(atol)
     _require_bound_parameters(mapped)
     merged = reassemble_distributed_program(
@@ -669,14 +674,20 @@ def verify_distributed_program(
         # of them a different number of times: not the same computation.
         return False
 
-    width = len(merged.qubits)
-    outcome_slots = _outcome_slots(width, mapped, merged)
+    # The merged circuit spans the whole architecture, but a qubit nothing acts
+    # on keeps its input state on both sides, so only the qubits something
+    # acts on are simulated.
+    active = _acted_on_qubits(merged, mapped)
+    merged_active = _on_qubits(merged, active)
+    mapped_active = _on_qubits(mapped, active)
+    width = len(active)
+    outcome_slots = _outcome_slots(width, mapped_active, merged_active)
     total = width + len(outcome_slots)
     if total > MAX_VERIFIABLE_QUBITS:
         raise ValueError(
-            f"circuit has {width} qubits and {len(outcome_slots)} measured classical "
-            f"bits, above the {MAX_VERIFIABLE_QUBITS}-qubit state-vector "
-            "verification limit"
+            f"the programs act on {width} qubits, with {len(outcome_slots)} "
+            f"measured classical bits, above the {MAX_VERIFIABLE_QUBITS}-qubit "
+            "state-vector verification limit"
         )
 
     preparation = _widen(_random_product_state(width, seed), total)
@@ -685,14 +696,14 @@ def verify_distributed_program(
 
     actual = preparation.copy()
     actual.compose(
-        _measurements_into_ancillas(merged, total, outcome_slots),
+        _measurements_into_ancillas(merged_active, total, outcome_slots),
         qubits=range(total),
         inplace=True,
     )
 
     expected = preparation.copy()
     expected.compose(
-        _measurements_into_ancillas(mapped, total, outcome_slots),
+        _measurements_into_ancillas(mapped_active, total, outcome_slots),
         qubits=range(total),
         inplace=True,
     )
@@ -900,6 +911,46 @@ def _single_measurement_writes(circuit: QuantumCircuit) -> dict[Any, int]:
                 f"{circuit.find_bit(clbit).index} with more than one measurement"
             )
     return writes
+
+
+def _acted_on_qubits(*circuits: QuantumCircuit) -> list[int]:
+    """Indices of the qubits an instruction of any of ``circuits`` acts on.
+
+    Barriers act on nothing. The circuits share their qubits by index, as a
+    merged circuit and the one it was split from do.
+    """
+    active: set[int] = set()
+    for circuit in circuits:
+        position = {qubit: index for index, qubit in enumerate(circuit.qubits)}
+        for instruction in circuit.data:
+            if not isinstance(instruction.operation, Barrier):
+                active.update(position[qubit] for qubit in instruction.qubits)
+    return sorted(active)
+
+
+def _on_qubits(circuit: QuantumCircuit, qubits: Sequence[int]) -> QuantumCircuit:
+    """``circuit`` on the given qubits alone, renumbered in order.
+
+    Every other qubit must be idle, and barriers are dropped. The classical
+    bits are kept as they are, so two circuits restricted alike still share
+    them.
+    """
+    out = QuantumCircuit(QuantumRegister(len(qubits), "q"))
+    out.add_bits(circuit.clbits)
+    renamed = {
+        circuit.qubits[old]: out.qubits[new]
+        for new, old in enumerate(qubits)
+        if old < len(circuit.qubits)
+    }
+    for instruction in circuit.data:
+        if isinstance(instruction.operation, Barrier):
+            continue
+        out.append(
+            instruction.operation,
+            [renamed[qubit] for qubit in instruction.qubits],
+            instruction.clbits,
+        )
+    return out
 
 
 def _random_product_state(n_qubits: int, seed: int) -> QuantumCircuit:

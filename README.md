@@ -634,7 +634,9 @@ comparison. Local routing at `optimization_level` 2 or 3 may drop a diagonal gat
 right before a measurement, or re-target the classical bit of a measurement that
 follows a `swap`; neither changes an outcome, and neither now fails verification.
 Comparing per classical bit also checks which bit each measurement writes, and
-each measured bit counts toward the 24-qubit simulation limit. A measured qubit is
+each measured bit counts toward the 24-qubit simulation limit, as does every qubit
+the programs or the circuit act on; the architecture's idle qubits do not. A
+measured qubit is
 left in a fixed generic state, so a program that acts on a qubit after measuring
 it, other than to move it, fails the check. A measurement terminates when nothing
 but barriers acts on its qubit afterwards; a measurement or reset that later
