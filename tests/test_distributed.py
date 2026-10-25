@@ -2923,3 +2923,34 @@ def test_reassembly_takes_operands_and_markers_as_lists() -> None:
     ]
 
     reassemble_distributed_program(mapped, program.local_circuits, listed, arch)
+
+
+def test_reassembly_keeps_the_global_phase() -> None:
+    """The programs started at phase zero and the merge added none, so the
+    reassembled circuit matched the mapped one only up to a phase."""
+    import math
+
+    from qiskit.quantum_info import Operator
+
+    from quport.compiler import compile_distributed
+    from quport.distributed import reassemble_distributed_program
+
+    cfg = MultiQPUConfig(
+        n_qpus=2, compute_qubits_per_qpu=1, comm_qubits_per_qpu=0, optimization_level=1
+    )
+    arch = MultiQPUArchitecture(cfg)
+    qc = QuantumCircuit(2, global_phase=math.pi / 2)
+    qc.h(0)
+    qc.cx(0, 1)
+    res = compile_distributed(qc, cfg, seed=0, strategy="balanced")
+    physical = res.physical_circuit
+    program = split_into_qpus(physical, arch)
+
+    for local, ops in (
+        (res.local_routed, res.routed_remote_ops),
+        (program.local_circuits, program.remote_ops),
+    ):
+        merged = reassemble_distributed_program(physical, local, ops, arch)
+        reference = QuantumCircuit(merged.num_qubits)
+        reference.compose(physical, qubits=range(physical.num_qubits), inplace=True)
+        assert Operator(merged) == Operator(reference)

@@ -1418,3 +1418,23 @@ def test_a_reset_hidden_in_a_custom_instruction_is_refused() -> None:
         verify_distributed_program(
             mapped, program.local_circuits, program.remote_ops, arch
         )
+
+
+def test_the_emitted_protocol_keeps_the_global_phase() -> None:
+    """With its ancillas back in ``|0>`` the protocol leaves the data exactly in
+    the mapped circuit's state, phase included."""
+    import math
+
+    import numpy as np
+    from qiskit.quantum_info import Statevector
+
+    arch = _arch(compute=2)
+    mapped = QuantumCircuit(arch.n_phys, global_phase=math.pi / 3)
+    mapped.h(0)
+    mapped.cx(0, 3)
+    mapped.cx(0, 4)
+
+    program = build_telegate_circuit(mapped, arch, coherent=True)
+    by_ancillas = Statevector(program.circuit).data.reshape(-1, 2**program.n_data)
+
+    assert np.allclose(by_ancillas[0], Statevector(mapped).data)

@@ -1679,7 +1679,8 @@ markers and its accesses to bits another program or a remote operation also
 uses -- held in the mapped circuit's order, so routing cannot tie two of them
 together the other way round and leave programs no execution satisfies. An
 instruction that acts on no qubit, such as a condition whose body is empty,
-goes into QPU 0's program alone, so it still runs once.
+goes into QPU 0's program alone, so it still runs once, and so does the
+circuit's global phase.
 
 Qiskit's routing stage gathers a circuit's final measurements behind a barrier and
 puts them back in qubit order, which can swap two final measurements into the same

@@ -331,7 +331,7 @@ def build_telegate_circuit(
     taken.add(work.name)
     ancilla_register = QuantumRegister(max_ancillas, _fresh_register_name("cat", taken))
     taken.add(ancilla_register.name)
-    circuit = QuantumCircuit(work, ancilla_register)
+    circuit = QuantumCircuit(work, ancilla_register, global_phase=mapped.global_phase)
     if mapped.clbits:
         circuit.add_bits(mapped.clbits)
     for creg in mapped.cregs:
@@ -480,7 +480,8 @@ def _trim_unused_ancillas(
         return circuit
 
     ancillas = QuantumRegister(used, ancilla_name)
-    trimmed = QuantumCircuit(work, ancillas) if used else QuantumCircuit(work)
+    registers = (work, ancillas) if used else (work,)
+    trimmed = QuantumCircuit(*registers, global_phase=circuit.global_phase)
     if mapped.clbits:
         trimmed.add_bits(mapped.clbits)
     for creg in mapped.cregs:

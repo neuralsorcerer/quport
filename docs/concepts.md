@@ -178,7 +178,7 @@ recorded only in the mapped circuit, which is where
 each program with its remote markers and its accesses to bits other programs
 use held in that order, so the routed programs never contradict it. An
 instruction that acts on no qubit goes into QPU 0's program alone, so it runs
-once.
+once, and the global phase goes with it.
 
 ## Scheduling
 

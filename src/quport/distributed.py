@@ -841,6 +841,10 @@ def reassemble_distributed_program(
         clbit_queues[qpu] = per_clbit
         retired[qpu] = [False] * len(instructions)
 
+    # Each program carries its share of the phase, and routing adds its own.
+    for qpu in qpus:
+        out.global_phase += local_routed[qpu].global_phase
+
     def leads(qpu: int, index: int) -> bool:
         """True when this instruction is first in line on every bit it uses.
 
@@ -1225,7 +1229,8 @@ def split_into_qpus(
     - For remote ops, local circuits will include barriers on the involved QPUs to make
       synchronization explicit for downstream schedulers.
     - An instruction acting on no qubit, such as a condition whose body is empty, goes
-      to QPU 0's program only, so it still runs once.
+      to QPU 0's program only, so it still runs once. So does the circuit's global
+      phase.
     """
     reject_classical_storage(mapped, what="split_into_qpus")
     n_qpus = arch.cfg.n_qpus
@@ -1234,6 +1239,9 @@ def split_into_qpus(
     # (You may later shrink them to only used qubits.)
     for q in range(n_qpus):
         local[q] = _new_local_circuit(mapped, arch.n_phys)
+    # The phase belongs to no qubit, so it goes with the instructions that act
+    # on none, and the programs' phases still add up to the circuit's.
+    local[_QPU_WITHOUT_QUBITS].global_phase = mapped.global_phase
 
     remote_ops: list[RemoteOp] = []
     # Barriers emitted per QPU so far.  A remote operation records where its own

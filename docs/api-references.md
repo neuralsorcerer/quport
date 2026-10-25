@@ -260,7 +260,8 @@ to the owning QPU circuit. Cross-QPU operations become `RemoteOp` entries and
 barriers are inserted on involved local circuits to mark synchronization points.
 
 A zero-qubit barrier becomes a barrier on every local circuit. Any other operation
-that acts on no qubit goes to QPU 0's circuit only, so it still runs once.
+that acts on no qubit goes to QPU 0's circuit only, so it still runs once, as
+does the circuit's global phase.
 Multi-qubit operations that span multiple QPUs are conservatively represented as
 remote composite operations.
 
@@ -582,9 +583,9 @@ verify_distributed_program(mapped, local_routed, remote_ops, arch, *,
 `reassemble_distributed_program` is the inverse of `split_into_qpus`: it merges
 per-QPU programs and a remote-op manifest back into one circuit and, with
 `restore_layout=True`, undoes each QPU's routing permutation so the result is
-directly comparable with the mapped circuit. Classical bits and registers are
-carried across, so measurements and conditioned operations survive the round
-trip. `verify_distributed_program` does that comparison by state-vector
+directly comparable with the mapped circuit, global phase included. Classical bits
+and registers are carried across, so measurements and conditioned operations
+survive the round trip. `verify_distributed_program` does that comparison by state-vector
 simulation. Terminating measurements are compared by outcome, per classical bit:
 each is swapped into an ancilla for its bit, and the ancillas are dephased, so
 the measurement-aware optimizations of `optimization_level` 2 and 3 (dropping a
