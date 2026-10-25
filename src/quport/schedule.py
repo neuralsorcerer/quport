@@ -10,7 +10,7 @@ import heapq
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any, SupportsFloat, SupportsIndex, cast
 
 from qiskit import ClassicalRegister, QuantumCircuit
@@ -1889,28 +1889,30 @@ def estimate_entanglement_schedule(
     )
 
 
-def _serialised_qubit_time(
+def _local_work(
     mapped: QuantumCircuit,
     arch: MultiQPUArchitecture,
     lat: _ValidatedLatencyValues,
-) -> float:
-    """Longest total duration of the gates serialised on any single qubit.
+) -> tuple[float, list[float]]:
+    """The work of the gates that stay on one QPU: per busiest qubit, and per QPU.
 
     Every gate touching a qubit occupies that qubit's timeline, so no schedule
     can finish sooner than the busiest qubit's own work. Cross-QPU gates are
     excluded: they run against a cat copy on the host QPU, on that copy's
     timeline rather than the root's, which is exactly the parallelism the
-    entanglement model buys.
+    entanglement model buys. Durations are the ones the estimator charges.
     """
     qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
     load = [0.0] * len(mapped.qubits)
+    work = [0.0] * arch.cfg.n_qpus
     for instruction in mapped.data:
         if is_directive(instruction.operation):
             continue
         qubits = [qindex[qubit] for qubit in instruction.qubits]
         if not qubits:
             continue
-        if len({phys_to_qpu[qubit] for qubit in qubits}) > 1:
+        qpus = {phys_to_qpu[qubit] for qubit in qubits}
+        if len(qpus) > 1:
             continue
         if len(qubits) == 1:
             duration = lat.oneq
@@ -1920,7 +1922,8 @@ def _serialised_qubit_time(
             duration = lat.twoq
         for qubit in qubits:
             load[qubit] += duration
-    return max(load, default=0.0)
+        work[qpus.pop()] += duration
+    return max(load, default=0.0), work
 
 
 def _budget_over(count: int, makespan: float) -> float:
@@ -1948,8 +1951,8 @@ def audit_entanglement_schedule(
 
     :func:`estimate_entanglement_schedule` returns aggregates and no trace, so
     unlike :func:`audit_topology_schedule_plan` there is no event log to replay.
-    What can still be checked from the outside is everything the aggregates are
-    related by *theorem* rather than by convention:
+    What can still be checked from the outside is what the aggregates must
+    satisfy whatever the timing:
 
     - a QPU with ``P`` ports cannot hold more than ``P`` cat copies at once, nor
       accrue more than ``P * makespan`` of port-busy time; a link with ``C``
@@ -1961,10 +1964,19 @@ def audit_entanglement_schedule(
     - ``remote_gates`` is the number of operations in the circuit that span more
       than one QPU, counted as :func:`quport.distributed.split_into_qpus` counts
       them, and no more gates can be unschedulable than there are remote ones;
-    - with ``plan``, the summary describes that plan's blocks and EPR pairs.
+    - every unschedulable gate is charged :data:`UNSCHEDULABLE_PENALTY`, so a
+      summary with any cannot finish sooner;
+    - times and counts are finite and non-negative, links are links of the
+      interconnect, listed once each, and a QPU accrues port-busy time exactly
+      when it holds a port at some instant;
+    - the summary describes the plan: its blocks and EPR pairs, the gates it
+      leaves unserved or routes through a block no link can serve, the traffic
+      its blocks put on every link, the gate time on each QPU, and at least the
+      port time its blocks' entanglers take.
 
-    ``ports_per_qpu`` must be whatever the schedule was produced with; the
-    default reads the architecture's own budget, matching the estimator.
+    ``plan`` and ``ports_per_qpu`` must be whatever the schedule was produced
+    with; the defaults rebuild the plan and read the architecture's own port
+    budget, as the estimator does.
 
     A caller who wants monotonicity instead -- that widening a resource never
     lengthens a schedule -- can get it by scheduling one fixed ``plan`` twice and
@@ -2022,7 +2034,7 @@ def audit_entanglement_schedule(
             f"busy times sum to {total_link}"
         )
 
-    floor = _serialised_qubit_time(mapped, arch, lat)
+    floor, local_work = _local_work(mapped, arch, lat)
     if makespan < floor - 1e-6:
         problems.append(
             f"makespan is {makespan}, below the {floor} of work serialised on the "
@@ -2034,6 +2046,11 @@ def audit_entanglement_schedule(
             f"{summary.unschedulable_gates} gates unschedulable, but only "
             f"{summary.remote_gates} are remote"
         )
+    if summary.unschedulable_gates > 0 and makespan < UNSCHEDULABLE_PENALTY:
+        problems.append(
+            f"{summary.unschedulable_gates} gates unschedulable, each charged "
+            f"{UNSCHEDULABLE_PENALTY}, but the makespan is {makespan}"
+        )
 
     actual = _count_cross_qpu_operations(mapped, arch)
     if summary.remote_gates != actual:
@@ -2042,18 +2059,190 @@ def audit_entanglement_schedule(
             f"{actual} operations spanning more than one QPU"
         )
 
-    if plan is not None:
-        if summary.blocks != len(plan.blocks):
-            problems.append(
-                f"reports {summary.blocks} blocks, the plan has {len(plan.blocks)}"
+    problems.extend(_entanglement_field_problems(summary, arch))
+
+    if plan is None:
+        plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=ports)
+    if summary.blocks != len(plan.blocks):
+        problems.append(
+            f"reports {summary.blocks} blocks, the plan has {len(plan.blocks)}"
+        )
+    if summary.epr_pairs != plan.epr_pairs:
+        problems.append(
+            f"reports {summary.epr_pairs} EPR pairs, the plan spends "
+            f"{plan.epr_pairs}"
+        )
+    overfull = next(
+        (
+            qpu
+            for qpu, peak in enumerate(plan.peak_cat_copies[:n_qpus])
+            if peak > ports[qpu]
+        ),
+        None,
+    )
+    shortfall = (
+        f"QPU {overfull} holds more cat copies than its {ports[overfull]} ports"
+        if overfull is not None
+        else _plan_port_shortfall(plan, ports)
+    )
+    if shortfall is not None:
+        # The estimator refuses such a plan, so no summary describes it.
+        problems.append(f"the plan exceeds the comm-port budget: {shortfall}")
+    else:
+        problems.extend(
+            _plan_derived_problems(
+                summary, mapped, arch, model, lat, plan, link_cap, local_work
             )
-        if summary.epr_pairs != plan.epr_pairs:
-            problems.append(
-                f"reports {summary.epr_pairs} EPR pairs, the plan spends "
-                f"{plan.epr_pairs}"
-            )
+        )
 
     return tuple(problems)
+
+
+def _entanglement_field_problems(
+    summary: EntanglementScheduleSummary, arch: MultiQPUArchitecture
+) -> list[str]:
+    """Check the summary's fields one by one: signs, links, and port holds."""
+    problems: list[str] = []
+    scalars: list[tuple[str, object]] = [
+        ("makespan", summary.makespan),
+        ("entanglement_time", summary.entanglement_time),
+        ("blocks", summary.blocks),
+        ("epr_pairs", summary.epr_pairs),
+        ("remote_gates", summary.remote_gates),
+        ("unschedulable_gates", summary.unschedulable_gates),
+    ]
+    for label, values in (
+        ("peak_ports_in_use", summary.peak_ports_in_use),
+        ("port_busy_time", summary.port_busy_time),
+        ("qpu_busy_time", summary.qpu_busy_time),
+    ):
+        scalars.extend(
+            (f"{label}[{index}]", value) for index, value in enumerate(values)
+        )
+    scalars.extend((f"link {edge}", busy) for edge, busy in summary.link_busy_time)
+    for label, value in scalars:
+        if (
+            is_boolean(value)
+            or not isinstance(value, Real)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            problems.append(f"{label} is {value!r}, not a finite non-negative number")
+
+    graph = arch.qpu_graph()
+    links = {(u, v) for u, neighbours in enumerate(graph) for v in neighbours if u < v}
+    seen: set[QpuEdge] = set()
+    for edge, _busy in summary.link_busy_time:
+        if edge in seen:
+            problems.append(f"link {edge} is listed more than once")
+        elif edge not in links:
+            problems.append(f"link {edge} is not a link of the interconnect")
+        seen.add(edge)
+
+    for qpu, (peak, busy) in enumerate(
+        zip(summary.peak_ports_in_use, summary.port_busy_time)
+    ):
+        # A port held for any time is in use at some instant, and one in use at
+        # some instant is held for a positive time.
+        if (busy > 0) != (peak > 0):
+            problems.append(
+                f"QPU {qpu} accrues {busy} port-busy time but holds at most "
+                f"{peak} ports at once"
+            )
+    return problems
+
+
+def _plan_derived_problems(
+    summary: EntanglementScheduleSummary,
+    mapped: QuantumCircuit,
+    arch: MultiQPUArchitecture,
+    model: LatencyModel,
+    lat: _ValidatedLatencyValues,
+    plan: AggregationPlan,
+    link_cap: int,
+    local_work: Sequence[float],
+) -> list[str]:
+    """Check what the plan fixes whatever the timing: traffic, gate time, holds.
+
+    A block runs when its two QPUs are connected and links have channels; it
+    then puts one distribution on every link of its path (two for a teleport,
+    whose return trip is a second pair) and holds a port on each end at least
+    for its entangler. A gate is unschedulable when the plan leaves it unserved
+    or a block it needs cannot run, and otherwise runs on its first block's
+    host.
+    """
+    n_qpus = arch.cfg.n_qpus
+    for block in plan.blocks:
+        outside = [index for index in block.gate_indices if index >= len(mapped.data)]
+        if outside:
+            return [
+                f"a block serves instruction {outside[0]}, the circuit has "
+                f"{len(mapped.data)}"
+            ]
+    sp = arch.qpu_shortest_paths()
+    classical = _effective_classical_rtt(arch.cfg, lat)
+    links: dict[QpuEdge, float] = {}
+    port_floor = [0.0] * n_qpus
+    failed: set[int] = set()
+    host_of: dict[int, int] = {}
+    for block in plan.blocks:
+        for gate_index in block.gate_indices:
+            host_of.setdefault(gate_index, block.remote_qpu)
+        hops = sp.dist[block.root_qpu][block.remote_qpu]
+        if hops >= UNREACHABLE_DISTANCE or link_cap == 0:
+            failed.update(block.gate_indices)
+            continue
+        distribute = model.expected_epr_time(hops)
+        teleport = block.protocol == "teleport"
+        for edge in path_edges(sp, block.root_qpu, block.remote_qpu):
+            links[edge] = links.get(edge, 0.0) + distribute * (2 if teleport else 1)
+        entangler = distribute + classical + lat.remote_gate_overhead
+        port_floor[block.root_qpu] += entangler
+        port_floor[block.remote_qpu] += (
+            entangler + classical + (distribute if teleport else 0.0)
+        )
+
+    problems: list[str] = []
+    expected = plan.unschedulable_gates + len(failed)
+    if summary.unschedulable_gates != expected:
+        problems.append(
+            f"reports {summary.unschedulable_gates} unschedulable gates, the plan "
+            f"leaves {expected} unserved"
+        )
+
+    def close(left: float, right: float) -> bool:
+        return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-6)
+
+    reported = dict(summary.link_busy_time)
+    for edge in sorted(links.keys() | reported.keys()):
+        if (
+            edge not in links
+            or edge not in reported
+            or not close(reported[edge], links[edge])
+        ):
+            problems.append(
+                f"link {edge} accrues {reported.get(edge, 0.0)} busy time, the "
+                f"plan's blocks put {links.get(edge, 0.0)} on it"
+            )
+
+    gate_time = list(local_work)
+    for gate_index, host in host_of.items():
+        if gate_index in failed:
+            continue
+        operation = mapped.data[gate_index].operation
+        gate_time[host] += lat.swap if is_standard_gate(operation, "swap") else lat.twoq
+    for qpu, (busy, work) in enumerate(zip(summary.qpu_busy_time, gate_time)):
+        if not close(busy, work):
+            problems.append(
+                f"QPU {qpu} accrues {busy} gate time, its gates take {work}"
+            )
+    for qpu, (busy, held) in enumerate(zip(summary.port_busy_time, port_floor)):
+        if busy < held - 1e-6 * max(1.0, held):
+            problems.append(
+                f"QPU {qpu} accrues {busy} port-busy time, its blocks' entanglers "
+                f"alone hold ports for {held}"
+            )
+    return problems
 
 
 def _normalized_port_budget(

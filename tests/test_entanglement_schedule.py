@@ -441,6 +441,98 @@ def test_audit_catches_a_schedule_that_cannot_be_true():
         ), f"audit reported {problems} for {expected!r}"
 
 
+def test_audit_holds_a_schedule_to_the_plan_it_describes():
+    """The plan fixes a schedule's link traffic, gate time, unserved gates and a
+    floor on its port time whatever the timing; each of these used to pass."""
+    import dataclasses
+
+    from quport.schedule import UNSCHEDULABLE_PENALTY, audit_entanglement_schedule
+
+    summary, mapped, arch, model, plan = _scheduled_case()
+    links = dict(summary.link_busy_time)
+    zeroed = tuple(0.0 for _ in summary.port_busy_time)
+
+    cases = {
+        "not a finite non-negative number": dataclasses.replace(
+            summary, qpu_busy_time=tuple(-1.0 for _ in summary.qpu_busy_time)
+        ),
+        "listed more than once": dataclasses.replace(
+            summary, link_busy_time=summary.link_busy_time[:1] * 2
+        ),
+        "holds at most": dataclasses.replace(
+            summary, peak_ports_in_use=tuple(0 for _ in summary.peak_ports_in_use)
+        ),
+        "its gates take": dataclasses.replace(
+            summary, qpu_busy_time=tuple(0.0 for _ in summary.qpu_busy_time)
+        ),
+        "the plan's blocks put": dataclasses.replace(
+            summary,
+            link_busy_time=tuple((edge, 0.0) for edge in links),
+            entanglement_time=0.0,
+        ),
+        "entanglers alone": dataclasses.replace(
+            summary,
+            port_busy_time=zeroed,
+            peak_ports_in_use=tuple(0 for _ in zeroed),
+        ),
+        "leaves 0 unserved": dataclasses.replace(
+            summary, unschedulable_gates=1, makespan=UNSCHEDULABLE_PENALTY
+        ),
+        "each charged": dataclasses.replace(summary, unschedulable_gates=1),
+        "not a link of the interconnect": dataclasses.replace(
+            summary,
+            link_busy_time=summary.link_busy_time + (((0, arch.cfg.n_qpus), 0.0),),
+        ),
+    }
+
+    for expected, broken in cases.items():
+        problems = audit_entanglement_schedule(broken, mapped, arch, model, plan=plan)
+        assert any(
+            expected in problem for problem in problems
+        ), f"audit reported {problems} for {expected!r}"
+
+
+def test_audit_counts_the_gates_a_portless_plan_leaves_unserved():
+    """With no ports both remote gates go unserved, and are charged the penalty."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0)
+    )
+    model = LatencyModel()
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 2)
+    mapped.cx(1, 3)
+    plan = aggregate_remote_operations(mapped, arch)
+    summary = estimate_entanglement_schedule(mapped, arch, model, plan=plan)
+    forged = dataclasses.replace(summary, unschedulable_gates=0, makespan=0.0)
+
+    assert summary.unschedulable_gates == plan.unschedulable_gates == 2
+    assert audit_entanglement_schedule(summary, mapped, arch, model) == ()
+    assert any(
+        "leaves 2 unserved" in problem
+        for problem in audit_entanglement_schedule(forged, mapped, arch, model)
+    )
+
+
+def test_audit_rebuilds_the_plan_it_is_not_given():
+    """Without ``plan`` the audit checks the one the estimator builds itself."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    summary, mapped, arch, model, _plan = _scheduled_case()
+    broken = dataclasses.replace(summary, blocks=summary.blocks + 1)
+
+    assert audit_entanglement_schedule(summary, mapped, arch, model) == ()
+    assert any(
+        "the plan has" in problem
+        for problem in audit_entanglement_schedule(broken, mapped, arch, model)
+    )
+
+
 def test_widening_a_resource_never_lengthens_one_fixed_plan():
     """Monotonicity is a property of the estimator, so it is checked directly.
 

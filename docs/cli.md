@@ -140,7 +140,8 @@ and topology-aware makespans. `--out` writes the full plan, including each block
 root qubit, host QPU, protocol, and served gate indices — after
 `audit_entanglement_schedule` has checked it against the port and link budgets it
 claims to respect, the circuit's own cross-QPU operation count, and the plan it
-came from. An inconsistent schedule is reported and not written.
+came from: its blocks, the gates it leaves unserved, and the link traffic and gate
+time it fixes. An inconsistent schedule is reported and not written.
 
 `--emit-qasm PATH` additionally writes the executable protocol circuit as
 OpenQASM 3, with explicit EPR pairs, mid-circuit measurement, and `if`

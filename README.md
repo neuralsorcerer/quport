@@ -1724,7 +1724,11 @@ a makespan $T$, and a link with $C$ channels likewise; `entanglement_time` is by
 definition the sum of per-link busy time; every gate on a qubit occupies that
 qubit's timeline, so the busiest qubit's own work is a lower bound on $T$;
 `remote_gates` is the circuit's own count of operations spanning more than one QPU;
-and no more gates can be unschedulable than there are remote ones.
+and no more gates can be unschedulable than there are remote ones, each charged a
+penalty the makespan cannot undercut. The plan fixes more than the timing does:
+which gates go unserved, the traffic its blocks put on every link, the gate time on
+each QPU, and a floor on each QPU's port time, so those are recomputed from it and
+compared.
 
 Monotonicity is checked too, but it belongs to the estimator rather than to any one
 result, so it is obtained by scheduling one fixed plan twice: widening ports or link

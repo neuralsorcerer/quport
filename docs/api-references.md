@@ -432,8 +432,8 @@ audit_entanglement_schedule(summary, mapped, arch, model, *,
 ```
 
 The counterpart for `estimate_entanglement_schedule`, which returns aggregates and
-no trace — so instead of replaying events, this checks everything the aggregates
-are related by *theorem*:
+no trace — so instead of replaying events, this checks what the aggregates must
+satisfy whatever the timing:
 
 - a QPU with `P` ports cannot hold more than `P` cat copies at once, nor accrue
   more than `P * makespan` of port-busy time; a link with `C` channels likewise;
@@ -442,9 +442,19 @@ are related by *theorem*:
   work is a lower bound on the makespan;
 - `remote_gates` is the circuit's own count of operations spanning more than one
   QPU, and no more gates can be unschedulable than there are remote ones;
-- with `plan`, the summary describes that plan's blocks and EPR pairs.
+- every unschedulable gate is charged `UNSCHEDULABLE_PENALTY`, so a summary with
+  any cannot finish sooner;
+- times and counts are finite and non-negative, every link is a link of the
+  interconnect and is listed once, and a QPU accrues port-busy time exactly when
+  it holds a port at some instant;
+- the summary describes the plan: its blocks and EPR pairs, the gates it leaves
+  unserved or routes through a block no link can serve, the traffic its blocks put
+  on every link, the gate time on each QPU, and at least the port time its blocks'
+  entanglers take.
 
-`ports_per_qpu` must be whatever the schedule was produced with. Monotonicity —
+`plan` and `ports_per_qpu` must be whatever the schedule was produced with; the
+defaults rebuild the plan and read the architecture's port budget, as the
+estimator does. Monotonicity —
 that widening a resource never lengthens a schedule — is a property of the
 estimator rather than of one result, so it is obtained by scheduling one fixed
 `plan` twice and comparing; `tests/test_entanglement_schedule.py` does exactly
