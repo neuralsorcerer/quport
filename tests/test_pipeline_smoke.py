@@ -1392,3 +1392,42 @@ def test_an_out_csv_through_a_broken_link_is_refused(tmp_path: Path, kind: str) 
 
     os.symlink(tmp_path / "target.csv", tmp_path / "fine.csv")
     assert _validate_out_csv(str(tmp_path / "fine.csv"))
+
+
+@pytest.mark.parametrize("level", [2, 3])
+def test_a_unitary_gate_named_measure_is_compiled_as_the_gate_it_is(
+    level: int,
+) -> None:
+    """Qiskit drops diagonal gates before anything named ``measure``, so a
+    custom ``measure`` (here an H, undoing the H before it) lost the rz in
+    front of it at levels 2 and 3 and the circuit came out as a bare H."""
+    from qiskit import QuantumCircuit
+    from qiskit.quantum_info import Statevector
+
+    from quport.entanglement import is_standard_namesake
+    from quport.pipeline import map_and_transpile, transpile_baseline
+
+    body = QuantumCircuit(1, name="measure")
+    body.h(0)
+    fake = body.to_gate()
+    qc = QuantumCircuit(1)
+    qc.h(0)
+    qc.append(fake, [0])
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        optimization_level=level,
+    )
+
+    assert is_standard_namesake(fake)
+    for result in (
+        transpile_baseline(qc, cfg, seed=0),
+        map_and_transpile(qc, cfg, seed=0, strategy="balanced"),
+    ):
+        mapped = result.mapped_circuit
+        assert all(
+            instruction.operation.name != "measure" for instruction in mapped.data
+        )
+        qubit = mapped.layout.final_index_layout()[0]
+        assert Statevector(mapped).probabilities([qubit])[1] == pytest.approx(0.0)

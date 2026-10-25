@@ -157,19 +157,37 @@ def is_standard_gate(operation: Any, name: str | None = None) -> bool:
     return bool(_standard_gates_by_name().get(own) == standard)
 
 
+@cache
+def _standard_non_gates_by_name() -> dict[str, type]:
+    """Qiskit's standard operations that carry no gate mark, by their class.
+
+    ``measure``, ``reset`` and ``delay`` are standard but not gates, so they
+    are recognised by class, as the simulator recognises them.
+    """
+    from qiskit.circuit.library import get_standard_gate_name_mapping
+
+    return {
+        name: operation.base_class
+        for name, operation in get_standard_gate_name_mapping().items()
+        if getattr(operation, "_standard_gate", None) is None
+    }
+
+
 def is_standard_namesake(operation: Any) -> bool:
-    """True for an operation named like a Qiskit standard gate without being it.
+    """True for an operation named like a Qiskit standard one without being it.
 
     Names are a lookup key, not an identity: a custom gate called ``t`` whose
     definition is an ``X`` is no ``T`` gate, and neither is Qiskit's ``X``
-    copied under that name.
+    copied under that name. Nor is a gate called ``measure`` a measurement,
+    though passes that match by name treat it as one.
     """
     name = getattr(operation, "name", None)
-    return (
-        isinstance(name, str)
-        and name in _standard_gates_by_name()
-        and not is_standard_gate(operation)
-    )
+    if not isinstance(name, str):
+        return False
+    kind = _standard_non_gates_by_name().get(name)
+    if kind is not None:
+        return not isinstance(operation, kind)
+    return name in _standard_gates_by_name() and not is_standard_gate(operation)
 
 
 def _is_named_operation(operation: Any) -> bool:
