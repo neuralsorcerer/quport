@@ -129,8 +129,8 @@ def _coerce_finite_float(value: object, *, label: str) -> float:
     return out
 
 
-def _seeded_rng(seed: object) -> random.Random:
-    """A generator for ``seed``: an integer, NumPy's included, or None.
+def _validate_seed(seed: object) -> int | None:
+    """Return ``seed`` as an integer, NumPy's included, or None.
 
     ``random.Random`` takes ``True`` as seed 1 and refuses a NumPy integer;
     neither is what a caller means, so both are settled here, as
@@ -138,7 +138,12 @@ def _seeded_rng(seed: object) -> random.Random:
     """
     if seed is not None and (is_boolean(seed) or not isinstance(seed, Integral)):
         raise ValueError("seed must be an integer or None")
-    return random.Random(None if seed is None else int(seed))
+    return None if seed is None else int(seed)
+
+
+def _seeded_rng(seed: object) -> random.Random:
+    """A generator for ``seed``, validated by :func:`_validate_seed`."""
+    return random.Random(_validate_seed(seed))
 
 
 def _validate_positive_float(value: object, *, label: str) -> float:
@@ -484,7 +489,7 @@ def balanced_greedy_partition(
         normalized_weights=normalized_weights,
         n_qpus=n_qpus,
         capacity=capacity,
-        seed=seed,
+        seed=_validate_seed(seed),
         alpha_balance=alpha,
     )
 
@@ -1054,6 +1059,7 @@ def tpccap_partition(
     congestion_source = _validate_congestion_source(
         congestion_source, packets=packets_value
     )
+    seed_value = _validate_seed(seed)
     if n == 0:
         return _empty_partition_result(n_qpus), _zero_partition_diagnostics()
 
@@ -1064,7 +1070,7 @@ def tpccap_partition(
         capacity=capacity,
         comm_ports_per_qpu=comm_ports_per_qpu,
         sp=sp,
-        seed=seed,
+        seed=seed_value,
         w_dist=w_dist_value,
         w_port=w_port_value,
         w_cong=w_cong_value,

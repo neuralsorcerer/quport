@@ -1764,3 +1764,33 @@ def test_partitioners_take_a_numpy_seed_and_refuse_a_boolean(strategy: str) -> N
     for bad in (True, 1.5, "3"):
         with pytest.raises(ValueError, match="seed must be an integer"):
             run(bad)
+
+
+@pytest.mark.parametrize("strategy", ["balanced", "tpccap", "tpccap_sa", "ebit"])
+def test_partitioners_refuse_a_bad_seed_with_no_qubits_too(strategy: str) -> None:
+    """balanced and tpccap returned early on an empty instance, before the seed
+    was ever looked at, so they accepted what the other two refused."""
+    from qiskit import QuantumCircuit
+
+    from quport.hypergraph import build_distributable_packets
+    from quport.network import all_pairs_shortest_paths
+    from quport.partition import (
+        balanced_greedy_partition,
+        ebit_partition,
+        tpccap_partition,
+        tpccap_sa_partition,
+    )
+
+    paths = all_pairs_shortest_paths([[1], [0]])
+    packets = build_distributable_packets(QuantumCircuit(0))
+    run = {
+        "balanced": lambda s: balanced_greedy_partition(0, {}, 2, 2, seed=s),
+        "tpccap": lambda s: tpccap_partition(0, {}, 2, 2, 1, paths, seed=s),
+        "tpccap_sa": lambda s: tpccap_sa_partition(0, {}, 2, 2, 1, paths, seed=s),
+        "ebit": lambda s: ebit_partition(0, {}, 2, 2, 1, paths, packets, seed=s),
+    }[strategy]
+
+    run(0)
+    for bad in (True, 1.5, "seven"):
+        with pytest.raises(ValueError, match="seed must be an integer"):
+            run(bad)
