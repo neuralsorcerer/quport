@@ -47,9 +47,13 @@ which an operation commutes with `Z`, from three rules applied in order:
 
 1. an explicit table for operations whose structure is not otherwise derivable
    (`rzz` on both operands, `rzx` on operand 0, `swap`/`ecr`/`rxx` on neither);
-2. `ControlledGate` structure — every control operand is diagonal regardless of
-   `ctrl_state`, and because `C(U) = P_0 (x) I + P_1 (x) U`, every operand that is
-   diagonal for the base gate stays diagonal once controlled;
+2. `ControlledGate` structure, for Qiskit's own controlled gates — every control
+   operand is diagonal regardless of `ctrl_state`, and because
+   `C(U) = P_0 (x) I + P_1 (x) U`, every operand that is diagonal for the base gate
+   stays diagonal once controlled. Any other controlled gate, one built with
+   `Gate.control` or by hand, runs its definition whatever its `base_gate` says, so
+   it is judged by what it does: by its unitary when it has at most six qubits and
+   bound parameters, otherwise gate by gate through its definition;
 3. a table of diagonal single-qubit gates (`z`, `s`, `t`, `rz`, `p`, …).
 
 Anything else is reported as non-diagonal on every operand. That direction of error

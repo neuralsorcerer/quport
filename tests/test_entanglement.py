@@ -325,3 +325,73 @@ def test_a_renamed_x_closes_the_cat_copy_it_would_break() -> None:
 
     assert plan.epr_pairs == 2
     assert verify_telegate_equivalence(mapped, arch, plan)
+
+
+def _mislabelled_controlled_gate() -> Gate:
+    """A ``ControlledGate`` labelled controlled-Z whose definition flips operand 0."""
+    from qiskit import QuantumCircuit
+    from qiskit.circuit import ControlledGate
+    from qiskit.circuit.library import ZGate
+
+    definition = QuantumCircuit(2)
+    definition.cx(1, 0)
+    return ControlledGate(
+        "cfoo", 2, [], num_ctrl_qubits=1, definition=definition, base_gate=ZGate()
+    )
+
+
+def test_a_controlled_gate_is_judged_by_its_definition_not_its_base_gate() -> None:
+    """``base_gate`` is a label: the definition is what runs, and this one is a
+    CX targeting operand 0, so only operand 1 commutes with Z."""
+    gate = _mislabelled_controlled_gate()
+
+    assert set(diagonal_positions(gate)) == _commuting_positions(gate) == {1}
+
+
+def test_a_mislabelled_controlled_gate_closes_the_cat_copy_it_would_break() -> None:
+    from qiskit import QuantumCircuit
+
+    from quport.aggregation import aggregate_remote_operations
+    from quport.architecture import MultiQPUArchitecture
+    from quport.config import MultiQPUConfig
+    from quport.hypergraph import build_distributable_packets, ebit_cost
+    from quport.protocol import verify_telegate_equivalence
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.h(0)
+    mapped.h(1)
+    mapped.cx(0, 3)
+    mapped.append(_mislabelled_controlled_gate(), [0, 1])
+    mapped.cx(0, 3)
+
+    plan = aggregate_remote_operations(mapped, arch)
+    part = [arch.qpu_of_phys(phys) for phys in range(arch.n_phys)]
+
+    assert plan.epr_pairs == 2
+    assert ebit_cost(build_distributable_packets(mapped), part, 2) == 2
+    assert verify_telegate_equivalence(mapped, arch, plan)
+
+
+def test_controlled_gates_built_by_qiskit_keep_their_exact_diagonal_operands() -> None:
+    """Gates from ``Gate.control`` are judged by their unitary, which agrees with
+    their structure; a wider one or one with an unbound angle falls back to its
+    definition, which can only under-report."""
+    from qiskit.circuit import Parameter
+    from qiskit.circuit.library import HGate, RZGate, ZGate
+
+    for gate in (
+        HGate().control(2, annotated=False),
+        HGate().control(2, ctrl_state=0, annotated=False),
+        RZGate(0.3).control(2, annotated=False),
+        ZGate().control(3, annotated=False),
+    ):
+        assert set(diagonal_positions(gate)) == _commuting_positions(gate)
+
+    wide = HGate().control(6, annotated=False)
+    assert set(diagonal_positions(wide)) == set(range(6))
+
+    unbound = RZGate(Parameter("theta")).control(2, annotated=False)
+    assert {0, 1} <= set(diagonal_positions(unbound)) <= {0, 1, 2}

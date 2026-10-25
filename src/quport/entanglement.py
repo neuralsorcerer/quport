@@ -56,7 +56,9 @@ from collections.abc import Iterable, Sequence
 from functools import cache
 from typing import Any
 
-from qiskit.circuit import ControlledGate, Delay, Operation
+import numpy as np
+from qiskit.circuit import ControlledGate, Delay, Operation, QuantumCircuit
+from qiskit.exceptions import QiskitError
 
 __all__ = [
     "DIAGONAL_1Q_GATES",
@@ -112,6 +114,10 @@ DIAGONAL_QARG_POSITIONS: dict[str, tuple[int, ...]] = {
     "reset": (),
     "initialize": (),
 }
+
+#: Widest controlled gate outside Qiskit's library whose unitary is built to
+#: find its diagonal operands; a wider one is judged gate by gate.
+_MAX_UNITARY_QUBITS = 6
 
 
 def is_directive(operation: Any) -> bool:
@@ -198,11 +204,16 @@ def diagonal_positions(operation: Operation | Any) -> frozenset[int]:
     1. An explicit entry in :data:`DIAGONAL_QARG_POSITIONS`, for Qiskit's own
        gate of that name -- a custom gate that merely shares the name gets
        none of the tables' entries.
-    2. :class:`~qiskit.circuit.ControlledGate` structure. A controlled gate is
-       block diagonal in its control basis, so all ``num_ctrl_qubits`` control
-       operands are diagonal regardless of ``ctrl_state``; and because
+    2. :class:`~qiskit.circuit.ControlledGate` structure, for Qiskit's own
+       controlled gates. A controlled gate is block diagonal in its control
+       basis, so all ``num_ctrl_qubits`` control operands are diagonal
+       regardless of ``ctrl_state``; and because
        ``C(U) = P_0 (x) I + P_1 (x) U``, every operand that is diagonal for the
-       base gate stays diagonal once controlled.
+       base gate stays diagonal once controlled. Any other controlled gate --
+       one built by :meth:`~qiskit.circuit.Gate.control`, or by hand from a
+       definition its ``base_gate`` need not describe -- is judged by what it
+       does: by its unitary when it has at most six qubits and bound
+       parameters, otherwise gate by gate through its definition.
     3. :data:`DIAGONAL_1Q_GATES` for Qiskit's own single-qubit operations.
 
     Anything else is reported as non-diagonal on every operand.
@@ -219,6 +230,10 @@ def diagonal_positions(operation: Operation | Any) -> frozenset[int]:
             return frozenset(explicit)
 
     if isinstance(operation, ControlledGate):
+        if not _is_qiskit_operation(operation):
+            # Anyone can build a ControlledGate from any definition, and the
+            # definition is what runs: its base gate is only a label.
+            return _definition_diagonal_positions(operation)
         num_ctrl = operation.num_ctrl_qubits
         if type(num_ctrl) is bool or not isinstance(num_ctrl, int) or num_ctrl < 0:
             return frozenset()
@@ -235,6 +250,61 @@ def diagonal_positions(operation: Operation | Any) -> frozenset[int]:
             return frozenset({0})
 
     return frozenset()
+
+
+def _is_qiskit_operation(operation: Any) -> bool:
+    """True for Qiskit's standard gates and the classes of its circuit library.
+
+    Their definitions are built from what they are, so their structure can be
+    read off them. Qiskit's singleton classes carry no module, and are all
+    standard gates.
+    """
+    module = type(operation).__module__ or ""
+    return is_standard_gate(operation) or module.startswith("qiskit.circuit.library")
+
+
+def _definition_diagonal_positions(operation: Any) -> frozenset[int]:
+    """Diagonal operands of an operation, from what its definition does.
+
+    A narrow enough operation with bound parameters is judged by its unitary,
+    exactly. Otherwise an operand is diagonal when every gate of the definition
+    acts on it diagonally, since a product of operators that each commute with
+    ``Z`` commutes with it too.
+    """
+    num_qubits = _num_qubits(operation)
+    if num_qubits <= _MAX_UNITARY_QUBITS:
+        from qiskit.quantum_info import Operator
+
+        try:
+            unitary = Operator(operation).data
+        except (QiskitError, TypeError, ValueError):
+            pass
+        else:
+            labels = np.arange(2**num_qubits)
+            positions = set()
+            for position in range(num_qubits):
+                bit = (labels >> position) & 1
+                # U commutes with Z on an operand exactly when it never maps a
+                # basis state to one with that operand's bit flipped.
+                if np.allclose(unitary[bit[:, None] != bit[None, :]], 0.0, atol=1e-10):
+                    positions.add(position)
+            return frozenset(positions)
+
+    definition = getattr(operation, "definition", None)
+    if not isinstance(definition, QuantumCircuit):
+        return frozenset()
+    if definition.num_qubits != num_qubits:
+        return frozenset()
+    index = {qubit: position for position, qubit in enumerate(definition.qubits)}
+    disturbed: set[int] = set()
+    for instruction in definition.data:
+        diagonal = diagonal_positions(instruction.operation)
+        disturbed.update(
+            index[qubit]
+            for position, qubit in enumerate(instruction.qubits)
+            if position not in diagonal
+        )
+    return frozenset(set(range(num_qubits)) - disturbed)
 
 
 def acts_diagonally(operation: Operation | Any, position: int) -> bool:
