@@ -27,10 +27,13 @@ hypergraph partitioning, which is what this module computes:
 
 Each *distributable packet* ``P`` is a maximal run of gates over which one root
 qubit stays diagonal in the computational basis, and it contributes one e-bit
-per distinct remote QPU its partners occupy. This is exactly the number of
-cat-entanglements a compiler must perform, which is why
+per distinct remote QPU its partners occupy: one cat-entanglement each.
 :func:`quport.aggregation.aggregate_remote_operations` reproduces this count
-exactly when comm ports are unconstrained.
+exactly when comm ports are unconstrained and every cross-QPU gate's root is
+forced -- one operand diagonal and the other not, as for every ``cx``. A
+symmetric gate (``cz``, ``cp``, ``rzz``) leaves the root free, and the
+aggregator, which knows the placement, may choose it differently and land on
+either side of this count.
 
 Why packets are partition independent
 -------------------------------------
@@ -356,9 +359,11 @@ def ebit_cost(
     """Return the lambda-1 e-bit cost of ``part``.
 
     One e-bit per (packet, distinct remote QPU) pair, plus ``2`` for every
-    operand of an unpackable gate that sits off that gate's host QPU. This is
-    the exact number of EPR pairs a cat-entanglement compiler consumes when comm
-    ports are unconstrained.
+    operand of an unpackable gate that sits off that gate's host QPU: the EPR
+    pairs a cat-entanglement compiler consumes for these packets when comm
+    ports are unconstrained. :func:`quport.aggregation.aggregate_remote_operations`
+    spends exactly this many whenever each cross-QPU gate's root is forced; on
+    symmetric gates it may root packets differently.
     """
     n_qpus_value = _validate_n_qpus(n_qpus)
     assignments = _validate_part(
