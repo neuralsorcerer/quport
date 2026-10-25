@@ -527,8 +527,9 @@ def verify_telegate_equivalence(
     diagonality rule. Aggregating across an operation that breaks the rule
     leaves the root entangled with its copy and lowers the fidelity by however
     much that operation moves the root's computational-basis label: an ``X``
-    sends it to about zero, a small rotation only slightly below one. Either
-    fails the check, whose tolerance is ``atol``.
+    sends it far below one -- to 0.002 with the default input seed, and no
+    higher than 0.72 for any seed from 0 to 19 -- a small rotation only
+    slightly below one. Either fails the check, whose tolerance is ``atol``.
 
     Parameters
     ----------
