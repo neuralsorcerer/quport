@@ -9,7 +9,7 @@ from __future__ import annotations
 import heapq
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Integral, Real
 from typing import Any, SupportsFloat, SupportsIndex, cast
 
@@ -1998,6 +1998,13 @@ def audit_entanglement_schedule(
         the summary is consistent and feasible.
     """
     lat = _validate_schedule_inputs(arch, model)
+    # A summary rebuilt from entanglement_plan.json holds each edge as a list.
+    links = tuple(
+        (tuple(edge) if isinstance(edge, list) else edge, busy)
+        for edge, busy in summary.link_busy_time
+    )
+    if links != tuple(summary.link_busy_time):
+        summary = replace(summary, link_busy_time=links)
     n_qpus = arch.cfg.n_qpus
     ports = _normalized_port_budget(ports_per_qpu, arch)
     link_cap = _validated_nonnegative_int(

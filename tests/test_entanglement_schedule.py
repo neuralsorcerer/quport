@@ -990,3 +990,22 @@ def test_audit_allows_latencies_lost_to_rounding_far_out_on_a_timeline():
         )
         == ()
     )
+
+
+def test_audit_takes_a_summary_rebuilt_from_json():
+    """``to_dict`` writes each link as a list, which the audit's link checks
+    could not hash."""
+    import dataclasses
+    import json
+
+    from quport.schedule import audit_entanglement_schedule
+
+    summary, mapped, arch, model, plan = _scheduled_case()
+    links = json.loads(json.dumps(summary.to_dict()))["link_busy_time"]
+    rebuilt = dataclasses.replace(
+        summary,
+        link_busy_time=tuple((entry["edge"], entry["busy"]) for entry in links),
+    )
+
+    assert isinstance(rebuilt.link_busy_time[0][0], list)
+    assert audit_entanglement_schedule(rebuilt, mapped, arch, model, plan=plan) == ()
