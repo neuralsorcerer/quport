@@ -1009,9 +1009,7 @@ def _check_manifest_describes(
             f"is {source.operation.name!r}"
         )
     params = getattr(source.operation, "params", [])
-    if _json_safe_sequence(list(op.params), set()) != _json_safe_sequence(
-        list(params), set()
-    ):
+    if _comparable_params(op.params) != _comparable_params(params):
         raise ValueError(
             f"remote_ops[{entry}] gives parameters {list(op.params)}, but "
             f"instruction {index} takes {list(params)}"
@@ -1022,6 +1020,28 @@ def _check_manifest_describes(
             f"remote_ops[{entry}] names classical bits {list(op.clbits)}, but "
             f"instruction {index} uses {clbits}"
         )
+
+
+def _comparable_params(params: Sequence[object]) -> Any:
+    """Parameters as a manifest can state them, for comparing two of them.
+
+    A value with no JSON form -- a control-flow body, a unitary's matrix -- is
+    written as its type and its text, and that text is not stable: a circuit
+    is drawn at the terminal's width, an array at NumPy's print precision. So
+    such a value is compared by its type alone; every other value exactly, as
+    it is written.
+    """
+
+    def described(value: Any) -> Any:
+        if isinstance(value, dict):
+            if set(value) == {"type", "repr"}:
+                return {"type": value["type"]}
+            return {key: described(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [described(item) for item in value]
+        return value
+
+    return described(_json_safe_sequence(list(params), set()))
 
 
 def _check_manifest_markers(

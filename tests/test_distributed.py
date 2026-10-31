@@ -2954,3 +2954,44 @@ def test_reassembly_keeps_the_global_phase() -> None:
         reference = QuantumCircuit(merged.num_qubits)
         reference.compose(physical, qubits=range(physical.num_qubits), inplace=True)
         assert Operator(merged) == Operator(reference)
+
+
+def test_manifest_params_with_no_json_form_are_compared_by_type() -> None:
+    """A unitary's matrix and a branch body are written as text, which NumPy's
+    print options and the terminal's width change, so a genuine manifest read
+    back in another process was refused as naming other parameters."""
+    import dataclasses
+    import json
+
+    import numpy as np
+    from qiskit.circuit.library import UnitaryGate
+    from qiskit.quantum_info import random_unitary
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = QuantumCircuit(arch.n_phys, 1)
+    mapped.append(UnitaryGate(random_unitary(4, seed=3)), [0, 3])
+    mapped.measure(0, 0)
+    with mapped.if_test((mapped.clbits[0], 1)):
+        mapped.cx(1, 4)
+    program = split_into_qpus(mapped, arch)
+
+    def as_read_back(op: Any, **change: Any) -> Any:
+        params = json.loads(json.dumps(op.to_dict()["params"]))
+        for value in params:
+            if isinstance(value, dict) and "repr" in value:
+                value["repr"] = "drawn at another width"
+                value.update(change)
+        return dataclasses.replace(op, params=params)
+
+    with np.printoptions(precision=3):
+        read_back = [as_read_back(op) for op in program.remote_ops]
+    reassemble_distributed_program(mapped, program.local_circuits, read_back, arch)
+
+    retyped = [as_read_back(program.remote_ops[0], type="QuantumCircuit")]
+    retyped += read_back[1:]
+    with pytest.raises(ValueError, match="gives parameters"):
+        reassemble_distributed_program(mapped, program.local_circuits, retyped, arch)
