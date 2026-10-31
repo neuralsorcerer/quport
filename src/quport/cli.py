@@ -305,6 +305,56 @@ def _load_or_random_circuit(
 #: The summaries ``compile-dist`` writes beside its programs and manifest.
 _COMPILE_SUMMARIES = ("schedule.json", "schedule_trace.json", "entanglement_plan.json")
 
+
+def _write_layout(path: Path, initial: list[int], final: list[int]) -> None:
+    """Write where each input qubit starts and ends on the physical machine.
+
+    The OpenQASM 3 programs record no layout, so without this a reader of the
+    files alone cannot tell which physical qubit holds which input qubit, nor
+    where routing left it.
+    """
+    path.write_text(
+        json.dumps(
+            {"initial_layout": list(initial), "final_layout": list(final)}, indent=2
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _mapped_layouts(mapped: QuantumCircuit) -> tuple[list[int], list[int]]:
+    """Input qubits' physical positions before and after a mapped circuit runs."""
+    layout = mapped.layout
+    if layout is None:
+        identity = list(range(mapped.num_qubits))
+        return identity, identity
+    return (
+        layout.initial_index_layout(filter_ancillas=True),
+        layout.final_index_layout(filter_ancillas=True),
+    )
+
+
+def _routed_final_layout(
+    initial: list[int],
+    local_routed: Mapping[int, QuantumCircuit],
+    arch: MultiQPUArchitecture,
+) -> list[int]:
+    """Where local routing leaves each input qubit, given where it started.
+
+    Each routed program spans the whole machine in physical labelling and
+    permutes only its own QPU's qubits, so an input qubit's final position is
+    its starting one, moved by its QPU's program.
+    """
+    final: list[int] = []
+    for physical in initial:
+        routed = local_routed.get(arch.qpu_of_phys(physical))
+        layout = routed.layout if routed is not None else None
+        final.append(
+            layout.final_index_layout()[physical] if layout is not None else physical
+        )
+    return final
+
+
 #: Partition strategies the mapping and compiling commands take.
 _STRATEGIES = ("balanced", "cluster", "ebit", "tpccap", "tpccap_sa")
 
@@ -669,6 +719,7 @@ def split(
 
     # write remote ops
     write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
+    _write_layout(outp / "layout.json", *_mapped_layouts(res.mapped_circuit))
     _remove_stale_programs(outp, programs, keep=[input_qasm] if input_qasm else [])
     # A compile-dist bundle's summaries describe its own manifest, which this
     # one has replaced.
@@ -1102,6 +1153,12 @@ def compile_dist(
     # them: local routing permutes qubits inside a QPU unless the intra-QPU
     # topology is a clique, and the pre-routing indices would point elsewhere.
     write_remote_ops_json(res.routed_remote_ops, outp / "remote_ops.json")
+    initial, _ = _mapped_layouts(res.physical_circuit)
+    _write_layout(
+        outp / "layout.json",
+        initial,
+        _routed_final_layout(initial, res.local_routed, MultiQPUArchitecture(cfg)),
+    )
     (outp / "schedule.json").write_text(
         json.dumps(res.schedule.to_dict(), indent=2, allow_nan=False),
         encoding="utf-8",

@@ -118,7 +118,9 @@ quport split --n-logical 6 --depth 5 --seed 1 --strategy tpccap --out-dir distri
 ```
 
 Maps a random or `--input-qasm` circuit globally, splits the mapped circuit into
-per-QPU local QASM files, and writes `remote_ops.json`. The directory then holds
+per-QPU local QASM files, and writes `remote_ops.json` and `layout.json` -- the
+physical qubit each input qubit starts on and the one holding it when the programs
+end, which the OpenQASM files cannot record. The directory then holds
 this one bundle: a `qpu_<id>.qasm` an earlier run left there for a QPU this run does
 not write is removed, and so are the routed programs and the `schedule.json`,
 `schedule_trace.json` and `entanglement_plan.json` a `compile-dist` run left, whose
@@ -223,6 +225,7 @@ benchmark. Output artifacts:
 
 - `qpu_<id>_routed.qasm`: locally routed per-QPU programs;
 - `remote_ops.json`: ordered remote operation manifest, in the routed programs' physical-qubit labelling (local routing permutes qubits inside a QPU unless the intra-QPU topology is a clique, so the pre-routing indices would point elsewhere);
+- `layout.json`: `initial_layout`, the physical qubit each input qubit starts on, and `final_layout`, the one local routing leaves it on -- the permutation the OpenQASM files cannot record, and that a reader of the files alone needs to find each qubit's final state;
 - `schedule.json`: topology-aware schedule summary emitted from `TopologyScheduleSummary.to_dict()`;
 - `schedule_trace.json`: detailed per-layer/per-round communication plan emitted from `TopologySchedulePlan.to_dict()`, with absolute `start_time` / `end_time` offsets for layers and remote rounds;
 - `entanglement_plan.json`: aggregated EPR blocks, the e-bit report for the chosen partition, and the entanglement-aware schedule summary (audited before writing, like the schedule trace). Blocks are planned on the physical circuit, before local routing: `root_phys` is a position in that labelling, and `gate_indices` match the manifest's `index` field, whose entry gives the root's routed position at each gate.

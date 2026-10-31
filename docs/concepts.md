@@ -168,7 +168,9 @@ ready once its marker leads on every QPU listed there, and `operands` names all
 of its operands, which for an operation on three or more qubits the two
 endpoints do not. `reassemble_distributed_program` implements that rule, and
 `verify_distributed_program` uses it to check that the artifacts still compute
-the circuit they came from.
+the circuit they came from, up to the permutation local routing leaves each
+QPU's qubits in; the files cannot record it, so the CLI writes it to
+`layout.json`.
 
 Classical bits are not split: every program refers to the source circuit's
 bits, so a conditional on one QPU can read a bit measured on another. Each

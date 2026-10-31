@@ -1619,6 +1619,7 @@ Produces:
 |---|---|
 | `qpu_<id>.qasm` | Local OpenQASM 3 circuit for QPU `<id>`. |
 | `remote_ops.json` | Ordered list of cross-QPU operations. |
+| `layout.json` | `initial_layout` and `final_layout`: the physical qubit each input qubit starts on, and the one holding it when the programs end. OpenQASM 3 records no layout. |
 
 ### `quport compile-dist --out-dir compile_out`
 
@@ -1628,6 +1629,7 @@ Produces:
 |---|---|
 | `qpu_<id>_routed.qasm` | Locally routed OpenQASM 3 circuit for QPU `<id>`. |
 | `remote_ops.json` | Ordered remote-operation trace, in the **routed** programs' physical-qubit labelling. |
+| `layout.json` | `initial_layout` and `final_layout`: the physical qubit each input qubit starts on, and the one local routing leaves it on. OpenQASM 3 records no layout. |
 | `schedule.json` | Strict JSON topology-aware schedule summary produced from `TopologyScheduleSummary.to_dict()`. |
 | `schedule_trace.json` | Strict JSON per-layer/per-round communication plan produced from `TopologySchedulePlan.to_dict()`, with absolute timing, QPU-pair packing, port use, link utilization, and unschedulable penalty rounds. |
 | `entanglement_plan.json` | Strict JSON bundle with the aggregated EPR blocks (`aggregation`), the $\lambda-1$ e-bit report for the chosen partition (`ebits`), and the entanglement-aware schedule summary (`schedule`). |

@@ -308,6 +308,7 @@ def test_split_writes_one_qasm_per_qpu_plus_remote_ops(tmp_path: Path) -> None:
         "qpu_0.qasm",
         "qpu_1.qasm",
         "remote_ops.json",
+        "layout.json",
     }
     assert isinstance(json.loads((out_dir / "remote_ops.json").read_text()), list)
 
@@ -337,6 +338,7 @@ def test_compile_dist_writes_routed_programs_and_schedule_manifests(
         "qpu_0_routed.qasm",
         "qpu_1_routed.qasm",
         "remote_ops.json",
+        "layout.json",
         "schedule.json",
         "schedule_trace.json",
         "entanglement_plan.json",
@@ -1723,7 +1725,13 @@ def test_split_and_compile_dist_into_one_directory_leave_one_bundle(
 
     names = sorted(path.name for path in out_dir.iterdir())
     if order[-1] == "split":
-        assert names == ["qpu_0.qasm", "qpu_1.qasm", "qpu_2.qasm", "remote_ops.json"]
+        assert names == [
+            "layout.json",
+            "qpu_0.qasm",
+            "qpu_1.qasm",
+            "qpu_2.qasm",
+            "remote_ops.json",
+        ]
     else:
         assert not any(re.fullmatch(r"qpu_\d+\.qasm", name) for name in names)
         assert {"schedule.json", "schedule_trace.json"} <= set(names)
@@ -1758,3 +1766,89 @@ def test_an_input_named_like_a_program_is_not_removed(
     )
 
     assert source.read_text(encoding="utf-8") == qasm2.dumps(circuit)
+
+
+@pytest.mark.parametrize("command", ["split", "compile-dist"])
+def test_the_bundle_records_where_each_input_qubit_ends(
+    tmp_path: Path, command: str
+) -> None:
+    """No file recorded the layout, so a reader of the files alone could not
+    tell which physical qubit ends up holding which input qubit: on a line,
+    routing permutes them, and the state read off the programs was wrong."""
+    from qiskit.quantum_info import Statevector
+
+    from quport.architecture import MultiQPUArchitecture
+    from quport.compiler import compile_distributed
+    from quport.config import LatencyModel, MultiQPUConfig, load_config
+    from quport.distributed import reassemble_distributed_program, split_into_qpus
+    from quport.pipeline import map_and_transpile
+
+    circuit = QuantumCircuit(5)
+    circuit.h(0)
+    for target in range(1, 5):
+        circuit.cx(target - 1, target)
+        circuit.ry(0.3 * target, target)
+    # Triangles, which no line embeds, so local routing has to move qubits.
+    for a, b, c in ((0, 1, 2), (2, 3, 4)):
+        circuit.cx(a, b)
+        circuit.cx(b, c)
+        circuit.cx(c, a)
+    source = tmp_path / "input.qasm"
+    source.write_text(qasm2.dumps(circuit), encoding="utf-8")
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        json.dumps(
+            {
+                "n_qpus": 2,
+                "compute_qubits_per_qpu": 3,
+                "comm_qubits_per_qpu": 1,
+                "intra_topology": "line",
+                "optimization_level": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "bundle"
+    _run(
+        [
+            command,
+            "--input-qasm",
+            str(source),
+            "--config",
+            str(config),
+            "--seed",
+            "0",
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+    layout = json.loads((out_dir / "layout.json").read_text(encoding="utf-8"))
+
+    cfg = load_config(str(config))
+    arch = MultiQPUArchitecture(cfg)
+    loaded = qasm2.loads(source.read_text(encoding="utf-8"))
+    if command == "split":
+        mapped = map_and_transpile(
+            loaded, cfg, latency=LatencyModel(), seed=0, strategy="tpccap"
+        ).mapped_circuit
+        program = split_into_qpus(mapped, arch)
+        merged = reassemble_distributed_program(
+            mapped, program.local_circuits, program.remote_ops, arch
+        )
+    else:
+        result = compile_distributed(
+            loaded, cfg, latency=LatencyModel(), seed=0, strategy="tpccap_sa"
+        )
+        merged = reassemble_distributed_program(
+            result.physical_circuit,
+            result.local_routed,
+            result.routed_remote_ops,
+            arch,
+            restore_layout=False,
+        )
+
+    assert len(layout["initial_layout"]) == len(layout["final_layout"]) == 5
+    assert layout["initial_layout"] != layout["final_layout"]
+    expected = QuantumCircuit(merged.num_qubits)
+    expected.compose(circuit, qubits=layout["final_layout"], inplace=True)
+    assert Statevector(merged).equiv(Statevector(expected))
