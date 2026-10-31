@@ -325,3 +325,54 @@ def test_every_temporal_decay_default_is_the_documented_one() -> None:
     assert implicit.partition == explicit.partition
     # guard against the comparison being vacuous
     assert implicit.partition != nearby.partition
+
+
+def test_interactions_inside_control_flow_count_on_the_qubits_they_touch() -> None:
+    """A wide block holding CX gates contributed nothing, and a two-qubit block
+    holding none counted as an interaction, so the partitioners split pairs
+    that interact inside a box and reported a cut of zero."""
+    qc = QuantumCircuit(4, 1)
+    with qc.box():
+        qc.cx(0, 1)
+        qc.cx(1, 2)
+    with qc.if_test((qc.clbits[0], 1)) as orelse:
+        qc.cx(2, 3)
+    with orelse:
+        qc.cx(3, 0)
+    with qc.for_loop(range(3)):
+        qc.cz(1, 3)
+    with qc.if_test((qc.clbits[0], 0)):
+        qc.x(0)
+        qc.barrier(0, 2)
+
+    assert extract_twoq_weights(qc) == {
+        (0, 1): 1,
+        (1, 2): 1,
+        (2, 3): 1,
+        (0, 3): 1,
+        (1, 3): 1,
+    }
+    temporal = extract_temporal_twoq_weights(qc, decay=0.5)
+    assert temporal == pytest.approx(
+        {(0, 1): 1.0, (1, 2): 0.5, (2, 3): 0.25, (0, 3): 0.125, (1, 3): 0.0625}
+    )
+    assert cut_weight(extract_twoq_weights(qc), [0, 1, 0, 1]) == 4.0
+
+
+def test_a_box_of_gates_keeps_its_pairs_together_when_mapped() -> None:
+    from quport.config import MultiQPUConfig
+    from quport.pipeline import map_and_transpile
+
+    qc = QuantumCircuit(4)
+    with qc.box():
+        for _ in range(3):
+            qc.cx(0, 1)
+            qc.cx(2, 3)
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=0)
+
+    for strategy in ("balanced", "tpccap"):
+        result = map_and_transpile(qc, cfg, seed=0, strategy=strategy)
+        part = result.partition
+        assert part[0] == part[1] and part[2] == part[3], strategy
+        assert result.partition_cut == 0.0
+        assert result.metrics.remote_2q == 0

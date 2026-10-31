@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from numbers import Integral
 from typing import SupportsFloat, SupportsIndex, TypeAlias, cast
 
 from qiskit import QuantumCircuit
+from qiskit.circuit import ControlFlowOp
 
 from quport._validation import is_boolean, validate_nonnegative_integral
 
@@ -54,32 +55,49 @@ def _iter_validated_weights(
         yield i, j, weight
 
 
+def _two_qubit_interactions(
+    circuit: QuantumCircuit, outer: Sequence[int]
+) -> Iterator[tuple[int, int]]:
+    """Each two-qubit interaction, in program order, as a sorted index pair.
+
+    ``outer[k]`` is the index, in the circuit being analysed, of ``circuit``'s
+    qubit ``k``. A control-flow operation is no interaction itself: the gates
+    in its bodies are, on the qubits the block applies them to -- once each,
+    in every branch -- as :func:`quport.metrics.compute_metrics` counts them,
+    so wrapping gates in a ``box`` or a condition does not hide them.
+    """
+    position = {qubit: outer[index] for index, qubit in enumerate(circuit.qubits)}
+    for inst in circuit.data:
+        operation = inst.operation
+        if isinstance(operation, ControlFlowOp):
+            applied = [position[qubit] for qubit in inst.qubits]
+            for block in operation.blocks:
+                yield from _two_qubit_interactions(block, applied)
+            continue
+        if len(inst.qubits) != 2:
+            continue
+        # Compiler directives (e.g. a 2-qubit barrier) are not interactions.
+        if getattr(operation, "_directive", False):
+            continue
+        i = position[inst.qubits[0]]
+        j = position[inst.qubits[1]]
+        if i == j:
+            continue
+        yield (i, j) if i < j else (j, i)
+
+
 def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
     """Extract a weighted *undirected* interaction graph from a circuit.
 
     For each 2-qubit instruction acting on logical qubits (i, j), we increment
-    weight[(min(i,j), max(i,j))].
+    weight[(min(i,j), max(i,j))]. Instructions inside control-flow bodies count
+    too, once each, in every branch, on the qubits the block applies them to.
 
     This works for random circuits and any circuits with 2Q ops (cx, cz, ecr, rxx, etc.).
     """
     weights: dict[tuple[int, int], int] = defaultdict(int)
-
-    # Fast index lookup
-    qindex = {q: i for i, q in enumerate(qc.qubits)}
-
-    for inst in qc.data:
-        if len(inst.qubits) != 2:
-            continue
-        # Compiler directives (e.g. a 2-qubit barrier) are not interactions.
-        if getattr(inst.operation, "_directive", False):
-            continue
-        i = qindex[inst.qubits[0]]
-        j = qindex[inst.qubits[1]]
-        if i == j:
-            continue
-        a, b = (i, j) if i < j else (j, i)
-        weights[(a, b)] += 1
-
+    for edge in _two_qubit_interactions(qc, range(len(qc.qubits))):
+        weights[edge] += 1
     return dict(weights)
 
 
@@ -149,7 +167,8 @@ def extract_temporal_twoq_weights(
 
         w_t = decay ** t
 
-    where t is a monotonically increasing instruction index over 2Q ops.
+    where t is a monotonically increasing instruction index over 2Q ops, those
+    inside control-flow bodies included, in program order.
 
     Parameters
     ----------
@@ -165,21 +184,9 @@ def extract_temporal_twoq_weights(
     decay_value = validate_temporal_decay(decay)
 
     weights: dict[tuple[int, int], float] = defaultdict(float)
-    qindex = {q: i for i, q in enumerate(qc.qubits)}
-    t = 0
-    for inst in qc.data:
-        if len(inst.qubits) != 2:
-            continue
-        # Compiler directives (e.g. a 2-qubit barrier) are not interactions.
-        if getattr(inst.operation, "_directive", False):
-            continue
-        i = qindex[inst.qubits[0]]
-        j = qindex[inst.qubits[1]]
-        if i == j:
-            continue
-        a, b = (i, j) if i < j else (j, i)
-        weights[(a, b)] += float(decay_value**t)
-        t += 1
+    interactions = _two_qubit_interactions(qc, range(len(qc.qubits)))
+    for t, edge in enumerate(interactions):
+        weights[edge] += float(decay_value**t)
     # Once decay**t underflows, an edge first seen after that point adds only
     # zeros; it carries no interaction and is left out of the graph.
     return {edge: weight for edge, weight in weights.items() if weight > 0.0}
