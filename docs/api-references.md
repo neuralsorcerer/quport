@@ -585,7 +585,9 @@ verify_distributed_program(mapped, local_routed, remote_ops, arch, *,
 `reassemble_distributed_program` is the inverse of `split_into_qpus`: it merges
 per-QPU programs and a remote-op manifest back into one circuit and, with
 `restore_layout=True`, undoes each QPU's routing permutation so the result is
-directly comparable with the mapped circuit, global phase included. Classical bits
+directly comparable with the mapped circuit, global phase included as far as
+Qiskit's local routing keeps it (at optimization levels 2 and 3 its two-qubit
+peephole pass can drop one). Classical bits
 and registers are carried across, so measurements and conditioned operations
 survive the round trip. Each remote operation runs as the mapped circuit has it,
 and a manifest entry naming another gate, other parameters, other classical bits,

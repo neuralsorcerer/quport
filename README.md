@@ -1688,7 +1688,8 @@ uses -- held in the mapped circuit's order, so routing cannot tie two of them
 together the other way round and leave programs no execution satisfies. An
 instruction that acts on no qubit, such as a condition whose body is empty,
 goes into QPU 0's program alone, so it still runs once, and so does the
-circuit's global phase.
+circuit's global phase -- in memory: OpenQASM 3 as Qiskit writes it carries no
+global phase, so the files do not.
 
 Qiskit's routing stage gathers a circuit's final measurements behind a barrier and
 puts them back in qubit order, which can swap two final measurements into the same
@@ -1864,6 +1865,9 @@ python examples/reproduce_readme_figures.py calibration
 - State-vector verification is exponential in circuit width and is refused above 24 qubits, and it is refused outright for circuits with mid-circuit measurement, reset, or classical control.
 - Cross-QPU classical feedforward is not marked in the emitted bundle: a program can read a classical bit another QPU writes, and the order of those accesses across QPUs is recorded only in the mapped circuit.
 - A control-flow operation spanning QPUs is listed in the manifest by name, bits and markers, with its bodies rendered as text and its condition left out: the manifest says where it runs, but running it takes the mapped circuit.
+- The manifest names each remote operation and its parameters but does not define it: a custom gate's definition is in no file, so a consumer of the Python API's bundles needs it from elsewhere. The CLI compiles only to Qiskit's standard gates, which need none.
+- Manifest `clbits` are positions among the source circuit's classical bits. Qiskit's OpenQASM 3 exporter declares bits outside any register first, as `_bit<position>`, and registers after them, so for a circuit with such bits the files declare bits in a different order from those positions.
+- The emitted OpenQASM files carry no global phase, which no measurement observes; the in-memory programs do.
 - Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.
