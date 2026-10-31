@@ -286,3 +286,24 @@ def test_transpiler_method_names_are_stored_stripped() -> None:
     cfg = MultiQPUConfig(layout_method=" dense", routing_method="sabre ")
 
     assert (cfg.layout_method, cfg.routing_method) == ("dense", "sabre")
+
+
+def test_dump_config_refuses_a_value_json_cannot_hold(tmp_path: Path) -> None:
+    """A ring ignores switch_reconfig_delay, so an infinite one passes
+    validation, and the dump wrote it as Infinity, which strict JSON parsers
+    refuse. YAML has an infinity and writes it."""
+    import math
+
+    from quport.config import MultiQPUConfig, dump_config, load_config
+
+    cfg = MultiQPUConfig(inter_topology="ring", switch_reconfig_delay=math.inf)
+    target = tmp_path / "cfg.json"
+    target.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="switch_reconfig_delay is inf"):
+        dump_config(cfg, str(target))
+    assert target.read_text(encoding="utf-8") == "{}"
+
+    pytest.importorskip("yaml")
+    dump_config(cfg, str(tmp_path / "cfg.yaml"))
+    assert math.isinf(load_config(str(tmp_path / "cfg.yaml")).switch_reconfig_delay)

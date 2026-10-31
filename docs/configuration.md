@@ -55,7 +55,9 @@ integer, an `int` subclass -- as a plain `int`, so such a config works
 everywhere a file-loaded one does. `dump_config` writes real values (a NumPy
 float, a `Fraction`, a `Decimal`) as plain numbers, and it serializes before
 opening the file, so a value the encoder rejects leaves an existing config
-untouched. The write itself is not atomic: a failure partway through it, such
+untouched. JSON has no infinity or NaN, so a field holding one -- possible in a
+field the topology ignores, which is not checked -- is refused with a message
+naming it; YAML writes it. The write itself is not atomic: a failure partway through it, such
 as a full disk, can leave the file truncated.
 
 ### Derived quantities

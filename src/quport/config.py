@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from decimal import Decimal
@@ -358,7 +359,16 @@ def dump_config(cfg: MultiQPUConfig, path: str) -> None:
         yaml = _load_yaml_module()
         text = yaml.safe_dump(data, sort_keys=False)
     else:
-        text = json.dumps(data, indent=2)
+        # JSON has no infinity or NaN; a field only some topologies read can
+        # hold one, and writing it as Python's extension would make a file
+        # strict parsers refuse.
+        for key, value in data.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(
+                    f"{key} is {value}, which JSON cannot represent; write the "
+                    "config as YAML or give the field a finite value"
+                )
+        text = json.dumps(data, indent=2, allow_nan=False)
     parent = Path(path).parent
     if parent != Path(""):
         parent.mkdir(parents=True, exist_ok=True)
