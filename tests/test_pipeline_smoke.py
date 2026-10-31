@@ -1016,6 +1016,26 @@ def test_global_routing_explains_a_gate_inside_a_block_it_cannot_route() -> None
         transpile_baseline(qc, _disconnected_cfg(), seed=0)
 
 
+def test_global_routing_explains_a_box_qiskit_panics_on() -> None:
+    """Qiskit's SABRE router panics, rather than raising, on a box whose gates
+    span disconnected QPUs, and the Rust panic reached the caller as is."""
+    from qiskit import QuantumCircuit
+
+    from quport.pipeline import map_and_transpile, transpile_baseline
+
+    qc = QuantumCircuit(4)
+    with qc.box():
+        qc.cx(0, 1)
+        qc.cx(1, 2)
+        qc.cx(2, 3)
+        qc.cx(3, 0)
+
+    with pytest.raises(ValueError, match="cannot connect QPUs"):
+        transpile_baseline(qc, _disconnected_cfg(), seed=0)
+    with pytest.raises(ValueError, match="cannot connect QPUs"):
+        map_and_transpile(qc, _disconnected_cfg(), seed=0, strategy="balanced")
+
+
 def test_global_routing_leaves_a_gate_qiskit_optimizes_away_to_qiskit() -> None:
     """A self-cancelling pair across the gap never reaches routing at level 3."""
     from qiskit import QuantumCircuit

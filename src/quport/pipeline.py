@@ -448,8 +448,12 @@ def _route_globally(
             routing_method=cfg.routing_method,
             seed_transpiler=seed,
         )
-    except TranspilerError as exc:
-        if "disconnected" not in str(exc):
+    except BaseException as exc:
+        # Qiskit reports disconnected operands as a TranspilerError, except
+        # that its SABRE router panics instead on a control-flow block whose
+        # gates span the gap; either way the reason is looked for.
+        disconnected = isinstance(exc, TranspilerError) and "disconnected" in str(exc)
+        if not (disconnected or _is_rust_panic(exc)):
             raise
         qpus = _unreachable_interaction(qc, initial_layout, arch, coupling)
         if qpus is None:
@@ -461,6 +465,12 @@ def _route_globally(
             "as unschedulable instead"
         ) from exc
     return _release_order_barriers(routed)
+
+
+def _is_rust_panic(exc: BaseException) -> bool:
+    """True for the exception a panic in Qiskit's Rust core surfaces as."""
+    kind = type(exc)
+    return kind.__name__ == "PanicException" and kind.__module__ == "pyo3_runtime"
 
 
 def _unreachable_interaction(
