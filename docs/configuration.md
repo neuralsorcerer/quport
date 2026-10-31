@@ -72,6 +72,11 @@ as a full disk, can leave the file truncated.
   dimensions are inferred. If one dimension is provided, the other is inferred.
 - `degree_d` uses `inter_degree` to create a bounded-degree QPU graph.
 - `clos` and `fat_tree` are abstractions, not detailed switch-level hardware descriptions.
+  In particular, the schedulers treat a QPU's comm qubits as interchangeable ports,
+  each able to hold an EPR half in the same round, whichever physical link the
+  architecture wires to it. `fat_tree` wires every inter-QPU link to the first port,
+  and `clos` reaches other pods only through the second, so on those fabrics read the
+  per-round port concurrency as an upper bound.
 - `switch_parallel_links`, `link_capacity`, `async_classical`, and `async_overlap`
   matter most in topology-aware scheduling.
 
