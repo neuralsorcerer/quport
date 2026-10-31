@@ -349,9 +349,9 @@ def _definition_to_expand(operation: Any) -> QuantumCircuit:
     definition = operation.definition
     if definition is None:
         raise ValueError(
-            f"gate {operation.name!r} shares a Qiskit standard gate's name "
-            "without being that gate, and has no definition to translate "
-            "it by; rename it"
+            f"operation {operation.name!r} shares the name of a Qiskit standard "
+            "operation without being it, and has no definition to translate it "
+            "by; rename it"
         )
     return definition
 

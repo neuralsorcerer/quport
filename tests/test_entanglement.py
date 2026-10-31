@@ -395,3 +395,19 @@ def test_controlled_gates_built_by_qiskit_keep_their_exact_diagonal_operands() -
 
     unbound = RZGate(Parameter("theta")).control(2, annotated=False)
     assert {0, 1} <= set(diagonal_positions(unbound)) <= {0, 1, 2}
+
+
+def test_a_controlled_gate_that_cannot_be_built_is_judged_non_diagonal() -> None:
+    """Building its unitary raised NotImplementedError, which escaped and took
+    aggregation down with it."""
+    from qiskit.circuit import ControlledGate
+    from qiskit.circuit.library import ZGate
+
+    class NativeCZ(ControlledGate):
+        def __init__(self) -> None:
+            super().__init__("native_cz", 2, [], num_ctrl_qubits=1, base_gate=ZGate())
+
+        def _define(self) -> None:
+            raise NotImplementedError("native gate, no decomposition")
+
+    assert diagonal_positions(NativeCZ()) == frozenset()

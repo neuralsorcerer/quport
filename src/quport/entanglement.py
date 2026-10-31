@@ -58,7 +58,6 @@ from typing import Any
 
 import numpy as np
 from qiskit.circuit import ControlledGate, Delay, Operation, QuantumCircuit
-from qiskit.exceptions import QiskitError
 
 __all__ = [
     "DIAGONAL_1Q_GATES",
@@ -287,7 +286,8 @@ def _definition_diagonal_positions(operation: Any) -> frozenset[int]:
     A narrow enough operation with bound parameters is judged by its unitary,
     exactly. Otherwise an operand is diagonal when every gate of the definition
     acts on it diagonally, since a product of operators that each commute with
-    ``Z`` commutes with it too.
+    ``Z`` commutes with it too. An operation whose unitary and definition both
+    fail to build, however they fail, is reported non-diagonal everywhere.
     """
     num_qubits = _num_qubits(operation)
     if num_qubits <= _MAX_UNITARY_QUBITS:
@@ -295,7 +295,7 @@ def _definition_diagonal_positions(operation: Any) -> frozenset[int]:
 
         try:
             unitary = Operator(operation).data
-        except (QiskitError, TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - a gate that cannot be built is judged below
             pass
         else:
             labels = np.arange(2**num_qubits)
@@ -308,7 +308,10 @@ def _definition_diagonal_positions(operation: Any) -> frozenset[int]:
                     positions.add(position)
             return frozenset(positions)
 
-    definition = getattr(operation, "definition", None)
+    try:
+        definition = operation.definition
+    except Exception:  # noqa: BLE001 - no definition to read: judged non-diagonal
+        return frozenset()
     if not isinstance(definition, QuantumCircuit):
         return frozenset()
     if definition.num_qubits != num_qubits:
