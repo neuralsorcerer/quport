@@ -368,9 +368,10 @@ def write_distributed_program(
     The bundle contains one OpenQASM 3 file per local QPU circuit plus a
     standards-compliant ``remote_ops.json`` manifest.  The returned mapping uses
     stable artifact keys (``qpu_<id>`` and ``remote_ops``) so callers can report
-    or post-process generated files without re-deriving filenames.  A
-    ``qpu_<id>.qasm`` an earlier bundle left in the directory, for a QPU this
-    one does not write, is removed: the directory holds one bundle.
+    or post-process generated files without re-deriving filenames.  A program
+    an earlier bundle left in the directory -- a ``qpu_<id>.qasm`` for a QPU
+    this one does not write, or a routed ``qpu_<id>_routed.qasm`` -- is removed:
+    the directory holds one bundle.
     """
     if not isinstance(program, DistributedProgram):
         raise ValueError("program must be a DistributedProgram")
@@ -418,25 +419,31 @@ def write_distributed_program(
 
 
 def _remove_stale_programs(
-    out_dir: _PathLike, written: Iterable[_PathLike], *, suffix: str = ""
+    out_dir: _PathLike,
+    written: Iterable[_PathLike],
+    *,
+    keep: Iterable[_PathLike] = (),
 ) -> list[Path]:
     """Remove the per-QPU programs an earlier bundle left in ``out_dir``.
 
-    A consumer finds a bundle's programs by their names, ``qpu_<id><suffix>.qasm``,
-    so one left behind for a QPU the new bundle does not write -- after a run
-    on fewer QPUs, or one that skipped empty programs -- would be read as part
-    of it. Files named so and not among ``written`` are removed; nothing else
-    is touched. Returns the paths removed.
+    A consumer finds a bundle's programs by their names, ``qpu_<id>.qasm`` or,
+    routed, ``qpu_<id>_routed.qasm``, so one left behind -- for a QPU the new
+    bundle does not write, after a run on fewer QPUs or one that skipped empty
+    programs, or by the other kind of bundle, whose manifest the new one has
+    replaced -- would be read as part of it. Files named either way and not
+    among ``written`` are removed, except those in ``keep``, such as the input
+    the bundle was compiled from; nothing else is touched. Returns the paths
+    removed.
     """
     directory = Path(out_dir)
-    keep = {Path(path).resolve() for path in written}
-    pattern = re.compile(rf"qpu_\d+{re.escape(suffix)}\.qasm")
+    kept = {Path(path).resolve() for path in (*written, *keep)}
+    pattern = re.compile(r"qpu_\d+(?:_routed)?\.qasm")
     removed: list[Path] = []
     for candidate in sorted(directory.iterdir()):
         if (
             pattern.fullmatch(candidate.name)
             and candidate.is_file()
-            and candidate.resolve() not in keep
+            and candidate.resolve() not in kept
         ):
             candidate.unlink()
             removed.append(candidate)

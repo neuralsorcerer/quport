@@ -1684,3 +1684,77 @@ def test_option_checks_name_what_is_wrong() -> None:
     with pytest.raises(typer.BadParameter, match="20 qubits, more than the 12"):
         _require_room(20, cfg)
     _require_room(12, cfg)
+
+
+def _small_config(tmp_path: Path) -> Path:
+    config = tmp_path / "cfg.json"
+    config.write_text(
+        '{"n_qpus": 3, "compute_qubits_per_qpu": 2, "comm_qubits_per_qpu": 1}',
+        encoding="utf-8",
+    )
+    return config
+
+
+@pytest.mark.parametrize(
+    "order", [("compile-dist", "split"), ("split", "compile-dist")]
+)
+def test_split_and_compile_dist_into_one_directory_leave_one_bundle(
+    tmp_path: Path, order: tuple[str, str]
+) -> None:
+    """Each command removed only its own kind of program, so the other's stayed
+    beside a manifest that no longer described them, and split left
+    compile-dist's schedule summaries contradicting its own manifest."""
+    config = _small_config(tmp_path)
+    out_dir = tmp_path / "bundle"
+    for command in order:
+        _run(
+            [
+                command,
+                "--n-logical",
+                "5",
+                "--depth",
+                "4",
+                "--config",
+                str(config),
+                "--out-dir",
+                str(out_dir),
+            ]
+        )
+
+    names = sorted(path.name for path in out_dir.iterdir())
+    if order[-1] == "split":
+        assert names == ["qpu_0.qasm", "qpu_1.qasm", "qpu_2.qasm", "remote_ops.json"]
+    else:
+        assert not any(re.fullmatch(r"qpu_\d+\.qasm", name) for name in names)
+        assert {"schedule.json", "schedule_trace.json"} <= set(names)
+
+
+@pytest.mark.parametrize(
+    ("command", "name"),
+    [("split", "qpu_9.qasm"), ("compile-dist", "qpu_9_routed.qasm")],
+)
+def test_an_input_named_like_a_program_is_not_removed(
+    tmp_path: Path, command: str, name: str
+) -> None:
+    """The input sat in the output directory under a program's name, and the
+    stale-program sweep deleted it."""
+    circuit = QuantumCircuit(4, 4)
+    circuit.h(0)
+    circuit.cx(0, 3)
+    circuit.measure(range(4), range(4))
+    source = tmp_path / name
+    source.write_text(qasm2.dumps(circuit), encoding="utf-8")
+
+    _run(
+        [
+            command,
+            "--input-qasm",
+            str(source),
+            "--config",
+            str(_small_config(tmp_path)),
+            "--out-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert source.read_text(encoding="utf-8") == qasm2.dumps(circuit)

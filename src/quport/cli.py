@@ -302,6 +302,9 @@ def _load_or_random_circuit(
     return random_benchmark_circuit(n_logical, depth, seed)
 
 
+#: The summaries ``compile-dist`` writes beside its programs and manifest.
+_COMPILE_SUMMARIES = ("schedule.json", "schedule_trace.json", "entanglement_plan.json")
+
 #: Partition strategies the mapping and compiling commands take.
 _STRATEGIES = ("balanced", "cluster", "ebit", "tpccap", "tpccap_sa")
 
@@ -666,7 +669,14 @@ def split(
 
     # write remote ops
     write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
-    _remove_stale_programs(outp, programs)
+    _remove_stale_programs(outp, programs, keep=[input_qasm] if input_qasm else [])
+    # A compile-dist bundle's summaries describe its own manifest, which this
+    # one has replaced.
+    kept = Path(input_qasm).resolve() if input_qasm else None
+    for name in _COMPILE_SUMMARIES:
+        summary = outp / name
+        if summary.is_file() and summary.resolve() != kept:
+            summary.unlink()
 
     _print_path(
         f"Wrote {len(prog.local_circuits)} local circuits and {len(prog.remote_ops)} remote ops to {out_dir}"
@@ -1086,7 +1096,7 @@ def compile_dist(
     programs = [outp / f"qpu_{qpu}_routed.qasm" for qpu in res.local_routed]
     for path, c in zip(programs, res.local_routed.values()):
         path.write_text(qasm3.dumps(c), encoding="utf-8")
-    _remove_stale_programs(outp, programs, suffix="_routed")
+    _remove_stale_programs(outp, programs, keep=[input_qasm] if input_qasm else [])
 
     # The bundle ships routed programs, so it ships the manifest that matches
     # them: local routing permutes qubits inside a QPU unless the intra-QPU
