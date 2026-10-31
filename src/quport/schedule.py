@@ -1899,19 +1899,22 @@ def _local_work(
     mapped: QuantumCircuit,
     arch: MultiQPUArchitecture,
     lat: _ValidatedLatencyValues,
-) -> tuple[float, list[float]]:
-    """The work of the gates that stay on one QPU: per busiest qubit, and per QPU.
+) -> tuple[list[float], list[float], list[tuple[int, list[int]]]]:
+    """The work of the gates that stay on one QPU, and the gates that do not.
 
-    Every gate touching a qubit occupies that qubit's timeline, so no schedule
-    can finish sooner than the busiest qubit's own work. Cross-QPU gates are
-    excluded: they run against a cat copy on the host QPU, on that copy's
+    Returns the work per qubit and per QPU, with the durations the estimator
+    charges, and each cross-QPU operation as ``(index, qubits)``. Every gate
+    touching a qubit occupies that qubit's timeline, so no schedule can finish
+    sooner than the busiest qubit's own work. A cross-QPU gate is left to the
+    caller: it runs against a cat copy on the host QPU, on that copy's
     timeline rather than the root's, which is exactly the parallelism the
-    entanglement model buys. Durations are the ones the estimator charges.
+    entanglement model buys, and where it runs depends on the plan.
     """
     qindex, phys_to_qpu = _qubit_qpu_indices(mapped, arch)
     load = [0.0] * len(mapped.qubits)
     work = [0.0] * arch.cfg.n_qpus
-    for instruction in mapped.data:
+    remote: list[tuple[int, list[int]]] = []
+    for index, instruction in enumerate(mapped.data):
         if is_directive(instruction.operation):
             continue
         qubits = [qindex[qubit] for qubit in instruction.qubits]
@@ -1919,6 +1922,7 @@ def _local_work(
             continue
         qpus = {phys_to_qpu[qubit] for qubit in qubits}
         if len(qpus) > 1:
+            remote.append((index, qubits))
             continue
         if len(qubits) == 1:
             duration = lat.oneq
@@ -1929,7 +1933,7 @@ def _local_work(
         for qubit in qubits:
             load[qubit] += duration
         work[qpus.pop()] += duration
-    return max(load, default=0.0), work
+    return load, work, remote
 
 
 def _budget_over(count: int, makespan: float) -> float:
@@ -1980,7 +1984,8 @@ def audit_entanglement_schedule(
       its blocks put on every link, the gate time on each QPU, and at least the
       port time its blocks hold -- a host's port from the entangler through
       every gate its copy serves, in turn, to the disentangler -- which no
-      makespan can be shorter than either. These floors allow for what the
+      makespan can be shorter than either, nor than the gates and penalties
+      the plan serialises on any one qubit. These floors allow for what the
       estimator's absolute times lose to rounding far out on a timeline.
 
     ``plan`` and ``ports_per_qpu`` must be whatever the schedule was produced
@@ -2050,7 +2055,8 @@ def audit_entanglement_schedule(
             f"busy times sum to {total_link}"
         )
 
-    floor, local_work = _local_work(mapped, arch, lat)
+    load, local_work, remote = _local_work(mapped, arch, lat)
+    floor = max(load, default=0.0)
     if makespan < floor - _rounding_slack(max(makespan, floor), len(mapped.data)):
         problems.append(
             f"makespan is {makespan}, below the {floor} of work serialised on the "
@@ -2107,7 +2113,14 @@ def audit_entanglement_schedule(
     else:
         problems.extend(
             _plan_derived_problems(
-                summary, mapped, arch, model, lat, plan, link_cap, local_work
+                summary,
+                mapped,
+                arch,
+                model,
+                lat,
+                plan,
+                link_cap,
+                (load, local_work, remote),
             )
         )
 
@@ -2188,7 +2201,7 @@ def _plan_derived_problems(
     lat: _ValidatedLatencyValues,
     plan: AggregationPlan,
     link_cap: int,
-    local_work: Sequence[float],
+    serialised: tuple[list[float], list[float], list[tuple[int, list[int]]]],
 ) -> list[str]:
     """Check what the plan fixes whatever the timing: traffic, gate time, holds.
 
@@ -2199,8 +2212,10 @@ def _plan_derived_problems(
     the copy serves, one after another, to the disentangler, so no schedule
     ends before that hold does. A gate is unschedulable when the plan leaves
     it unserved or a block it needs cannot run, and is then charged the
-    penalty; otherwise it runs on its first block's host.
+    penalty on every operand; otherwise it runs on its first block's host,
+    where it occupies every operand but the roots its copies stand in for.
     """
+    load, local_work, remote = serialised
     n_qpus = arch.cfg.n_qpus
     for block in plan.blocks:
         outside = [index for index in block.gate_indices if index >= len(mapped.data)]
@@ -2295,6 +2310,28 @@ def _plan_derived_problems(
         problems.append(
             f"makespan is {makespan}, shorter than the {hold} one block holds its "
             "host's port for"
+        )
+
+    roots_of: dict[int, set[int]] = {}
+    for block in plan.blocks:
+        for gate_index in block.gate_indices:
+            roots_of.setdefault(gate_index, set()).add(block.root_phys)
+    chain = list(load)
+    for gate_index, qubits in remote:
+        roots = roots_of.get(gate_index)
+        if roots is None or gate_index in failed:
+            for qubit in qubits:
+                chain[qubit] += UNSCHEDULABLE_PENALTY
+            continue
+        duration = gate_duration(gate_index)
+        for qubit in qubits:
+            if qubit not in roots:
+                chain[qubit] += duration
+    busiest = max(chain, default=0.0)
+    if makespan < busiest - _rounding_slack(max(makespan, busiest), len(mapped.data)):
+        problems.append(
+            f"makespan is {makespan}, below the {busiest} of gates and penalties "
+            "the plan serialises on one qubit"
         )
     return problems
 

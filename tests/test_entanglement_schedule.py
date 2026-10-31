@@ -1009,3 +1009,52 @@ def test_audit_takes_a_summary_rebuilt_from_json():
 
     assert isinstance(rebuilt.link_busy_time[0][0], list)
     assert audit_entanglement_schedule(rebuilt, mapped, arch, model, plan=plan) == ()
+
+
+def test_audit_holds_the_makespan_to_the_penalties_on_one_qubit():
+    """Two unserved gates on one pair of qubits cost two penalties in turn, but
+    the makespan floor counted only gates that stay on one QPU, and a makespan
+    of a single penalty passed."""
+    import dataclasses
+
+    from quport.schedule import UNSCHEDULABLE_PENALTY, audit_entanglement_schedule
+
+    arch = _arch(comm_qubits_per_qpu=0)
+    model = LatencyModel()
+    first = arch.block_of_qpu(0).compute[0]
+    second = arch.block_of_qpu(1).compute[0]
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(first, second)
+    mapped.cx(first, second)
+    summary = estimate_entanglement_schedule(mapped, arch, model)
+    assert summary.unschedulable_gates == 2
+    assert audit_entanglement_schedule(summary, mapped, arch, model) == ()
+
+    forged = dataclasses.replace(summary, makespan=UNSCHEDULABLE_PENALTY)
+    problems = audit_entanglement_schedule(forged, mapped, arch, model)
+    assert any("serialises on one qubit" in problem for problem in problems)
+
+
+def test_audit_holds_the_makespan_to_a_partner_serving_many_roots():
+    """Each root's copy serves one gate, so no single hold is long, but every
+    gate runs on the shared partner in turn."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = _arch(compute_qubits_per_qpu=3, comm_qubits_per_qpu=3)
+    model = LatencyModel(twoq=1000.0)
+    partner = arch.block_of_qpu(1).compute[0]
+    mapped = QuantumCircuit(arch.n_phys)
+    for _ in range(5):
+        for root in arch.block_of_qpu(0).compute:
+            mapped.h(root)
+            mapped.cx(root, partner)
+    plan = aggregate_remote_operations(mapped, arch)
+    summary = estimate_entanglement_schedule(mapped, arch, model, plan=plan)
+    assert audit_entanglement_schedule(summary, mapped, arch, model, plan=plan) == ()
+    assert summary.makespan >= 15 * 1000.0
+
+    forged = dataclasses.replace(summary, makespan=summary.makespan / 3)
+    problems = audit_entanglement_schedule(forged, mapped, arch, model, plan=plan)
+    assert any("serialises on one qubit" in problem for problem in problems)

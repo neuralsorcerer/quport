@@ -452,7 +452,8 @@ satisfy whatever the timing:
   unserved or routes through a block no link can serve, the traffic its blocks put
   on every link, the gate time on each QPU, and at least the port time its blocks
   hold — a host's port from the entangler through every gate its copy serves, in
-  turn, to the disentangler — which no makespan can be shorter than either.
+  turn, to the disentangler — which no makespan can be shorter than either, nor
+  than the gates and penalties the plan serialises on any one qubit.
 
 `plan` and `ports_per_qpu` must be whatever the schedule was produced with; the
 defaults rebuild the plan and read the architecture's port budget, as the
