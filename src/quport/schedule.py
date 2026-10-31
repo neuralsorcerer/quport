@@ -1978,7 +1978,10 @@ def audit_entanglement_schedule(
     - the summary describes the plan: its blocks and EPR pairs, the gates it
       leaves unserved or routes through a block no link can serve, the traffic
       its blocks put on every link, the gate time on each QPU, and at least the
-      port time its blocks' entanglers take.
+      port time its blocks hold -- a host's port from the entangler through
+      every gate its copy serves, in turn, to the disentangler -- which no
+      makespan can be shorter than either. These floors allow for what the
+      estimator's absolute times lose to rounding far out on a timeline.
 
     ``plan`` and ``ports_per_qpu`` must be whatever the schedule was produced
     with; the defaults rebuild the plan and read the architecture's own port
@@ -2041,7 +2044,7 @@ def audit_entanglement_schedule(
         )
 
     floor, local_work = _local_work(mapped, arch, lat)
-    if makespan < floor - 1e-6:
+    if makespan < floor - _rounding_slack(max(makespan, floor), len(mapped.data)):
         problems.append(
             f"makespan is {makespan}, below the {floor} of work serialised on the "
             f"busiest single qubit"
@@ -2158,6 +2161,18 @@ def _entanglement_field_problems(
     return problems
 
 
+def _rounding_slack(scale: float, steps: int) -> float:
+    """How far below an exact sum of durations an honest figure can fall.
+
+    The estimator works in absolute times, so each of the ``steps`` additions
+    and subtractions behind a figure can lose half an ulp of a time no larger
+    than ``scale``: a latency far below the makespan can vanish altogether
+    once penalties have pushed a timeline far out. A small relative and
+    absolute margin covers the rest.
+    """
+    return 1e-6 + 1e-9 * scale + steps * math.ulp(scale)
+
+
 def _plan_derived_problems(
     summary: EntanglementScheduleSummary,
     mapped: QuantumCircuit,
@@ -2172,10 +2187,12 @@ def _plan_derived_problems(
 
     A block runs when its two QPUs are connected and links have channels; it
     then puts one distribution on every link of its path (two for a teleport,
-    whose return trip is a second pair) and holds a port on each end at least
-    for its entangler. A gate is unschedulable when the plan leaves it unserved
-    or a block it needs cannot run, and otherwise runs on its first block's
-    host.
+    whose return trip is a second pair). Its root's QPU holds a port for the
+    entangler, and its host holds one from the entangler through every gate
+    the copy serves, one after another, to the disentangler, so no schedule
+    ends before that hold does. A gate is unschedulable when the plan leaves
+    it unserved or a block it needs cannot run, and is then charged the
+    penalty; otherwise it runs on its first block's host.
     """
     n_qpus = arch.cfg.n_qpus
     for block in plan.blocks:
@@ -2187,8 +2204,6 @@ def _plan_derived_problems(
             ]
     sp = arch.qpu_shortest_paths()
     classical = _effective_classical_rtt(arch.cfg, lat)
-    links: dict[QpuEdge, float] = {}
-    port_floor = [0.0] * n_qpus
     failed: set[int] = set()
     host_of: dict[int, int] = {}
     for block in plan.blocks:
@@ -2197,16 +2212,35 @@ def _plan_derived_problems(
         hops = sp.dist[block.root_qpu][block.remote_qpu]
         if hops >= UNREACHABLE_DISTANCE or link_cap == 0:
             failed.update(block.gate_indices)
+
+    def gate_duration(gate_index: int) -> float:
+        operation = mapped.data[gate_index].operation
+        return lat.swap if is_standard_gate(operation, "swap") else lat.twoq
+
+    links: dict[QpuEdge, float] = {}
+    port_floor = [0.0] * n_qpus
+    port_steps = [0] * n_qpus
+    longest_hold = (0.0, 0)
+    for block in plan.blocks:
+        hops = sp.dist[block.root_qpu][block.remote_qpu]
+        if hops >= UNREACHABLE_DISTANCE or link_cap == 0:
             continue
         distribute = model.expected_epr_time(hops)
         teleport = block.protocol == "teleport"
         for edge in path_edges(sp, block.root_qpu, block.remote_qpu):
             links[edge] = links.get(edge, 0.0) + distribute * (2 if teleport else 1)
         entangler = distribute + classical + lat.remote_gate_overhead
-        port_floor[block.root_qpu] += entangler
-        port_floor[block.remote_qpu] += (
-            entangler + classical + (distribute if teleport else 0.0)
+        served = sum(
+            UNSCHEDULABLE_PENALTY if gate in failed else gate_duration(gate)
+            for gate in block.gate_indices
         )
+        hold = entangler + served + classical + (distribute if teleport else 0.0)
+        steps = len(block.gate_indices) + 6
+        port_floor[block.root_qpu] += entangler
+        port_steps[block.root_qpu] += 4
+        port_floor[block.remote_qpu] += hold
+        port_steps[block.remote_qpu] += steps
+        longest_hold = max(longest_hold, (hold, steps))
 
     problems: list[str] = []
     expected = plan.unschedulable_gates + len(failed)
@@ -2233,21 +2267,28 @@ def _plan_derived_problems(
 
     gate_time = list(local_work)
     for gate_index, host in host_of.items():
-        if gate_index in failed:
-            continue
-        operation = mapped.data[gate_index].operation
-        gate_time[host] += lat.swap if is_standard_gate(operation, "swap") else lat.twoq
+        if gate_index not in failed:
+            gate_time[host] += gate_duration(gate_index)
     for qpu, (busy, work) in enumerate(zip(summary.qpu_busy_time, gate_time)):
         if not close(busy, work):
             problems.append(
                 f"QPU {qpu} accrues {busy} gate time, its gates take {work}"
             )
+
+    makespan = summary.makespan
     for qpu, (busy, held) in enumerate(zip(summary.port_busy_time, port_floor)):
-        if busy < held - 1e-6 * max(1.0, held):
+        scale = max(makespan, busy, held)
+        if busy < held - _rounding_slack(scale, port_steps[qpu]):
             problems.append(
-                f"QPU {qpu} accrues {busy} port-busy time, its blocks' entanglers "
-                f"alone hold ports for {held}"
+                f"QPU {qpu} accrues {busy} port-busy time, its blocks hold ports "
+                f"for at least {held}"
             )
+    hold, steps = longest_hold
+    if makespan < hold - _rounding_slack(max(makespan, hold), steps):
+        problems.append(
+            f"makespan is {makespan}, shorter than the {hold} one block holds its "
+            "host's port for"
+        )
     return problems
 
 

@@ -450,8 +450,9 @@ satisfy whatever the timing:
   it holds a port at some instant;
 - the summary describes the plan: its blocks and EPR pairs, the gates it leaves
   unserved or routes through a block no link can serve, the traffic its blocks put
-  on every link, the gate time on each QPU, and at least the port time its blocks'
-  entanglers take.
+  on every link, the gate time on each QPU, and at least the port time its blocks
+  hold — a host's port from the entangler through every gate its copy serves, in
+  turn, to the disentangler — which no makespan can be shorter than either.
 
 `plan` and `ports_per_qpu` must be whatever the schedule was produced with; the
 defaults rebuild the plan and read the architecture's port budget, as the

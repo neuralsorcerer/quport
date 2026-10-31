@@ -470,7 +470,7 @@ def test_audit_holds_a_schedule_to_the_plan_it_describes():
             link_busy_time=tuple((edge, 0.0) for edge in links),
             entanglement_time=0.0,
         ),
-        "entanglers alone": dataclasses.replace(
+        "hold ports for at least": dataclasses.replace(
             summary,
             port_busy_time=zeroed,
             peak_ports_in_use=tuple(0 for _ in zeroed),
@@ -921,6 +921,72 @@ def test_the_audit_takes_a_budget_beyond_float_range(field: str) -> None:
     assert (
         audit_entanglement_schedule(
             summary, qc, arch, LatencyModel(), ports_per_qpu=ports
+        )
+        == ()
+    )
+
+
+def test_audit_holds_the_makespan_to_a_cat_copy_serving_its_gates_in_turn():
+    """One copy serves 1000 gates one after another while its host's port is
+    held, so neither that port's time nor the makespan can be shorter; both
+    floors used to count only the entangler and local gates."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = _arch(compute_qubits_per_qpu=2)
+    model = LatencyModel()
+    root = arch.block_of_qpu(0).compute[0]
+    partner = arch.block_of_qpu(1).compute[0]
+    mapped = QuantumCircuit(arch.n_phys)
+    for _ in range(1000):
+        mapped.cz(root, partner)
+    plan = aggregate_remote_operations(mapped, arch)
+    summary = estimate_entanglement_schedule(mapped, arch, model, plan=plan)
+    assert len(plan.blocks) == 1
+    assert audit_entanglement_schedule(summary, mapped, arch, model, plan=plan) == ()
+
+    forged = dataclasses.replace(
+        summary,
+        makespan=290.0,
+        port_busy_time=tuple(min(busy, 290.0) for busy in summary.port_busy_time),
+    )
+    problems = audit_entanglement_schedule(forged, mapped, arch, model, plan=plan)
+    assert any("shorter than" in problem for problem in problems)
+    assert any("hold ports for at least" in problem for problem in problems)
+
+
+def test_audit_allows_latencies_lost_to_rounding_far_out_on_a_timeline():
+    """Eighteen penalties push the root's timeline to 1.8e10, where microsecond
+    latencies round away entirely; the estimator's port time is then honestly
+    zero, and an exact floor refused it."""
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = _arch(n_qpus=3, compute_qubits_per_qpu=1, async_classical=False)
+    model = LatencyModel(
+        oneq=1e-8,
+        twoq=1e-7,
+        swap=3e-7,
+        epr_gen=1.8e-6,
+        classical_rtt=1.8e-6,
+        remote_gate_overhead=1.8e-6,
+    )
+    first, second, third = (arch.block_of_qpu(qpu).compute[0] for qpu in range(3))
+    mapped = QuantumCircuit(arch.n_phys)
+    for _ in range(18):
+        mapped.cz(first, third)
+    mapped.cx(first, second)
+    ports = [1, 1, 0]
+    plan = aggregate_remote_operations(mapped, arch, ports_per_qpu=ports)
+    summary = estimate_entanglement_schedule(
+        mapped, arch, model, plan=plan, ports_per_qpu=ports
+    )
+
+    assert summary.unschedulable_gates == 18 and len(plan.blocks) == 1
+    assert summary.port_busy_time == (0.0, 0.0, 0.0)
+    assert (
+        audit_entanglement_schedule(
+            summary, mapped, arch, model, plan=plan, ports_per_qpu=ports
         )
         == ()
     )
