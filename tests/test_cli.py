@@ -1626,3 +1626,61 @@ def test_a_rerun_on_fewer_qpus_leaves_no_stale_programs(
         f"qpu_1{suffix}.qasm",
     ]
     assert (out_dir / "notes.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["map", "--n-logical", "4", "--strategy", "bogus"],
+        ["migrate", "--n-logical", "6", "--depth", "4", "--windows", "0"],
+        ["migrate", "--n-logical", "6", "--depth", "4", "--migration-cost", "-1"],
+        ["bench", "--n-logical", "4", "--trials", "-1", "--out", "r.csv"],
+        ["bench", "--n-logical", "4", "--strategies", "baseline,nope"],
+        ["map", "--n-logical", "20"],
+        ["optimal", "--n-logical", "6", "--depth", "4", "--max-nodes", "0"],
+        ["map", "--n-logical", "4", "--depth", "-1"],
+    ],
+    ids=[
+        "strategy",
+        "windows",
+        "migration-cost",
+        "trials",
+        "strategies",
+        "too-wide",
+        "max-nodes",
+        "depth",
+    ],
+)
+def test_a_bad_option_is_a_usage_error_not_a_traceback(
+    args: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """These reached the library and came back as tracebacks, some only after
+    a whole compile; optimal blamed its cut objective for a bad --max-nodes."""
+    config = tmp_path / "small.json"
+    config.write_text(
+        '{"n_qpus": 4, "compute_qubits_per_qpu": 2, "comm_qubits_per_qpu": 1}',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(app, [*args, "--config", str(config)])
+
+    assert result.exit_code == 2, result.output
+    assert isinstance(result.exception, SystemExit)
+
+
+def test_option_checks_name_what_is_wrong() -> None:
+    from quport.cli import _checked_strategies, _checked_strategy, _require_room
+    from quport.config import MultiQPUConfig
+
+    with pytest.raises(typer.BadParameter, match="must be one of: balanced"):
+        _checked_strategy("bogus")
+    assert _checked_strategy("tpccap_sa") == "tpccap_sa"
+    with pytest.raises(typer.BadParameter, match="nope"):
+        _checked_strategies("baseline,nope")
+    with pytest.raises(typer.BadParameter, match="duplicate"):
+        _checked_strategies("baseline,baseline")
+    cfg = MultiQPUConfig(n_qpus=4, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    with pytest.raises(typer.BadParameter, match="20 qubits, more than the 12"):
+        _require_room(20, cfg)
+    _require_room(12, cfg)

@@ -36,6 +36,7 @@ from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
 from quport.interaction import extract_twoq_weights
 from quport.network import build_qpu_graph, topology_metrics
 from quport.pipeline import (
+    _validate_strategy_sequence,
     benchmark_method_labels,
     benchmark_random_circuits,
     map_and_transpile,
@@ -273,10 +274,18 @@ def _load_or_random_circuit(
     n_logical: int | None,
     depth: int,
     seed: int,
+    cfg: MultiQPUConfig | None = None,
 ) -> QuantumCircuit:
-    """Load an OpenQASM 2/3 circuit or generate the configured random benchmark."""
+    """Load an OpenQASM 2/3 circuit or generate the configured random benchmark.
+
+    With ``cfg``, either is refused, as a usage error, when it is wider than the
+    configured machine.
+    """
     if input_qasm:
-        return _load_qasm_circuit(input_qasm)
+        circuit = _load_qasm_circuit(input_qasm)
+        if cfg is not None:
+            _require_room(circuit.num_qubits, cfg)
+        return circuit
     if n_logical is None:
         # Typer/Rich may syntax-highlight option-looking text inside validation
         # errors (for example under FORCE_COLOR), which can split the literal
@@ -288,7 +297,42 @@ def _load_or_random_circuit(
         raise typer.BadParameter(
             "--n-logical is required when --input-qasm is not provided"
         )
+    if cfg is not None:
+        _require_room(n_logical, cfg)
     return random_benchmark_circuit(n_logical, depth, seed)
+
+
+#: Partition strategies the mapping and compiling commands take.
+_STRATEGIES = ("balanced", "cluster", "ebit", "tpccap", "tpccap_sa")
+
+
+def _checked_strategy(value: str) -> str:
+    """Refuse an unknown ``--strategy`` as a usage error naming the option."""
+    if value not in _STRATEGIES:
+        raise typer.BadParameter(f"must be one of: {', '.join(_STRATEGIES)}")
+    return value
+
+
+def _checked_strategies(value: str) -> str:
+    """Refuse an unknown or repeated name in ``--strategies`` as a usage error."""
+    try:
+        _validate_strategy_sequence(
+            [name.strip() for name in value.split(",") if name.strip()],
+            label="--strategies",
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    return value
+
+
+def _require_room(n_qubits: int, cfg: MultiQPUConfig) -> None:
+    """Refuse a circuit wider than the configured machine before compiling it."""
+    available = cfg.total_physical_qubits()
+    if n_qubits > available:
+        raise typer.BadParameter(
+            f"the circuit has {n_qubits} qubits, more than the {available} "
+            "physical qubits the configuration provides"
+        )
 
 
 def _config_parse_errors() -> tuple[type[BaseException], ...]:
@@ -408,12 +452,13 @@ def topology_info(
 @app.command()
 def map(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(20, help="Random circuit depth"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "tpccap",
+        callback=_checked_strategy,
         help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
@@ -428,7 +473,11 @@ def map(
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
 
     res = map_and_transpile(qc, cfg, latency=latency, seed=seed, strategy=strategy)
@@ -451,12 +500,13 @@ def map(
 
 @app.command()
 def bench(
-    n_logical: int = typer.Option(..., help="Number of logical qubits"),
-    depth: int = typer.Option(20, help="Random circuit depth"),
-    trials: int = typer.Option(10, help="Number of random circuits"),
+    n_logical: int = typer.Option(..., min=0, help="Number of logical qubits"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
+    trials: int = typer.Option(10, min=0, help="Number of random circuits"),
     seed: int = typer.Option(0, help="Base seed"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
+        callback=_checked_strategies,
         help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
@@ -465,6 +515,7 @@ def bench(
     """Benchmark baseline vs QuPort on multiple random circuits."""
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
+    _require_room(n_logical, cfg)
 
     strats = [s.strip() for s in strategies.split(",") if s.strip()]
     rows = benchmark_random_circuits(
@@ -483,13 +534,14 @@ def bench(
 
 @app.command()
 def sweep(
-    n_logical: int = typer.Option(..., help="Number of logical qubits"),
-    depth: int = typer.Option(20, help="Random circuit depth"),
-    trials: int = typer.Option(5, help="Trials per setting"),
+    n_logical: int = typer.Option(..., min=0, help="Number of logical qubits"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
+    trials: int = typer.Option(5, min=0, help="Trials per setting"),
     seed: int = typer.Option(0, help="Base seed"),
     out: str = typer.Option("sweep.csv", help="Output CSV summary"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
+        callback=_checked_strategies,
         help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     plot: str | None = typer.Option(
@@ -530,12 +582,13 @@ def sweep(
 @app.command()
 def schedule(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(20, help="Random circuit depth"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
         "tpccap",
+        callback=_checked_strategy,
         help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
@@ -551,7 +604,11 @@ def schedule(
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
     res = map_and_transpile(qc, cfg, latency=latency, seed=seed, strategy=strategy)
     arch = MultiQPUArchitecture(cfg)
@@ -564,12 +621,13 @@ def schedule(
 @app.command()
 def split(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(20, help="Random circuit depth"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed"),
     strategy: str = typer.Option(
         "tpccap",
+        callback=_checked_strategy,
         help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
@@ -588,7 +646,11 @@ def split(
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
     res = map_and_transpile(qc, cfg, latency=latency, seed=seed, strategy=strategy)
     arch = MultiQPUArchitecture(cfg)
@@ -614,12 +676,13 @@ def split(
 @app.command()
 def ebits(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(20, help="Random circuit depth"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "ebit",
+        callback=_checked_strategy,
         help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
@@ -657,7 +720,11 @@ def ebits(
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
 
     res = compile_distributed(qc, cfg, latency=latency, seed=seed, strategy=strategy)
@@ -740,12 +807,13 @@ def ebits(
 @app.command()
 def optimal(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(12, help="Random circuit depth"),
+    depth: int = typer.Option(12, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "ebit",
+        callback=_checked_strategy,
         help="Partition strategy to score: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
@@ -757,6 +825,7 @@ def optimal(
     max_nodes: int = typer.Option(
         DEFAULT_MAX_NODES,
         "--max-nodes",
+        min=1,
         help="Branch-and-bound node budget; exhausting it reports a bound, not a proof",
     ),
     out: str | None = typer.Option(None, help="Optional JSON path for the gap report"),
@@ -770,7 +839,11 @@ def optimal(
     """
     cfg = _load_config_or_default(config)
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
 
     res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
@@ -847,19 +920,23 @@ def optimal(
 @app.command()
 def migrate(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(20, help="Random circuit depth"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "ebit",
+        callback=_checked_strategy,
         help="Partition strategy for the static placement to improve on",
     ),
     windows: int = typer.Option(
-        3, help="Number of time windows to cut the instruction stream into"
+        3, min=1, help="Number of time windows to cut the instruction stream into"
     ),
     migration_cost: int = typer.Option(
-        1, "--migration-cost", help="EPR pairs to teleport one qubit between QPUs"
+        1,
+        "--migration-cost",
+        min=0,
+        help="EPR pairs to teleport one qubit between QPUs",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -880,7 +957,11 @@ def migrate(
     """
     cfg = _load_config_or_default(config)
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
 
     res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
@@ -947,12 +1028,13 @@ def migrate(
 @app.command()
 def compile_dist(
     n_logical: int | None = typer.Option(
-        None, help="Number of logical qubits for generated random circuits"
+        None, min=0, help="Number of logical qubits for generated random circuits"
     ),
-    depth: int = typer.Option(20, help="Random circuit depth"),
+    depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "tpccap_sa",
+        callback=_checked_strategy,
         help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     temporal_decay: float = typer.Option(
@@ -982,7 +1064,11 @@ def compile_dist(
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
-        input_qasm=input_qasm, n_logical=n_logical, depth=depth, seed=seed
+        input_qasm=input_qasm,
+        n_logical=n_logical,
+        depth=depth,
+        seed=seed,
+        cfg=cfg,
     )
 
     res = compile_distributed(
