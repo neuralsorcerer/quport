@@ -10,6 +10,10 @@ custom workflows, use the Python API documented in [API reference](api-reference
 - Strategy values use the Python strategy names, for example `tpccap_sa`.
 - Config paths may be JSON or YAML; YAML requires the `yaml` extra.
 - Output directories are created when possible by artifact-writing commands.
+- A bad option value is a usage error, exit code 2, naming the option. A config
+  or circuit the library refuses -- one global routing cannot connect, say -- and
+  an output path that cannot be written end the command with the message and exit
+  code 1, rather than a Python traceback.
 - Commands that operate on one circuit (`map`, `schedule`, `split`, `ebits`,
   `optimal`, `migrate`, and `compile-dist`) can either generate a random
   benchmark with `--n-logical` or

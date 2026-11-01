@@ -1391,7 +1391,7 @@ quport compile-dist \
   --out-dir compile_out
 ```
 
-This produces per-QPU routed programs, an ordered remote-operation trace, and a topology-aware schedule summary.
+This produces per-QPU routed programs, an ordered remote-operation trace, the layout of each input qubit before and after local routing, and a topology-aware schedule summary.
 
 ---
 

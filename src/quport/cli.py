@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import functools
 import importlib
 import json
 import math
@@ -13,11 +14,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
 
 import typer
 from qiskit import QuantumCircuit, qasm2, qasm3
 from qiskit.exceptions import MissingOptionalLibraryError
+from qiskit.transpiler.exceptions import TranspilerError
 from rich.console import Console
 from rich.table import Table
 
@@ -395,6 +397,28 @@ def _refuse_input_in_bundle(input_qasm: str | None, out_dir: str) -> None:
         )
 
 
+_Command = TypeVar("_Command", bound=Callable[..., Any])
+
+
+def _reports_errors(command: _Command) -> _Command:
+    """Report what the library refuses as a one-line error, not a traceback.
+
+    A config that cannot map the circuit, a circuit Qiskit cannot route, or an
+    output path that cannot be written ends the command with its message and
+    exit code 1. A bad option value is still a usage error, exit code 2.
+    """
+
+    @functools.wraps(command)
+    def reported(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return command(*args, **kwargs)
+        except (ValueError, TranspilerError, OSError) as exc:
+            console.print(f"[bold red]Error:[/bold red] {exc}", highlight=False)
+            raise typer.Exit(code=1) from exc
+
+    return cast(_Command, reported)
+
+
 #: Partition strategies the mapping and compiling commands take.
 _STRATEGIES = ("balanced", "cluster", "ebit", "tpccap", "tpccap_sa")
 
@@ -510,6 +534,7 @@ def _pretty_config(cfg: MultiQPUConfig) -> None:
 
 
 @app.command()
+@_reports_errors
 def gen_config(
     out: str = typer.Option(
         "quport_config.json",
@@ -524,6 +549,7 @@ def gen_config(
 
 
 @app.command("topology-info")
+@_reports_errors
 def topology_info(
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
 ) -> None:
@@ -543,6 +569,7 @@ def topology_info(
 
 
 @app.command()
+@_reports_errors
 def map(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -593,6 +620,7 @@ def map(
 
 
 @app.command()
+@_reports_errors
 def bench(
     n_logical: int = typer.Option(..., min=0, help="Number of logical qubits"),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
@@ -627,6 +655,7 @@ def bench(
 
 
 @app.command()
+@_reports_errors
 def sweep(
     n_logical: int = typer.Option(..., min=0, help="Number of logical qubits"),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
@@ -674,6 +703,7 @@ def sweep(
 
 
 @app.command()
+@_reports_errors
 def schedule(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -713,6 +743,7 @@ def schedule(
 
 
 @app.command()
+@_reports_errors
 def split(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -734,7 +765,11 @@ def split(
         "distributed_out", help="Output directory for per-QPU QASM files"
     ),
 ) -> None:
-    """Split a mapped circuit into per-QPU local circuits + remote-op list (JSON)."""
+    """Split a mapped circuit into per-QPU local circuits + remote-op list (JSON).
+
+    Writes qpu_<id>.qasm per QPU, remote_ops.json, and layout.json: the physical
+    qubit each input qubit starts on and the one holding it at the end.
+    """
     from .distributed import split_into_qpus
 
     _refuse_input_in_bundle(input_qasm, out_dir)
@@ -775,6 +810,7 @@ def split(
 
 
 @app.command()
+@_reports_errors
 def ebits(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -905,6 +941,7 @@ def ebits(
 
 
 @app.command()
+@_reports_errors
 def optimal(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -1018,6 +1055,7 @@ def optimal(
 
 
 @app.command()
+@_reports_errors
 def migrate(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -1126,6 +1164,7 @@ def migrate(
 
 
 @app.command()
+@_reports_errors
 def compile_dist(
     n_logical: int | None = typer.Option(
         None, min=0, help="Number of logical qubits for generated random circuits"
@@ -1158,6 +1197,8 @@ def compile_dist(
       - qpu_<id>_routed.qasm : routed per-QPU local programs
       - remote_ops.json     : ordered remote-op trace, in the routed programs'
         physical-qubit labelling
+      - layout.json         : the physical qubit each input qubit starts on, and
+        the one local routing leaves it on
       - schedule.json       : topology-aware schedule summary
       - schedule_trace.json : detailed per-layer/per-round communication plan with absolute timing
       - entanglement_plan.json : aggregated EPR blocks, e-bit report, and the

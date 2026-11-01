@@ -1890,3 +1890,39 @@ def test_a_circuit_the_cli_cannot_write_exits_with_a_message() -> None:
     with pytest.raises(typer.Exit) as raised:
         _qasm3_or_exit(circuit)
     assert raised.value.exit_code == 1
+
+
+@pytest.mark.parametrize("case", ["no-ports", "creg-q", "out-dir-is-a-file"])
+def test_what_the_library_refuses_ends_with_a_message_not_a_traceback(
+    tmp_path: Path, case: str
+) -> None:
+    """A config that cannot route the circuit, an input Qiskit's layout cannot
+    hold, and an output directory that is a file all surfaced as tracebacks."""
+    config = tmp_path / "cfg.json"
+    ports = 0 if case == "no-ports" else 1
+    config.write_text(
+        json.dumps(
+            {"n_qpus": 2, "compute_qubits_per_qpu": 2, "comm_qubits_per_qpu": ports}
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "bundle"
+    args = ["split", "--config", str(config), "--out-dir", str(out_dir)]
+    if case == "creg-q":
+        source = tmp_path / "input.qasm"
+        source.write_text(
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg r[2];\ncreg q[2];\n'
+            "cx r[0], r[1];\nmeasure r -> q;\n",
+            encoding="utf-8",
+        )
+        args += ["--input-qasm", str(source)]
+    else:
+        args += ["--n-logical", "4", "--depth", "4"]
+    if case == "out-dir-is-a-file":
+        out_dir.write_text("", encoding="utf-8")
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "Error:" in result.output
