@@ -213,7 +213,7 @@ weights; smaller values emphasize earlier two-qubit interactions more strongly.
 | `cfg` | architecture config |
 | `strategy` | partitioning strategy |
 | `partition` | logical-qubit-to-QPU assignment |
-| `partition_cut` | cut of `partition` under the interaction weights the strategy partitioned with: gate counts for `balanced` and `cluster`, time-decayed weights (a decay of 0.98 by default) for `tpccap`, `tpccap_sa` and `ebit`, so it does not compare across strategies |
+| `partition_cut` | cut of `partition` under the interaction weights the strategy partitioned with: gate counts for `balanced` and `cluster`, time-decayed weights (a decay of 0.98 by default) for `tpccap`, `tpccap_sa` and `ebit`, each with the links that tie a top-level control-flow block's operands together (`block_operands=True`), so it does not compare across strategies |
 | `partition_diagnostics` | topology-aware partition diagnostics when available |
 | `anneal_diagnostics` | simulated annealing diagnostics for `tpccap_sa` and `ebit` |
 | `program` | `DistributedProgram` containing local circuits and remote ops |

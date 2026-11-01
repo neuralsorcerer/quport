@@ -171,11 +171,15 @@ $$
 
 Two-qubit gates inside control-flow bodies count too, once each and in every
 branch, on the qubits the block applies them to; the block itself is not an
-interaction. That is what global routing pays for. Distributed compilation instead
-gathers a whole control-flow operation on one QPU, so `compile_distributed` also
-links each operand of a top-level block that none of its gates touches to the block
-(`block_operands=True`): splitting even an idle operand off makes the block a remote
-operation.
+interaction. That is what `map_and_transpile`'s global routing pays for, and what
+its `remote_2q` metric counts. Distributed compilation instead gathers a whole
+control-flow operation on its first operand's QPU, teleporting each operand that
+sits elsewhere, so `compile_distributed` also links the first operand of each
+top-level block to each of its other operands (`block_operands=True`): splitting
+any of them off makes the block a remote operation. A nested block adds no link of
+its own, since it runs wherever the block around it is gathered. The global
+pipeline's weights leave these links out, but a block that spans QPUs after its
+routing is still shipped whole as one remote operation by `split_into_qpus`.
 
 The weighted logical interaction graph is:
 

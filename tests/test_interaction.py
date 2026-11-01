@@ -364,15 +364,15 @@ def test_interactions_inside_control_flow_count_on_the_qubits_they_touch() -> No
         {(0, 1): 1.0, (1, 2): 0.5, (2, 3): 0.25, (0, 3): 0.125, (1, 3): 0.0625}
     )
     assert cut_weight(extract_twoq_weights(qc), [0, 1, 0, 1]) == 4.0
-    # Weighing whole blocks, the last condition's idle operand 2 is linked to
-    # its first operand, 0, which nothing in that block touches either.
+    # Weighing whole blocks, each top-level block also links its first operand
+    # to each other one: (0,1) (0,2) | (2,3) (0,2) | (1,3) | (0,2).
     assert extract_twoq_weights(qc, block_operands=True) == {
-        (0, 1): 1,
+        (0, 1): 2,
+        (0, 2): 3,
         (1, 2): 1,
-        (2, 3): 1,
+        (2, 3): 2,
         (0, 3): 1,
-        (1, 3): 1,
-        (0, 2): 1,
+        (1, 3): 2,
     }
 
 
@@ -408,6 +408,29 @@ def test_a_block_spanning_qpus_weighs_what_splitting_it_costs() -> None:
         result = compile_distributed(qc, cfg, seed=0, strategy=strategy)
         assert result.partition[0] == result.partition[1], strategy
         assert len(result.program.remote_ops) == 1, strategy
+
+
+def test_weighing_whole_blocks_ties_every_operand_and_skips_empty_ones() -> None:
+    """Linking only operands no gate touched left two separate gate groups in
+    one block free to split, though the block still runs whole on one QPU; and
+    a block on no qubit crashed the anchor lookup."""
+    qc = QuantumCircuit(4, 1)
+    with qc.if_test((qc.clbits[0], 1)):
+        qc.cx(0, 1)
+        qc.cx(2, 3)
+    with qc.if_test((qc.clbits[0], 0)):
+        pass
+    with qc.box():
+        with qc.if_test((qc.clbits[0], 1)):
+            qc.cx(1, 2)
+
+    weights = extract_twoq_weights(qc, block_operands=True)
+    first = qc.find_bit(qc.data[0].qubits[0]).index
+    for other in range(4):
+        if other != first:
+            assert weights.get(tuple(sorted((first, other))), 0) >= 1
+    # The condition nested in the box adds no link of its own.
+    assert weights[(1, 2)] == 2
 
 
 def test_a_loops_break_is_no_interaction() -> None:
@@ -447,3 +470,28 @@ def test_a_box_of_gates_keeps_its_pairs_together_when_mapped() -> None:
         assert part[0] == part[1] and part[2] == part[3], strategy
         # The box itself spans both QPUs whatever the split; no gate in it does.
         assert result.metrics.remote_2q == 0
+
+
+def test_compile_distributed_takes_an_empty_control_flow_block() -> None:
+    """Weighing whole blocks looked up an operand of a block that has none, so
+    compile_distributed raised IndexError on an empty condition or box."""
+    from quport.compiler import compile_distributed
+    from quport.config import MultiQPUConfig
+
+    qc = QuantumCircuit(2, 1)
+    qc.h(0)
+    qc.measure(0, 0)
+    with qc.if_test((qc.clbits[0], 1)):
+        pass
+    with qc.box():
+        pass
+    qc.cx(0, 1)
+    cfg = MultiQPUConfig(
+        n_qpus=2,
+        compute_qubits_per_qpu=1,
+        comm_qubits_per_qpu=1,
+        basis_gates=("rz", "sx", "x", "cx", "if_else", "box", "measure"),
+    )
+
+    for strategy in ("balanced", "tpccap"):
+        compile_distributed(qc, cfg, seed=0, strategy=strategy)

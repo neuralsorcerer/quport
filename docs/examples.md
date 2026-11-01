@@ -182,8 +182,9 @@ res = compile_distributed(qc, cfg, seed=0, strategy="ebit")
 capacity = cfg.capacity_per_qpu()
 
 # `partition` and `packets` are indexed by the basis-translated circuit, so any
-# re-derived partitioning input has to come from `res.basis_circuit`.
-weights = extract_twoq_weights(res.basis_circuit)
+# re-derived partitioning input has to come from `res.basis_circuit`, with each
+# control-flow block's operands tied together as `compile_distributed` ties them.
+weights = extract_twoq_weights(res.basis_circuit, block_operands=True)
 
 best = optimal_partition(
     res.basis_circuit.num_qubits,

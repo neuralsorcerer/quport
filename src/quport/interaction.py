@@ -72,11 +72,12 @@ def _two_qubit_interactions(
     interaction. A loop's ``break`` or ``continue`` spans the loop's qubits but
     couples none.
 
-    With ``block_operands``, each operand of a top-level control-flow
-    operation that no gate in it touches is also linked to the operation, to
-    an operand a gate does touch where there is one: distributed compilation
-    gathers the whole operation on one QPU, so splitting even an idle operand
-    off makes it a remote operation.
+    With ``block_operands``, a top-level control-flow operation also links its
+    first operand to each other one: distributed compilation gathers the whole
+    operation on its first operand's QPU, teleporting each operand that sits
+    elsewhere, so splitting any of them off makes it a remote operation. A
+    nested one adds nothing more, since it runs wherever its enclosing one is
+    gathered.
     """
     position = {qubit: outer[index] for index, qubit in enumerate(circuit.qubits)}
     for inst in circuit.data:
@@ -89,13 +90,11 @@ def _two_qubit_interactions(
                 for edge in _two_qubit_interactions(block, applied, top=False)
             ]
             yield from inner
-            if block_operands and top:
-                touched = {qubit for edge in inner for qubit in edge}
-                operands = list(dict.fromkeys(applied))
-                anchor = next((q for q in operands if q in touched), operands[0])
-                for other in operands:
-                    if other != anchor and other not in touched:
-                        yield (anchor, other) if anchor < other else (other, anchor)
+            if block_operands and top and applied:
+                first = applied[0]
+                for other in dict.fromkeys(applied[1:]):
+                    if other != first:
+                        yield (first, other) if first < other else (other, first)
             continue
         if len(inst.qubits) != 2:
             continue
@@ -119,10 +118,10 @@ def extract_twoq_weights(
     For each 2-qubit instruction acting on logical qubits (i, j), we increment
     weight[(min(i,j), max(i,j))]. Instructions inside control-flow bodies count
     too, once each, in every branch, on the qubits the block applies them to.
-    That is what global routing pays for. With ``block_operands``, an operand
-    of a top-level control-flow operation that none of its gates touches is
-    linked to the operation as well, since distributed compilation gathers
-    the whole operation on one QPU; ``compile_distributed`` partitions on that.
+    That is what global routing pays for. With ``block_operands``, a top-level
+    control-flow operation also links its first operand to each other one,
+    since distributed compilation gathers the whole operation on one QPU;
+    ``compile_distributed`` partitions on that.
 
     This works for random circuits and any circuits with 2Q ops (cx, cz, ecr, rxx, etc.).
     """

@@ -1014,8 +1014,10 @@ def optimal(
     )
 
     res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
-    # The weights compile_distributed partitioned on, so the gap is measured
-    # against the objective the strategy optimised.
+    # Gate counts with each block's operands tied, as compile_distributed ties
+    # them: what balanced and cluster partition on. tpccap, tpccap_sa and ebit
+    # partition on time-decayed weights, so for them the cut gap is measured on
+    # plain counts, not on the weights they optimised.
     weights = extract_twoq_weights(res.basis_circuit, block_operands=True)
     capacity = cfg.capacity_per_qpu()
 
