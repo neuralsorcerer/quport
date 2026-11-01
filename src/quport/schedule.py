@@ -2031,16 +2031,19 @@ def audit_entanglement_schedule(
             problems.append(
                 f"QPU {qpu} holds {peak} cat copies at once, budget is {ports[qpu]}"
             )
+    # Busy times are sums of intervals between absolute times, each addition
+    # rounding at the makespan's magnitude.
+    steps = 4 * len(mapped.data)
     for qpu, busy in enumerate(summary.port_busy_time[:n_qpus]):
         allowed = _budget_over(ports[qpu], makespan)
-        if busy > allowed + 1e-6:
+        if busy > allowed + _rounding_slack(max(allowed, busy), steps):
             problems.append(
                 f"QPU {qpu} accrues {busy} port-busy time, but {ports[qpu]} ports "
                 f"over a {makespan} makespan allow at most {allowed}"
             )
     for edge, busy in summary.link_busy_time:
         allowed = _budget_over(link_cap, makespan)
-        if busy > allowed + 1e-6:
+        if busy > allowed + _rounding_slack(max(allowed, busy), steps):
             problems.append(
                 f"link {edge} accrues {busy} busy time, but {link_cap} channels "
                 f"over a {makespan} makespan allow at most {allowed}"
@@ -2213,7 +2216,8 @@ def _plan_derived_problems(
     ends before that hold does. A gate is unschedulable when the plan leaves
     it unserved or a block it needs cannot run, and is then charged the
     penalty on every operand; otherwise it runs on its first block's host,
-    where it occupies every operand but the roots its copies stand in for.
+    where it occupies every operand but the roots its copies stand in for. A
+    root itself waits for each of its blocks' entanglers.
     """
     load, local_work, remote = serialised
     n_qpus = arch.cfg.n_qpus
@@ -2242,6 +2246,8 @@ def _plan_derived_problems(
     links: dict[QpuEdge, float] = {}
     port_floor = [0.0] * n_qpus
     port_steps = [0] * n_qpus
+    # A root waits for each of its blocks' entanglers in turn.
+    entangling = [0.0] * len(load)
     longest_hold = (0.0, 0)
     for block in plan.blocks:
         hops = sp.dist[block.root_qpu][block.remote_qpu]
@@ -2259,6 +2265,7 @@ def _plan_derived_problems(
         hold = entangler + served + classical + (distribute if teleport else 0.0)
         steps = len(block.gate_indices) + 6
         port_floor[block.root_qpu] += entangler
+        entangling[block.root_phys] += entangler
         port_steps[block.root_qpu] += 4
         port_floor[block.remote_qpu] += hold
         port_steps[block.remote_qpu] += steps
@@ -2316,7 +2323,7 @@ def _plan_derived_problems(
     for block in plan.blocks:
         for gate_index in block.gate_indices:
             roots_of.setdefault(gate_index, set()).add(block.root_phys)
-    chain = list(load)
+    chain = [work + held for work, held in zip(load, entangling)]
     for gate_index, qubits in remote:
         roots = roots_of.get(gate_index)
         if roots is None or gate_index in failed:
@@ -2328,10 +2335,11 @@ def _plan_derived_problems(
             if qubit not in roots:
                 chain[qubit] += duration
     busiest = max(chain, default=0.0)
-    if makespan < busiest - _rounding_slack(max(makespan, busiest), len(mapped.data)):
+    steps = len(mapped.data) + 4 * len(plan.blocks)
+    if makespan < busiest - _rounding_slack(max(makespan, busiest), steps):
         problems.append(
-            f"makespan is {makespan}, below the {busiest} of gates and penalties "
-            "the plan serialises on one qubit"
+            f"makespan is {makespan}, below the {busiest} of gates, entanglers "
+            "and penalties the plan serialises on one qubit"
         )
     return problems
 

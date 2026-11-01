@@ -1058,3 +1058,63 @@ def test_audit_holds_the_makespan_to_a_partner_serving_many_roots():
     forged = dataclasses.replace(summary, makespan=summary.makespan / 3)
     problems = audit_entanglement_schedule(forged, mapped, arch, model, plan=plan)
     assert any("serialises on one qubit" in problem for problem in problems)
+
+
+def test_audit_holds_the_makespan_to_a_root_rooting_blocks_in_turn():
+    """A root waits for each of its blocks' entanglers, but the per-qubit floor
+    counted nothing on roots, so a makespan a tenth of the genuine one passed."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    arch = _arch(compute_qubits_per_qpu=10, comm_qubits_per_qpu=10, link_capacity=10)
+    model = LatencyModel()
+    root = arch.block_of_qpu(0).compute[0]
+    mapped = QuantumCircuit(arch.n_phys)
+    for partner in arch.block_of_qpu(1).compute:
+        mapped.cx(root, partner)
+        mapped.h(root)
+    plan = aggregate_remote_operations(mapped, arch)
+    summary = estimate_entanglement_schedule(mapped, arch, model, plan=plan)
+    assert len(plan.blocks) == 10
+    assert audit_entanglement_schedule(summary, mapped, arch, model, plan=plan) == ()
+
+    forged = dataclasses.replace(summary, makespan=summary.makespan / 9.5)
+    problems = audit_entanglement_schedule(forged, mapped, arch, model, plan=plan)
+    assert any("entanglers" in problem for problem in problems)
+
+
+def test_audit_allows_port_time_rounded_past_its_budget():
+    """Busy time is a sum of intervals between absolute times, so at a large
+    makespan it can round a few ulps past ports * makespan; a fixed 1e-6
+    tolerance refused such a genuine schedule."""
+    import dataclasses
+
+    from quport.schedule import audit_entanglement_schedule
+
+    summary, mapped, arch, model, plan = _scheduled_case()
+    scale = 1e8
+    scaled = dataclasses.replace(
+        summary,
+        makespan=summary.makespan * scale,
+        port_busy_time=tuple(
+            arch.cfg.comm_qubits_per_qpu * summary.makespan * scale * (1 + 4e-16)
+            for _ in summary.port_busy_time
+        ),
+    )
+    over = dataclasses.replace(
+        scaled,
+        port_busy_time=tuple(busy * 1.001 for busy in scaled.port_busy_time),
+    )
+
+    def budget_problems(candidate):
+        return [
+            problem
+            for problem in audit_entanglement_schedule(
+                candidate, mapped, arch, model, plan=plan
+            )
+            if "ports over a" in problem
+        ]
+
+    assert budget_problems(scaled) == []
+    assert budget_problems(over)
