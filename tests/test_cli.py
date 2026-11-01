@@ -2121,6 +2121,49 @@ def test_an_output_directory_that_is_a_file_is_refused_up_front(
     assert out_dir.read_text(encoding="utf-8") == "mine"
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["map", "--n-logical", "2", "--out", "{link}/x.qasm"],
+        ["split", "--n-logical", "2", "--depth", "2", "--out-dir", "{link}/x"],
+        ["split", "--n-logical", "2", "--depth", "2", "--out-dir", "{link}"],
+        ["compile-dist", "--n-logical", "2", "--depth", "2", "--out-dir", "{link}"],
+    ],
+    ids=["map-under", "split-under", "split-at", "compile-dist-at"],
+)
+def test_an_output_path_through_a_broken_link_is_refused_up_front(
+    tmp_path: Path, args: list[str]
+) -> None:
+    """A broken symlink reads as missing, so the checks let it through, and
+    no directory can be made in its place: the commands failed after all
+    their work."""
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "missing")
+
+    result = CliRunner().invoke(app, [arg.format(link=link) for arg in args])
+
+    assert result.exit_code == 2, result.output
+    assert not (tmp_path / "missing").exists()
+
+
+@pytest.mark.parametrize("command", ["split", "compile-dist"])
+def test_an_empty_output_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """An empty --out-dir, as an unset variable gives, wrote the bundle into
+    the working directory and removed the program files it found there."""
+    monkeypatch.chdir(tmp_path)
+    mine = tmp_path / "qpu_7.qasm"
+    mine.write_text("mine", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app, [command, "--n-logical", "2", "--depth", "2", "--out-dir", ""]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["qpu_7.qasm"]
+
+
 def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:
     """The message went through rich markup: a path with [old] in it lost
     those characters, and one with [/b] in it crashed the error handler."""

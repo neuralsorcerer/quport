@@ -436,9 +436,12 @@ def _reports_errors(command: _Command) -> _Command:
 
 
 def _blocking_ancestor(path: Path) -> Path | None:
-    """The nearest existing ancestor of ``path`` if it is not a directory."""
+    """The nearest existing ancestor of ``path`` if it is not a directory.
+
+    A broken symlink counts as existing: no directory can be made in its place.
+    """
     for ancestor in path.parents:
-        if ancestor.exists():
+        if ancestor.exists() or ancestor.is_symlink():
             return None if ancestor.is_dir() else ancestor
     return None
 
@@ -455,7 +458,9 @@ def _checked_output_file(value: str | None) -> str | None:
         raise typer.BadParameter(f"{value} is a directory; name a file to write")
     blocker = _blocking_ancestor(path)
     if blocker is not None:
-        raise typer.BadParameter(f"{blocker} is a file, so {value} cannot be written")
+        raise typer.BadParameter(
+            f"{blocker} is not a directory, so {value} cannot be written"
+        )
     return value
 
 
@@ -469,13 +474,19 @@ def _checked_required_output_file(value: str) -> str:
 
 
 def _checked_output_dir(value: str) -> str:
-    """Refuse an ``--out-dir`` that is, or lies under, a file."""
+    """Refuse an ``--out-dir`` that is, or lies under, something other than a
+    directory, or that is empty: a bundle replaces the files it finds, so an
+    unset variable must not write it into the working directory."""
+    if not value:
+        raise typer.BadParameter("name a directory to write")
     path = Path(value)
-    if path.exists() and not path.is_dir():
-        raise typer.BadParameter(f"{value} is a file, not a directory")
+    if (path.exists() or path.is_symlink()) and not path.is_dir():
+        raise typer.BadParameter(f"{value} is not a directory")
     blocker = _blocking_ancestor(path)
     if blocker is not None:
-        raise typer.BadParameter(f"{blocker} is a file, so {value} cannot be created")
+        raise typer.BadParameter(
+            f"{blocker} is not a directory, so {value} cannot be created"
+        )
     return value
 
 
