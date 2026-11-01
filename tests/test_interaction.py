@@ -495,3 +495,24 @@ def test_compile_distributed_takes_an_empty_control_flow_block() -> None:
 
     for strategy in ("balanced", "tpccap"):
         compile_distributed(qc, cfg, seed=0, strategy=strategy)
+
+
+def test_a_blocks_operand_links_weigh_alike_and_come_before_its_body() -> None:
+    """Each link took its own time step, after the block's body, so operands
+    of one block weighed less the later they were listed, and less than the
+    body, though each costs one teleport made before the body runs."""
+    from quport.interaction import extract_temporal_twoq_weights
+
+    qc = QuantumCircuit(4)
+    with qc.box():
+        qc.cz(0, 1)
+        qc.x(2)
+        qc.x(3)
+    qc.cx(2, 3)
+
+    assert extract_temporal_twoq_weights(qc, 0.5, block_operands=True) == {
+        (0, 1): 1.5,
+        (0, 2): 1.0,
+        (0, 3): 1.0,
+        (2, 3): 0.25,
+    }

@@ -209,7 +209,7 @@ $$
 W_{ij}=\sum_{t\in T_{ij}}\gamma^t,
 $$
 
-where $T_{ij}$ is the set of times at which logical qubits $i$ and $j$ interact. If $\gamma=1$, temporal weights reduce to ordinary interaction counts.
+where $T_{ij}$ is the set of times at which logical qubits $i$ and $j$ interact. If $\gamma=1$, temporal weights reduce to ordinary interaction counts. Under `compile_distributed`, the links that tie a top-level control-flow block's operands together all take one index, ahead of the block's body: they stand for the teleports that gather the block, which all happen before it runs and each cost the same.
 
 Two consequences are worth keeping in mind when choosing $\gamma$:
 

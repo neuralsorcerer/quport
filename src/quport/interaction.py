@@ -55,14 +55,17 @@ def _iter_validated_weights(
         yield i, j, weight
 
 
-def _two_qubit_interactions(
+def _interaction_steps(
     circuit: QuantumCircuit,
     outer: Sequence[int],
     *,
     block_operands: bool = False,
     top: bool = True,
-) -> Iterator[tuple[int, int]]:
-    """Each two-qubit interaction, in program order, as a sorted index pair.
+) -> Iterator[tuple[tuple[int, int], ...]]:
+    """The two-qubit interactions, in program order, a step at a time.
+
+    Each step is a tuple of sorted index pairs: one two-qubit gate's pair,
+    or the links a control-flow operation's operands share (below).
 
     ``outer[k]`` is the index, in the circuit being analysed, of ``circuit``'s
     qubit ``k``. The gates in a control-flow operation's bodies count on the
@@ -75,26 +78,27 @@ def _two_qubit_interactions(
     With ``block_operands``, a top-level control-flow operation also links its
     first operand to each other one: distributed compilation gathers the whole
     operation on its first operand's QPU, teleporting each operand that sits
-    elsewhere, so splitting any of them off makes it a remote operation. A
-    nested one adds nothing more, since it runs wherever its enclosing one is
-    gathered.
+    elsewhere, so splitting any of them off makes it a remote operation. Those
+    teleports all happen before the body runs, and each costs the same, so the
+    links are one step, ahead of the body's. A nested operation adds nothing
+    more, since it runs wherever its enclosing one is gathered.
     """
     position = {qubit: outer[index] for index, qubit in enumerate(circuit.qubits)}
     for inst in circuit.data:
         operation = inst.operation
         if isinstance(operation, ControlFlowOp):
             applied = [position[qubit] for qubit in inst.qubits]
-            inner = [
-                edge
-                for block in operation.blocks
-                for edge in _two_qubit_interactions(block, applied, top=False)
-            ]
-            yield from inner
             if block_operands and top and applied:
                 first = applied[0]
-                for other in dict.fromkeys(applied[1:]):
-                    if other != first:
-                        yield (first, other) if first < other else (other, first)
+                links = tuple(
+                    (first, other) if first < other else (other, first)
+                    for other in dict.fromkeys(applied[1:])
+                    if other != first
+                )
+                if links:
+                    yield links
+            for block in operation.blocks:
+                yield from _interaction_steps(block, applied, top=False)
             continue
         if len(inst.qubits) != 2:
             continue
@@ -107,7 +111,7 @@ def _two_qubit_interactions(
         j = position[inst.qubits[1]]
         if i == j:
             continue
-        yield (i, j) if i < j else (j, i)
+        yield ((i, j) if i < j else (j, i),)
 
 
 def extract_twoq_weights(
@@ -126,11 +130,10 @@ def extract_twoq_weights(
     This works for random circuits and any circuits with 2Q ops (cx, cz, ecr, rxx, etc.).
     """
     weights: dict[tuple[int, int], int] = defaultdict(int)
-    interactions = _two_qubit_interactions(
-        qc, range(len(qc.qubits)), block_operands=block_operands
-    )
-    for edge in interactions:
-        weights[edge] += 1
+    steps = _interaction_steps(qc, range(len(qc.qubits)), block_operands=block_operands)
+    for step in steps:
+        for edge in step:
+            weights[edge] += 1
     return dict(weights)
 
 
@@ -203,7 +206,9 @@ def extract_temporal_twoq_weights(
         w_t = decay ** t
 
     where t is a monotonically increasing instruction index over 2Q ops, those
-    inside control-flow bodies included, in program order.
+    inside control-flow bodies included, in program order. With
+    ``block_operands``, the links a top-level control-flow operation adds share
+    one index, ahead of its body's.
 
     Parameters
     ----------
@@ -221,11 +226,10 @@ def extract_temporal_twoq_weights(
     decay_value = validate_temporal_decay(decay)
 
     weights: dict[tuple[int, int], float] = defaultdict(float)
-    interactions = _two_qubit_interactions(
-        qc, range(len(qc.qubits)), block_operands=block_operands
-    )
-    for t, edge in enumerate(interactions):
-        weights[edge] += float(decay_value**t)
+    steps = _interaction_steps(qc, range(len(qc.qubits)), block_operands=block_operands)
+    for t, step in enumerate(steps):
+        for edge in step:
+            weights[edge] += float(decay_value**t)
     # Once decay**t underflows, an edge first seen after that point adds only
     # zeros; it carries no interaction and is left out of the graph.
     return {edge: weight for edge, weight in weights.items() if weight > 0.0}
