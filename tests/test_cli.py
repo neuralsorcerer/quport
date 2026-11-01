@@ -1951,3 +1951,62 @@ def test_a_file_option_naming_a_directory_is_refused_up_front(
 
     assert result.exit_code == 2, result.output
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("link", ["input-in-out-dir", "out-dir-name-is-a-link"])
+def test_a_symlinked_input_named_like_a_bundle_file_is_refused(
+    tmp_path: Path, link: str
+) -> None:
+    """The check compared the input's resolved directory with its given name,
+    so a link inside the output directory, or one pointing into it, passed and
+    the input was overwritten."""
+    circuit = QuantumCircuit(2, 2)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    circuit.measure([0, 1], [0, 1])
+    out_dir = tmp_path / "out"
+    data = tmp_path / "data"
+    out_dir.mkdir()
+    data.mkdir()
+    if link == "input-in-out-dir":
+        real = data / "c.qasm"
+        real.write_text(qasm2.dumps(circuit), encoding="utf-8")
+        given = out_dir / "qpu_0.qasm"
+        given.symlink_to(real)
+    else:
+        real = out_dir / "qpu_0.qasm"
+        real.write_text(qasm2.dumps(circuit), encoding="utf-8")
+        given = data / "c.qasm"
+        given.symlink_to(real)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "split",
+            "--input-qasm",
+            str(given),
+            "--config",
+            str(_small_config(tmp_path)),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert real.read_text(encoding="utf-8") == qasm2.dumps(circuit)
+
+
+def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:
+    """The message went through rich markup: a path with [old] in it lost
+    those characters, and one with [/b] in it crashed the error handler."""
+    blocker = tmp_path / "runs[old]"
+    blocker.write_text("", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        ["split", "--n-logical", "2", "--depth", "2", "--out-dir", str(blocker / "x")],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "runs[old]" in result.output.replace("\n", "")

@@ -360,7 +360,7 @@ def qasm3_text(circuit: QuantumCircuit) -> str:
     try:
         return str(qasm3.dumps(circuit))
     except QASM3ExporterError as exc:
-        if "alias" not in str(exc):
+        if "classical registers" not in str(exc) or "alias" not in str(exc):
             raise
         raise ValueError(
             "the circuit's classical registers share bits, which OpenQASM 3 can "
@@ -408,7 +408,6 @@ def write_distributed_program(
     out_dir = _coerce_output_path(path, label="path")
     if out_dir.exists() and not out_dir.is_dir():
         raise ValueError("path must be a directory or a path that does not exist")
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     entries: list[tuple[int, QuantumCircuit]] = []
     for qpu, circuit in program.local_circuits.items():
@@ -430,6 +429,7 @@ def write_distributed_program(
     ]
     manifest = _render_remote_ops_json(program.remote_ops)
 
+    out_dir.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
     for qpu_id, text in rendered:
         qpu_path = out_dir / f"qpu_{qpu_id}.qasm"
@@ -1072,29 +1072,55 @@ def _params_match(named: Sequence[object], actual: Sequence[object]) -> bool:
     written as their type and their text: a control-flow body, drawn at the
     terminal's width, and an array, printed at NumPy's precision. That text
     is not stable, so where the manifest was read back from JSON, such a
-    value is checked by its type alone; a live manifest is compared by value.
+    value -- at any depth -- is checked by its type alone; a live one is
+    compared by value. An array of one element is written as that number.
     """
     if len(named) != len(actual):
         return False
     return all(_param_matches(left, right) for left, right in zip(named, actual))
 
 
+#: Parameter types written as text that depends on the process: a circuit is
+#: drawn at the terminal's width, an array printed at NumPy's precision.
+_UNSTABLE_TEXT_TYPES = frozenset({"QuantumCircuit", "ndarray"})
+
+
 def _param_matches(named: object, actual: object) -> bool:
-    if isinstance(actual, QuantumCircuit | np.ndarray):
-        if isinstance(named, Mapping):
-            return named.get("type") == type(actual).__name__
-        if isinstance(actual, np.ndarray):
-            return isinstance(named, np.ndarray) and bool(
-                named.shape == actual.shape and np.array_equal(named, actual)
-            )
-        return isinstance(named, QuantumCircuit) and named == actual
+    if isinstance(actual, QuantumCircuit) and isinstance(named, QuantumCircuit):
+        return bool(named == actual)
+    if isinstance(actual, np.ndarray) and isinstance(named, np.ndarray):
+        return named.shape == actual.shape and _arrays_equal(named, actual)
     if (
         isinstance(actual, list | tuple)
         and isinstance(named, list | tuple)
         and not isinstance(named, str)
     ):
         return _params_match(named, actual)
-    return bool(_json_safe_value(named) == _json_safe_value(actual))
+    return bool(_stable_form(named) == _stable_form(actual))
+
+
+def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    """Element-wise equality, with NaN equal to NaN where the dtype has one."""
+    try:
+        return bool(np.array_equal(left, right, equal_nan=True))
+    except TypeError:
+        return bool(np.array_equal(left, right))
+
+
+def _stable_form(value: object) -> Any:
+    """A value's JSON form, with any text that depends on the process reduced
+    to the type it describes."""
+
+    def reduce(item: Any) -> Any:
+        if isinstance(item, dict):
+            if set(item) == {"type", "repr"} and item["type"] in _UNSTABLE_TEXT_TYPES:
+                return {"type": item["type"]}
+            return {key: reduce(inner) for key, inner in item.items()}
+        if isinstance(item, list):
+            return [reduce(inner) for inner in item]
+        return item
+
+    return reduce(_json_safe_value(value))
 
 
 def _check_manifest_markers(

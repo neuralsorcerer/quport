@@ -3101,3 +3101,71 @@ def test_the_library_writer_removes_another_bundles_summaries(
         "qpu_1.qasm",
         "remote_ops.json",
     ]
+
+
+def test_genuine_array_parameters_survive_the_manifest_check() -> None:
+    """A one-element array is written to JSON as its number, an array with a
+    NaN is not equal to itself element by element, and an array nested in a
+    dict was still compared by its printed text: all three genuine manifests
+    were refused."""
+    import dataclasses
+    import json
+
+    import numpy as np
+    from qiskit.circuit import Instruction
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+
+    class Tagged(Instruction):
+        def validate_parameter(self, parameter: Any) -> Any:
+            return parameter
+
+    for param, from_json in [
+        (np.array([0.5]), True),
+        (np.array(0.5), True),
+        (np.array([np.nan, 1.0]), False),
+        ({"m": np.arange(4.0).reshape(2, 2)}, True),
+    ]:
+        definition = QuantumCircuit(2)
+        definition.cx(0, 1)
+        tagged = Tagged("tagged", 2, 0, [param])
+        tagged.definition = definition
+        mapped = QuantumCircuit(arch.n_phys)
+        mapped.append(tagged, [0, 3])
+        program = split_into_qpus(mapped, arch)
+        ops = program.remote_ops
+        if from_json:
+            with np.printoptions(precision=2):
+                ops = [
+                    dataclasses.replace(
+                        op, params=json.loads(json.dumps(op.to_dict()["params"]))
+                    )
+                    for op in ops
+                ]
+        reassemble_distributed_program(mapped, program.local_circuits, ops, arch)
+
+
+def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
+    from qiskit.circuit import Clbit
+
+    from quport.distributed import write_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    bits = [Clbit() for _ in range(2)]
+    mapped = QuantumCircuit(
+        QuantumRegister(arch.n_phys, "q"),
+        ClassicalRegister(bits=bits, name="c"),
+        ClassicalRegister(bits=bits[:1], name="first"),
+    )
+    mapped.measure(0, bits[0])
+    target = tmp_path / "bundle"
+
+    with pytest.raises(ValueError, match="registers share bits"):
+        write_distributed_program(split_into_qpus(mapped, arch), target)
+    assert not target.exists()

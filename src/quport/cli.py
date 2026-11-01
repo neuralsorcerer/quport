@@ -21,6 +21,7 @@ from qiskit import QuantumCircuit, qasm2, qasm3
 from qiskit.exceptions import MissingOptionalLibraryError
 from qiskit.transpiler.exceptions import TranspilerError
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from quport.architecture import MultiQPUArchitecture, validate_architecture_config
@@ -366,7 +367,9 @@ def _qasm3_or_exit(circuit: QuantumCircuit) -> str:
     try:
         return qasm3_text(circuit)
     except ValueError as exc:
-        console.print(f"[bold red]Cannot write OpenQASM 3:[/bold red] {exc}")
+        console.print(
+            f"[bold red]Cannot write OpenQASM 3:[/bold red] {escape(str(exc))}"
+        )
         raise typer.Exit(code=1) from exc
 
 
@@ -388,9 +391,11 @@ def _refuse_input_in_bundle(input_qasm: str | None, out_dir: str) -> None:
     if not input_qasm:
         return
     source = Path(input_qasm)
-    if source.resolve().parent == Path(out_dir).resolve() and is_bundle_file(
-        source.name
-    ):
+    target = Path(out_dir).resolve()
+    # Both the name it was given and, through a symlink, the file it is.
+    for candidate in (source.parent.resolve() / source.name, source.resolve()):
+        if candidate.parent != target or not is_bundle_file(candidate.name):
+            continue
         raise typer.BadParameter(
             f"--input-qasm {input_qasm} is named like a file of the bundle written "
             f"to {out_dir}; move it or choose another --out-dir"
@@ -413,7 +418,9 @@ def _reports_errors(command: _Command) -> _Command:
         try:
             return command(*args, **kwargs)
         except (ValueError, TranspilerError, OSError) as exc:
-            console.print(f"[bold red]Error:[/bold red] {exc}", highlight=False)
+            console.print(
+                f"[bold red]Error:[/bold red] {escape(str(exc))}", highlight=False
+            )
             raise typer.Exit(code=1) from exc
 
     return cast(_Command, reported)
@@ -914,7 +921,7 @@ def ebits(
         if problems:
             console.print("[bold red]Entanglement schedule is inconsistent:[/bold red]")
             for problem in problems[:10]:
-                console.print(f"  {problem}")
+                console.print(f"  {escape(problem)}")
             raise typer.Exit(code=1)
 
         _output_path(out).write_text(
@@ -1035,7 +1042,7 @@ def optimal(
         except ValueError as exc:
             # A heuristic below a proved optimum is a bug in one of the two, not
             # a bad command line, so say which comparison failed and stop.
-            console.print(f"[bold red]{objective}:[/bold red] {exc}")
+            console.print(f"[bold red]{objective}:[/bold red] {escape(str(exc))}")
             raise typer.Exit(code=1) from exc
         # Without a proof, `optimal` is only an upper bound on the true optimum,
         # so the computed gap is a lower bound on the real one -- and can even
@@ -1282,7 +1289,7 @@ def compile_dist(
     if inconsistencies:
         console.print("[bold red]Schedule plan is inconsistent:[/bold red]")
         for problem in inconsistencies[:10]:
-            console.print(f"  {problem}")
+            console.print(f"  {escape(problem)}")
         if len(inconsistencies) > 10:
             console.print(f"  ... and {len(inconsistencies) - 10} more")
         raise typer.Exit(code=1)
@@ -1301,7 +1308,7 @@ def compile_dist(
     if entanglement_problems:
         console.print("[bold red]Entanglement schedule is inconsistent:[/bold red]")
         for problem in entanglement_problems[:10]:
-            console.print(f"  {problem}")
+            console.print(f"  {escape(problem)}")
         raise typer.Exit(code=1)
 
     (outp / "entanglement_plan.json").write_text(
