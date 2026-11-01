@@ -213,7 +213,7 @@ where $T_{ij}$ is the set of times at which logical qubits $i$ and $j$ interact.
 
 Two consequences are worth keeping in mind when choosing $\gamma$:
 
-- The total weight of a circuit converges to $\sum_{t\ge 0}\gamma^{t}=1/(1-\gamma)$ regardless of how long the circuit is. For the default $\gamma=0.98$ that is $50$, and $99\%$ of it falls in the first $\approx 228$ two-qubit operations. On a circuit with thousands of two-qubit gates the partitioner is therefore driven almost entirely by a prefix, which is the intended emphasis but is easy to overlook.
+- The total weight of a circuit's two-qubit gates converges to $\sum_{t\ge 0}\gamma^{t}=1/(1-\gamma)$ regardless of how long the circuit is. For the default $\gamma=0.98$ that is $50$, and $99\%$ of it falls in the first $\approx 228$ two-qubit operations. On a circuit with thousands of two-qubit gates the partitioner is therefore driven almost entirely by a prefix, which is the intended emphasis but is easy to overlook. A block's $k$ operand links share their index, so under `compile_distributed` that index adds $k\gamma^t$, and with control flow the total can exceed the bound; the prefix still dominates.
 - Once $\gamma^{t}$ underflows to zero in double precision (at $t=36{,}883$ for $\gamma=0.98$), an edge that first appears after that point contributes exactly zero and is dropped from the interaction graph.
 
 Which pipelines apply temporal weighting is not uniform, and it matters when comparing strategies:
