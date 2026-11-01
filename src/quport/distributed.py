@@ -77,7 +77,18 @@ def _enter_container(value: object, seen: set[int]) -> int:
     return object_id
 
 
-def _json_safe_mapping(value: Mapping[object, object], seen: set[int]) -> Any:
+def _typed_text(value: object) -> Any:
+    """The form of a value JSON cannot hold: its type and its text."""
+    return {"type": type(value).__name__, "repr": str(value)}
+
+
+#: Writes a value :func:`_json_safe_value` has no other form for.
+_Opaque: TypeAlias = Callable[[object], Any]
+
+
+def _json_safe_mapping(
+    value: Mapping[object, object], seen: set[int], opaque: _Opaque
+) -> Any:
     """Convert mappings while avoiding string-key collisions."""
     object_id = _enter_container(value, seen)
     try:
@@ -85,8 +96,8 @@ def _json_safe_mapping(value: Mapping[object, object], seen: set[int]) -> Any:
         entries: list[list[Any]] = []
         use_entries = False
         for key, item in value.items():
-            safe_key = _json_safe_value(key, seen)
-            safe_item = _json_safe_value(item, seen)
+            safe_key = _json_safe_value(key, seen, opaque)
+            safe_item = _json_safe_value(item, seen, opaque)
             entries.append([safe_key, safe_item])
 
             if isinstance(key, str) and key not in converted and not use_entries:
@@ -101,32 +112,39 @@ def _json_safe_mapping(value: Mapping[object, object], seen: set[int]) -> Any:
         seen.remove(object_id)
 
 
-def _json_safe_sequence(value: Sequence[object], seen: set[int]) -> list[Any]:
+def _json_safe_sequence(
+    value: Sequence[object], seen: set[int], opaque: _Opaque
+) -> list[Any]:
     """Convert ordered containers to JSON arrays with cycle detection."""
     object_id = _enter_container(value, seen)
     try:
-        return [_json_safe_value(item, seen) for item in value]
+        return [_json_safe_value(item, seen, opaque) for item in value]
     finally:
         seen.remove(object_id)
 
 
-def _json_safe_set(value: Set[object], seen: set[int]) -> Any:
+def _json_safe_set(value: Set[object], seen: set[int], opaque: _Opaque) -> Any:
     """Convert unordered containers deterministically without losing their type."""
     object_id = _enter_container(value, seen)
     try:
-        items = [_json_safe_value(item, seen) for item in sorted(value, key=repr)]
+        items = [
+            _json_safe_value(item, seen, opaque) for item in sorted(value, key=repr)
+        ]
         return {"type": type(value).__name__, "items": items}
     finally:
         seen.remove(object_id)
 
 
-def _json_safe_value(value: object, seen: set[int] | None = None) -> Any:
+def _json_safe_value(
+    value: object, seen: set[int] | None = None, opaque: _Opaque = _typed_text
+) -> Any:
     """Convert instruction metadata to a deterministic JSON-compatible value.
 
     Qiskit gate parameters are usually numbers or symbolic parameters, but custom
     instructions may carry richer metadata. This helper preserves JSON-native
     values, explicitly encodes non-finite/complex/bytes/container edge cases, and
-    falls back to a typed string representation for opaque objects.
+    falls back to ``opaque``, a typed string representation by default, for
+    opaque objects.
     """
     active_seen = set() if seen is None else seen
 
@@ -148,20 +166,20 @@ def _json_safe_value(value: object, seen: set[int] | None = None) -> Any:
             "data": base64.b64encode(raw).decode("ascii"),
         }
     if isinstance(value, Mapping):
-        return _json_safe_mapping(value, active_seen)
+        return _json_safe_mapping(value, active_seen, opaque)
     if isinstance(value, Set):
-        return _json_safe_set(value, active_seen)
+        return _json_safe_set(value, active_seen, opaque)
     if isinstance(value, Sequence) and not isinstance(value, str):
-        return _json_safe_sequence(value, active_seen)
+        return _json_safe_sequence(value, active_seen, opaque)
 
     item = getattr(value, "item", None)
     if callable(item):
         try:
-            return _json_safe_value(item(), active_seen)
+            return _json_safe_value(item(), active_seen, opaque)
         except (TypeError, ValueError, OverflowError):
             pass
 
-    return {"type": type(value).__name__, "repr": str(value)}
+    return opaque(value)
 
 
 @dataclass(frozen=True)
@@ -215,6 +233,7 @@ class RemoteOp:
         params = _json_safe_sequence(
             _validate_manifest_sequence(self.params, label="remote operation params"),
             set(),
+            _typed_text,
         )
         clbits = [
             _validate_manifest_int(clbit, label="remote operation clbit index")
@@ -1091,21 +1110,53 @@ def _param_matches(named: object, actual: object) -> bool:
         and set(named) == set(actual)
     ):
         return all(_param_matches(named[key], actual[key]) for key in actual)
-    if (
-        isinstance(actual, list | tuple)
-        and isinstance(named, list | tuple)
-        and not isinstance(named, str)
-    ):
+    if isinstance(actual, list | tuple) and isinstance(named, list | tuple):
         return _params_match(named, actual)
-    written = _json_safe_value(actual)
-    if (
-        isinstance(actual, QuantumCircuit | np.ndarray)
-        and isinstance(written, dict)
-        and set(written) == {"type", "repr"}
-    ):
-        # Read back from JSON, where only the type of such a value is stable.
-        return isinstance(named, Mapping) and named.get("type") == written["type"]
-    return bool(_json_safe_value(named) == written)
+    # Read back from JSON, or held in another form: compare what each is
+    # written as, walked as the writer walks it, with the unstable text in it
+    # reduced to the type it describes.
+    return _matches_written(
+        _json_safe_value(named), _json_safe_value(actual, opaque=_stable_text)
+    )
+
+
+@dataclass(frozen=True)
+class _TextOfType:
+    """Where a value is written as text that depends on the process."""
+
+    name: str
+
+
+def _stable_text(value: object) -> Any:
+    """As :func:`_typed_text`, except that a circuit, drawn at the terminal's
+    width, and an array, printed at NumPy's precision, keep only their type."""
+    if isinstance(value, QuantumCircuit | np.ndarray):
+        return _TextOfType(type(value).__name__)
+    return _typed_text(value)
+
+
+def _matches_written(named: Any, expected: Any) -> bool:
+    """True when the JSON form ``named`` is ``expected``, a written form whose
+    unstable text stands as :class:`_TextOfType`."""
+    if isinstance(expected, _TextOfType):
+        return (
+            isinstance(named, dict)
+            and set(named) == {"type", "repr"}
+            and named["type"] == expected.name
+        )
+    if isinstance(expected, dict):
+        return (
+            isinstance(named, dict)
+            and set(named) == set(expected)
+            and all(_matches_written(named[key], expected[key]) for key in expected)
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(named, list)
+            and len(named) == len(expected)
+            and all(map(_matches_written, named, expected))
+        )
+    return bool(named == expected)
 
 
 def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
@@ -1113,8 +1164,12 @@ def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
     try:
         return bool(np.array_equal(left, right, equal_nan=True))
     except TypeError:
-        # An object array: its elements are parameters in their own right.
-        return all(_param_matches(a, b) for a, b in zip(left.ravel(), right.ravel()))
+        # An object or text array: its elements are parameters in their own
+        # right. As plain arrays, since a raveled matrix is still a matrix.
+        return all(
+            _param_matches(a, b)
+            for a, b in zip(np.asarray(left).ravel(), np.asarray(right).ravel())
+        )
 
 
 def _check_manifest_markers(

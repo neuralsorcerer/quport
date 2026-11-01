@@ -3243,6 +3243,74 @@ def test_subclassed_and_object_array_parameters_survive_the_manifest_check(
     )
 
 
+@pytest.mark.parametrize("kind", ["int-key-array", "int-key-circuit", "one-element"])
+def test_a_json_manifest_is_read_by_the_form_it_was_written_in(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Only a circuit or an array the check reached by walking the Python
+    value had its text reduced to its type, so one the writer put in another
+    form -- under a dict with other than string keys, or as the element of a
+    one-element array -- was compared by text, and refused when written at
+    another print precision or terminal width."""
+    import dataclasses
+    import json
+
+    import numpy as np
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    body = QuantumCircuit(2)
+    for _ in range(40):
+        body.h(0)
+    body.cx(0, 1)
+    if kind == "int-key-array":
+        param: Any = {0: np.array([0.123456789, 2.0])}
+    elif kind == "int-key-circuit":
+        param = {0: body}
+    else:
+        param = np.empty(1, dtype=object)
+        param[0] = {"m": np.array([0.123456789, 2.0]), "b": body}
+    mapped = _mapped_with_tagged(arch, param)
+    program = split_into_qpus(mapped, arch)
+    monkeypatch.setenv("COLUMNS", "40")
+    with np.printoptions(precision=2):
+        text = json.dumps(program.remote_ops[0].to_dict()["params"])
+    monkeypatch.setenv("COLUMNS", "200")
+    ops = [dataclasses.replace(program.remote_ops[0], params=json.loads(text))]
+
+    reassemble_distributed_program(mapped, program.local_circuits, ops, arch)
+
+
+@pytest.mark.filterwarnings("ignore::PendingDeprecationWarning")
+@pytest.mark.parametrize("dtype", ["text", "object"])
+def test_a_text_or_object_matrix_parameter_matches_its_copy(dtype: str) -> None:
+    """A raveled matrix is still a matrix, so comparing its elements one by
+    one compared the matrix with itself again, without end."""
+    import copy
+
+    import numpy as np
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    param = (
+        np.matrix([["a", "b"]])
+        if dtype == "text"
+        else np.matrix([[1, None]], dtype=object)
+    )
+    mapped = _mapped_with_tagged(arch, param)
+    program = split_into_qpus(mapped, arch)
+
+    reassemble_distributed_program(
+        mapped, program.local_circuits, copy.deepcopy(program.remote_ops), arch
+    )
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 
