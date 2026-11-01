@@ -2146,6 +2146,33 @@ def test_an_output_path_through_a_broken_link_is_refused_up_front(
     assert not (tmp_path / "missing").exists()
 
 
+@pytest.mark.parametrize("link", ["into-a-missing-directory", "loop"])
+def test_an_output_file_that_is_a_broken_link_is_refused_up_front(
+    tmp_path: Path, link: str
+) -> None:
+    """Writing follows the link, and the file it names cannot be made: the
+    command failed after all its work."""
+    out = tmp_path / "out.qasm"
+    out.symlink_to(tmp_path / "missing" / "x.qasm" if link != "loop" else out)
+
+    result = CliRunner().invoke(app, ["map", "--n-logical", "2", "--out", str(out)])
+
+    assert result.exit_code == 2, result.output
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["out.qasm"]
+
+
+def test_an_output_file_that_is_a_link_to_a_new_file_is_written(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "out.qasm"
+    out.symlink_to(tmp_path / "new.qasm")
+
+    result = CliRunner().invoke(app, ["map", "--n-logical", "2", "--out", str(out)])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "new.qasm").read_text(encoding="utf-8").startswith("OPENQASM")
+
+
 @pytest.mark.parametrize("command", ["split", "compile-dist"])
 def test_an_empty_output_directory_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str

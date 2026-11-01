@@ -10,6 +10,7 @@ import functools
 import importlib
 import json
 import math
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import asdict
@@ -461,6 +462,12 @@ def _checked_output_file(value: str | None) -> str | None:
         raise typer.BadParameter(
             f"{blocker} is not a directory, so {value} cannot be written"
         )
+    if path.is_symlink() and not path.exists():
+        # Writing follows the link and creates the file it names, which needs
+        # a directory to go in, and a link that loops names no file at all.
+        target = Path(os.path.realpath(path))
+        if target.is_symlink() or not target.parent.is_dir():
+            raise typer.BadParameter(f"{value} is a broken link that cannot be written")
     return value
 
 
