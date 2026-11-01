@@ -31,13 +31,15 @@ from quport.config import (
     optional_module_available,
 )
 from quport.distributed import (
+    _COMPILE_SUMMARIES,
     _remove_stale_programs,
+    is_bundle_file,
     qasm3_text,
     write_remote_ops_json,
 )
 from quport.entanglement import is_standard_gate
 from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
-from quport.interaction import extract_twoq_weights
+from quport.interaction import extract_twoq_weights, validate_temporal_decay
 from quport.network import build_qpu_graph, topology_metrics
 from quport.pipeline import (
     _validate_strategy_sequence,
@@ -71,6 +73,8 @@ def _output_path(out: str) -> Path:
     The ``--out-dir`` commands and the bundle writers already create theirs.
     """
     path = Path(out)
+    if path.is_dir():
+        raise typer.BadParameter(f"{out} is a directory; name a file to write")
     if path.parent != Path(""):
         path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -306,10 +310,6 @@ def _load_or_random_circuit(
     return random_benchmark_circuit(n_logical, depth, seed)
 
 
-#: The summaries ``compile-dist`` writes beside its programs and manifest.
-_COMPILE_SUMMARIES = ("schedule.json", "schedule_trace.json", "entanglement_plan.json")
-
-
 def _write_layout(path: Path, initial: list[int], final: list[int]) -> None:
     """Write where each input qubit starts and ends on the physical machine.
 
@@ -357,6 +357,42 @@ def _routed_final_layout(
             layout.final_index_layout()[physical] if layout is not None else physical
         )
     return final
+
+
+def _qasm3_or_exit(circuit: QuantumCircuit) -> str:
+    """Render ``circuit`` as OpenQASM 3, or say why it cannot be and exit."""
+    try:
+        return qasm3_text(circuit)
+    except ValueError as exc:
+        console.print(f"[bold red]Cannot write OpenQASM 3:[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+def _checked_temporal_decay(value: float) -> float:
+    """Refuse a ``--temporal-decay`` outside ``(0, 1]`` as a usage error."""
+    try:
+        return validate_temporal_decay(value, label="--temporal-decay")
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _refuse_input_in_bundle(input_qasm: str | None, out_dir: str) -> None:
+    """Refuse an input that the bundle about to be written would replace.
+
+    A file in the output directory named like one of the bundle's -- a
+    program, the manifest, the layout or a schedule summary -- would be
+    overwritten, removed as stale, or read as part of the new bundle.
+    """
+    if not input_qasm:
+        return
+    source = Path(input_qasm)
+    if source.resolve().parent == Path(out_dir).resolve() and is_bundle_file(
+        source.name
+    ):
+        raise typer.BadParameter(
+            f"--input-qasm {input_qasm} is named like a file of the bundle written "
+            f"to {out_dir}; move it or choose another --out-dir"
+        )
 
 
 #: Partition strategies the mapping and compiling commands take.
@@ -512,7 +548,7 @@ def map(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    seed: int = typer.Option(0, min=0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "tpccap",
         callback=_checked_strategy,
@@ -551,7 +587,8 @@ def map(
     )
 
     if out:
-        _output_path(out).write_text(qasm3_text(res.mapped_circuit), encoding="utf-8")
+        text = _qasm3_or_exit(res.mapped_circuit)
+        _output_path(out).write_text(text, encoding="utf-8")
         _print_path(f"Wrote mapped circuit to {out}")
 
 
@@ -560,7 +597,7 @@ def bench(
     n_logical: int = typer.Option(..., min=0, help="Number of logical qubits"),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     trials: int = typer.Option(10, min=0, help="Number of random circuits"),
-    seed: int = typer.Option(0, help="Base seed"),
+    seed: int = typer.Option(0, min=0, help="Base seed"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
         callback=_checked_strategies,
@@ -594,7 +631,7 @@ def sweep(
     n_logical: int = typer.Option(..., min=0, help="Number of logical qubits"),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     trials: int = typer.Option(5, min=0, help="Trials per setting"),
-    seed: int = typer.Option(0, help="Base seed"),
+    seed: int = typer.Option(0, min=0, help="Base seed"),
     out: str = typer.Option("sweep.csv", help="Output CSV summary"),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
@@ -642,7 +679,7 @@ def schedule(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed"),
+    seed: int = typer.Option(0, min=0, help="Seed"),
     strategy: str = typer.Option(
         "tpccap",
         callback=_checked_strategy,
@@ -681,7 +718,7 @@ def split(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed"),
+    seed: int = typer.Option(0, min=0, help="Seed"),
     strategy: str = typer.Option(
         "tpccap",
         callback=_checked_strategy,
@@ -700,6 +737,7 @@ def split(
     """Split a mapped circuit into per-QPU local circuits + remote-op list (JSON)."""
     from .distributed import split_into_qpus
 
+    _refuse_input_in_bundle(input_qasm, out_dir)
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
@@ -713,25 +751,23 @@ def split(
     arch = MultiQPUArchitecture(cfg)
     prog = split_into_qpus(res.mapped_circuit, arch)
 
+    # Every program is rendered before any file is written, so a circuit that
+    # cannot be leaves an earlier bundle as it was.
+    texts = [_qasm3_or_exit(c) for c in prog.local_circuits.values()]
     outp = Path(out_dir)
     outp.mkdir(parents=True, exist_ok=True)
 
     # write per-QPU QASM3
     programs = [outp / f"qpu_{qpu}.qasm" for qpu in prog.local_circuits]
-    for path, c in zip(programs, prog.local_circuits.values()):
-        path.write_text(qasm3_text(c), encoding="utf-8")
+    for path, text in zip(programs, texts):
+        path.write_text(text, encoding="utf-8")
 
     # write remote ops
     write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
     _write_layout(outp / "layout.json", *_mapped_layouts(res.mapped_circuit))
-    _remove_stale_programs(outp, programs, keep=[input_qasm] if input_qasm else [])
     # A compile-dist bundle's summaries describe its own manifest, which this
     # one has replaced.
-    kept = Path(input_qasm).resolve() if input_qasm else None
-    for name in _COMPILE_SUMMARIES:
-        summary = outp / name
-        if summary.is_file() and summary.resolve() != kept:
-            summary.unlink()
+    _remove_stale_programs(outp, programs, stale=_COMPILE_SUMMARIES)
 
     _print_path(
         f"Wrote {len(prog.local_circuits)} local circuits and {len(prog.remote_ops)} remote ops to {out_dir}"
@@ -744,7 +780,7 @@ def ebits(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    seed: int = typer.Option(0, min=0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "ebit",
         callback=_checked_strategy,
@@ -849,9 +885,8 @@ def ebits(
         program = build_telegate_circuit(
             res.physical_circuit, arch, plan, coherent=False
         )
-        _output_path(emit_qasm).write_text(
-            qasm3_text(program.circuit), encoding="utf-8"
-        )
+        text = _qasm3_or_exit(program.circuit)
+        _output_path(emit_qasm).write_text(text, encoding="utf-8")
         _print_path(
             f"Wrote telegate circuit ({program.n_ancillas} protocol ancillas) "
             f"to {emit_qasm}"
@@ -875,7 +910,7 @@ def optimal(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(12, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    seed: int = typer.Option(0, min=0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "ebit",
         callback=_checked_strategy,
@@ -988,7 +1023,7 @@ def migrate(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    seed: int = typer.Option(0, min=0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "ebit",
         callback=_checked_strategy,
@@ -1096,14 +1131,16 @@ def compile_dist(
         None, min=0, help="Number of logical qubits for generated random circuits"
     ),
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
-    seed: int = typer.Option(0, help="Seed for random circuit + transpiler"),
+    seed: int = typer.Option(0, min=0, help="Seed for random circuit + transpiler"),
     strategy: str = typer.Option(
         "tpccap_sa",
         callback=_checked_strategy,
         help="Partition strategy: balanced, cluster, ebit, tpccap, tpccap_sa",
     ),
     temporal_decay: float = typer.Option(
-        0.98, help="Time-decay factor for 2Q weights (<=1). Use 1 for uniform."
+        0.98,
+        callback=_checked_temporal_decay,
+        help="Time-decay factor for 2Q weights (<=1). Use 1 for uniform.",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     input_qasm: str | None = typer.Option(
@@ -1126,6 +1163,7 @@ def compile_dist(
       - entanglement_plan.json : aggregated EPR blocks, e-bit report, and the
         entanglement-aware schedule summary
     """
+    _refuse_input_in_bundle(input_qasm, out_dir)
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(
@@ -1145,13 +1183,14 @@ def compile_dist(
         temporal_decay=temporal_decay,
     )
 
+    texts = [_qasm3_or_exit(c) for c in res.local_routed.values()]
     outp = Path(out_dir)
     outp.mkdir(parents=True, exist_ok=True)
 
     programs = [outp / f"qpu_{qpu}_routed.qasm" for qpu in res.local_routed]
-    for path, c in zip(programs, res.local_routed.values()):
-        path.write_text(qasm3_text(c), encoding="utf-8")
-    _remove_stale_programs(outp, programs, keep=[input_qasm] if input_qasm else [])
+    for path, text in zip(programs, texts):
+        path.write_text(text, encoding="utf-8")
+    _remove_stale_programs(outp, programs)
 
     # The bundle ships routed programs, so it ships the manifest that matches
     # them: local routing permutes qubits inside a QPU unless the intra-QPU

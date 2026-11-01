@@ -1641,6 +1641,10 @@ def test_a_rerun_on_fewer_qpus_leaves_no_stale_programs(
         ["map", "--n-logical", "20"],
         ["optimal", "--n-logical", "6", "--depth", "4", "--max-nodes", "0"],
         ["map", "--n-logical", "4", "--depth", "-1"],
+        ["map", "--n-logical", "4", "--seed", "-1"],
+        ["compile-dist", "--n-logical", "4", "--temporal-decay", "0"],
+        ["compile-dist", "--n-logical", "4", "--temporal-decay", "nan"],
+        ["map", "--n-logical", "4", "--depth", "2", "--out", "."],
     ],
     ids=[
         "strategy",
@@ -1651,6 +1655,10 @@ def test_a_rerun_on_fewer_qpus_leaves_no_stale_programs(
         "too-wide",
         "max-nodes",
         "depth",
+        "seed",
+        "temporal-decay",
+        "temporal-decay-nan",
+        "out-directory",
     ],
 )
 def test_a_bad_option_is_a_usage_error_not_a_traceback(
@@ -1739,13 +1747,19 @@ def test_split_and_compile_dist_into_one_directory_leave_one_bundle(
 
 @pytest.mark.parametrize(
     ("command", "name"),
-    [("split", "qpu_9.qasm"), ("compile-dist", "qpu_9_routed.qasm")],
+    [
+        ("split", "qpu_0.qasm"),
+        ("split", "qpu_9.qasm"),
+        ("compile-dist", "qpu_9_routed.qasm"),
+        ("split", "schedule.json"),
+    ],
 )
-def test_an_input_named_like_a_program_is_not_removed(
+def test_an_input_named_like_a_bundle_file_is_refused(
     tmp_path: Path, command: str, name: str
 ) -> None:
-    """The input sat in the output directory under a program's name, and the
-    stale-program sweep deleted it."""
+    """The input sat in the output directory under a bundle file's name: it
+    was deleted as a stale program, overwritten by the program it was named
+    like, or kept beside the bundle and read as a program of a QPU it lacks."""
     circuit = QuantumCircuit(4, 4)
     circuit.h(0)
     circuit.cx(0, 3)
@@ -1753,7 +1767,8 @@ def test_an_input_named_like_a_program_is_not_removed(
     source = tmp_path / name
     source.write_text(qasm2.dumps(circuit), encoding="utf-8")
 
-    _run(
+    result = CliRunner().invoke(
+        app,
         [
             command,
             "--input-qasm",
@@ -1762,10 +1777,12 @@ def test_an_input_named_like_a_program_is_not_removed(
             str(_small_config(tmp_path)),
             "--out-dir",
             str(tmp_path),
-        ]
+        ],
     )
 
+    assert result.exit_code == 2, result.output
     assert source.read_text(encoding="utf-8") == qasm2.dumps(circuit)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["cfg.json", name]
 
 
 @pytest.mark.parametrize("command", ["split", "compile-dist"])
@@ -1852,3 +1869,24 @@ def test_the_bundle_records_where_each_input_qubit_ends(
     expected = QuantumCircuit(merged.num_qubits)
     expected.compose(circuit, qubits=layout["final_layout"], inplace=True)
     assert Statevector(merged).equiv(Statevector(expected))
+
+
+def test_a_circuit_the_cli_cannot_write_exits_with_a_message() -> None:
+    """Writing a circuit whose registers share bits raised Qiskit's exporter
+    error as a traceback."""
+    from qiskit import QuantumRegister
+    from qiskit.circuit import ClassicalRegister, Clbit
+
+    from quport.cli import _qasm3_or_exit
+
+    bits = [Clbit() for _ in range(2)]
+    circuit = QuantumCircuit(
+        QuantumRegister(1, "q"),
+        ClassicalRegister(bits=bits, name="c"),
+        ClassicalRegister(bits=bits[:1], name="first"),
+    )
+    circuit.measure(0, bits[0])
+
+    with pytest.raises(typer.Exit) as raised:
+        _qasm3_or_exit(circuit)
+    assert raised.value.exit_code == 1

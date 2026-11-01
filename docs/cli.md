@@ -125,7 +125,9 @@ this one bundle: a `qpu_<id>.qasm` an earlier run left there for a QPU this run 
 not write is removed, and so are the routed programs and the `schedule.json`,
 `schedule_trace.json` and `entanglement_plan.json` a `compile-dist` run left, whose
 manifest this one has replaced. `compile-dist` likewise removes any program it did
-not write. The `--input-qasm` file is never removed, whatever it is called.
+not write. An `--input-qasm` file inside the output directory named like one of the
+bundle's files is refused, since the run would overwrite it, remove it, or leave it
+to be read as part of the bundle.
 
 This command is useful for inspecting how a globally routed circuit is decomposed,
 but it is not the preferred distributed-compilation workflow. Prefer `compile-dist`

@@ -350,12 +350,23 @@ def qasm3_text(circuit: QuantumCircuit) -> str:
 
     Classical registers that share bits -- a ``let`` alias in an OpenQASM 3
     input, or a register built over another's bits -- can only be written as
-    aliases, which Qiskit's exporter refuses unless asked; a circuit without
-    any is written exactly as before.
+    aliases, and Qiskit writes those in a form OpenQASM 3 parsers, its own
+    included, cannot read back. Such a circuit is refused with ``ValueError``
+    rather than written unreadable.
     """
     from qiskit import qasm3
+    from qiskit.qasm3.exceptions import QASM3ExporterError
 
-    return str(qasm3.dumps(circuit, allow_aliasing=True))
+    try:
+        return str(qasm3.dumps(circuit))
+    except QASM3ExporterError as exc:
+        if "alias" not in str(exc):
+            raise
+        raise ValueError(
+            "the circuit's classical registers share bits, which OpenQASM 3 can "
+            "express only as aliases, and Qiskit writes those in a form "
+            "OpenQASM 3 parsers cannot read back; give each bit to one register"
+        ) from exc
 
 
 def _render_remote_ops_json(remote_ops: Iterable[RemoteOp]) -> str:
@@ -384,8 +395,10 @@ def write_distributed_program(
     stable artifact keys (``qpu_<id>`` and ``remote_ops``) so callers can report
     or post-process generated files without re-deriving filenames.  A program
     an earlier bundle left in the directory -- a ``qpu_<id>.qasm`` for a QPU
-    this one does not write, or a routed ``qpu_<id>_routed.qasm`` -- is removed:
-    the directory holds one bundle.
+    this one does not write, or a routed ``qpu_<id>_routed.qasm`` -- is removed,
+    as are the ``layout.json`` and schedule summaries a CLI run left: the
+    directory holds one bundle. A circuit :func:`qasm3_text` cannot write is
+    refused before any file is.
     """
     if not isinstance(program, DistributedProgram):
         raise ValueError("program must be a DistributedProgram")
@@ -426,34 +439,52 @@ def write_distributed_program(
     remote_path = out_dir / "remote_ops.json"
     remote_path.write_text(manifest, encoding="utf-8")
     written["remote_ops"] = remote_path
-    _remove_stale_programs(out_dir, written.values())
+    # The layout and schedule summaries a CLI run left describe its manifest,
+    # which this one has replaced.
+    _remove_stale_programs(
+        out_dir, written.values(), stale=("layout.json", *_COMPILE_SUMMARIES)
+    )
     return written
+
+
+#: The summaries ``quport compile-dist`` writes beside its programs and manifest.
+_COMPILE_SUMMARIES = ("schedule.json", "schedule_trace.json", "entanglement_plan.json")
+
+#: Every file a bundle may hold, by name, besides its programs.
+BUNDLE_FILES = ("remote_ops.json", "layout.json", *_COMPILE_SUMMARIES)
+
+_PROGRAM_NAME = re.compile(r"qpu_\d+(?:_routed)?\.qasm")
+
+
+def is_bundle_file(name: str) -> bool:
+    """True for a name a bundle's files may have: a program, manifest or summary."""
+    return bool(_PROGRAM_NAME.fullmatch(name)) or name in BUNDLE_FILES
 
 
 def _remove_stale_programs(
     out_dir: _PathLike,
     written: Iterable[_PathLike],
     *,
-    keep: Iterable[_PathLike] = (),
+    stale: Iterable[str] = (),
 ) -> list[Path]:
-    """Remove the per-QPU programs an earlier bundle left in ``out_dir``.
+    """Remove the files an earlier bundle left in ``out_dir``.
 
     A consumer finds a bundle's programs by their names, ``qpu_<id>.qasm`` or,
     routed, ``qpu_<id>_routed.qasm``, so one left behind -- for a QPU the new
     bundle does not write, after a run on fewer QPUs or one that skipped empty
     programs, or by the other kind of bundle, whose manifest the new one has
     replaced -- would be read as part of it. Files named either way and not
-    among ``written`` are removed, except those in ``keep``, such as the input
-    the bundle was compiled from; nothing else is touched. Returns the paths
-    removed.
+    among ``written`` are removed, as are those named in ``stale`` -- other
+    bundle files the new bundle does not write; nothing else is touched.
+    Returns the paths removed.
     """
     directory = Path(out_dir)
-    kept = {Path(path).resolve() for path in (*written, *keep)}
-    pattern = re.compile(r"qpu_\d+(?:_routed)?\.qasm")
+    kept = {Path(path).resolve() for path in written}
+    names = set(stale)
     removed: list[Path] = []
     for candidate in sorted(directory.iterdir()):
         if (
-            pattern.fullmatch(candidate.name)
+            (_PROGRAM_NAME.fullmatch(candidate.name) or candidate.name in names)
             and candidate.is_file()
             and candidate.resolve() not in kept
         ):

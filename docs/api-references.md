@@ -323,8 +323,12 @@ write_distributed_program(program, path, *, include_empty_circuits=True) -> dict
 `allow_nan=False`. `write_distributed_program` writes `qpu_<id>.qasm` files and a
 `remote_ops.json` manifest to a directory, validating all artifact inputs before writing.
 A program an earlier bundle left there -- a `qpu_<id>.qasm` for a QPU this one does
-not write, or a routed `qpu_<id>_routed.qasm` -- is removed, so the directory holds
-one bundle: a consumer finds the programs by name.
+not write, or a routed `qpu_<id>_routed.qasm` -- is removed, and so are the
+`layout.json` and schedule summaries a CLI run left, which describe its manifest; the
+directory holds one bundle: a consumer finds the programs by name. A circuit whose
+classical registers share bits is refused with `ValueError` before anything is
+written: OpenQASM 3 expresses such registers only as aliases, which Qiskit writes in
+a form OpenQASM 3 parsers cannot read back.
 
 `write_distributed_program` returns a mapping of artifact labels to `Path` objects.
 Keys are stable (`qpu_<id>` and `remote_ops`) so callers can report or post-process

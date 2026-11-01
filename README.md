@@ -1870,6 +1870,7 @@ python examples/reproduce_readme_figures.py calibration
 - The manifest names each remote operation and its parameters but does not define it: a custom gate's definition is in no file, so a consumer of the Python API's bundles needs it from elsewhere. The CLI compiles only to Qiskit's standard gates, which need none.
 - Manifest `clbits` are positions among the source circuit's classical bits. Qiskit's OpenQASM 3 exporter declares bits outside any register first, as `_bit<position>`, and registers after them, so for a circuit with such bits the files declare bits in a different order from those positions.
 - The emitted OpenQASM files carry no global phase, which no measurement observes; the in-memory programs do.
+- A circuit whose classical registers share bits is refused by every writer: OpenQASM 3 expresses such registers only as aliases, which Qiskit writes in a form OpenQASM 3 parsers cannot read back.
 - Remote-operation manifests are tied to the programs they ship with: `quport split` writes pre-routing indices beside unrouted programs, `quport compile-dist` writes routed indices beside routed programs, and both carry explicit barrier markers so a consumer never has to pair by position.
 - Disconnected QPU pairs and zero-capacity communication resources are penalized rather than silently ignored.
 - Random benchmark circuits are generated for repeatable experiments; application-specific circuits can be passed directly through the Python API.

@@ -2997,12 +2997,13 @@ def test_manifest_params_with_no_json_form_are_compared_by_type() -> None:
         reassemble_distributed_program(mapped, program.local_circuits, retyped, arch)
 
 
-def test_a_circuit_with_overlapping_classical_registers_is_written(
+def test_a_circuit_whose_registers_share_bits_is_refused_before_writing(
     tmp_path: Path,
 ) -> None:
-    """Registers sharing bits can only be written as aliases, which Qiskit's
-    exporter refuses unless asked, so the compile succeeded and every writer
-    then failed."""
+    """Registers sharing bits can only be written as aliases, and Qiskit writes
+    those in a form OpenQASM 3 parsers, its own included, cannot read back. The
+    exporter's own error escaped as a traceback; writing the aliases anyway
+    made files nobody could load. Refuse clearly, leaving the old bundle."""
     from qiskit import qasm3
     from qiskit.circuit import Clbit
 
@@ -3021,11 +3022,14 @@ def test_a_circuit_with_overlapping_classical_registers_is_written(
     mapped.cx(0, 3)
     mapped.measure(0, bits[0])
     mapped.measure(3, bits[1])
+    earlier = tmp_path / "remote_ops.json"
+    earlier.write_text("[]\n", encoding="utf-8")
 
-    written = write_distributed_program(split_into_qpus(mapped, arch), tmp_path)
+    with pytest.raises(ValueError, match="registers share bits"):
+        write_distributed_program(split_into_qpus(mapped, arch), tmp_path)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["remote_ops.json"]
+    assert earlier.read_text(encoding="utf-8") == "[]\n"
 
-    assert set(written) == {"qpu_0", "qpu_1", "remote_ops"}
-    assert "let first" in qasm3_text(mapped)
     plain = QuantumCircuit(2, 2)
     plain.h(0)
     plain.measure([0, 1], [0, 1])
@@ -3070,3 +3074,30 @@ def test_a_manifest_naming_other_live_parameters_is_refused(kind: str) -> None:
 
     with pytest.raises(ValueError, match="gives parameters"):
         reassemble_distributed_program(honest, program.local_circuits, foreign, arch)
+
+
+def test_the_library_writer_removes_another_bundles_summaries(
+    tmp_path: Path,
+) -> None:
+    """A compile-dist run's layout and schedule summaries describe its own
+    manifest, and the library writer replaced that manifest but left them."""
+    from quport.distributed import write_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    for name in ("layout.json", "schedule.json", "schedule_trace.json"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    (tmp_path / "entanglement_plan.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("mine", encoding="utf-8")
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.cx(0, 3)
+
+    write_distributed_program(split_into_qpus(mapped, arch), tmp_path)
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "notes.txt",
+        "qpu_0.qasm",
+        "qpu_1.qasm",
+        "remote_ops.json",
+    ]
