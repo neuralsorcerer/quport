@@ -2147,7 +2147,7 @@ def test_an_output_path_through_a_broken_link_is_refused_up_front(
 
 
 @pytest.mark.parametrize(
-    "target", ["missing/x.qasm", "out.qasm", "new/", "new/.", "chain"]
+    "target", ["missing/x.qasm", "out.qasm", "new/", "new/.", "chain", "long-chain"]
 )
 def test_an_output_file_that_is_a_broken_link_is_refused_up_front(
     tmp_path: Path, target: str
@@ -2159,12 +2159,17 @@ def test_an_output_file_that_is_a_broken_link_is_refused_up_front(
     if target == "chain":
         (tmp_path / "hop").symlink_to("new/")
         target = "hop"
+    elif target == "long-chain":
+        # More hops than the system follows to resolve one name.
+        for hop in range(45):
+            (tmp_path / f"hop{hop}").symlink_to(f"hop{hop + 1}")
+        target = "hop0"
     out.symlink_to(target)
 
     result = CliRunner().invoke(app, ["map", "--n-logical", "2", "--out", str(out)])
 
     assert result.exit_code == 2, result.output
-    assert {path.name for path in tmp_path.iterdir()} <= {"out.qasm", "hop"}
+    assert not [path for path in tmp_path.iterdir() if not path.is_symlink()]
 
 
 def test_an_output_file_that_is_a_link_to_a_new_file_is_written(
@@ -2231,6 +2236,79 @@ def test_a_plot_name_without_a_suffix_is_checked_as_the_file_written(
     assert result.exit_code == 0, result.output
     assert (tmp_path / "plot.png").is_file()
     assert "plot.png" in result.output.replace("\n", "")
+
+
+@pytest.mark.parametrize(
+    ("given", "written"),
+    [("plot.", "plot.png"), ("..png", "..png.png"), ("sub/.v", "sub/.v.png")],
+)
+def test_a_plot_name_is_the_file_matplotlib_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: str, written: str
+) -> None:
+    """``Path.suffix`` and matplotlib disagree on dotted names, so the check
+    and the report named one file and matplotlib wrote another."""
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("pandas")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "sub").mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--depth",
+            "1",
+            "--trials",
+            "1",
+            "--strategies",
+            "baseline",
+            "--out",
+            "s.csv",
+            "--plot",
+            given,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / written).is_file()
+    assert f"Wrote plot to {written}" in result.output.replace("\n", "")
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["map", "--n-logical", "2", "--out", "new/"],
+        ["map", "--n-logical", "2", "--out", "new/."],
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--trials",
+            "1",
+            "--out",
+            "s.csv",
+            "--plot",
+            "new/",
+        ],
+    ],
+    ids=["out-slash", "out-dot", "plot-slash"],
+)
+def test_a_file_name_ending_in_a_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    """``Path`` drops a trailing ``/`` or ``/.``, so such a name wrote a file
+    where a directory was meant, or a hidden ``.png`` inside it."""
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 2, result.output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:

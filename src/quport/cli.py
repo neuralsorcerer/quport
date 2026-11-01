@@ -454,9 +454,8 @@ def _checked_output_file(value: str | None) -> str | None:
     """
     if not value:
         return value
+    _refuse_a_directory(value)
     path = Path(value)
-    if path.is_dir():
-        raise typer.BadParameter(f"{value} is a directory; name a file to write")
     blocker = _blocking_ancestor(path)
     if blocker is not None:
         raise typer.BadParameter(
@@ -476,25 +475,52 @@ def _checked_output_file(value: str | None) -> str | None:
     return value
 
 
+def _refuse_a_directory(value: str) -> None:
+    """Refuse a file option naming a directory, or ending in a directory's
+    name: ``Path`` drops what makes it one, so ``out/`` would write ``out``."""
+    if Path(value).is_dir():
+        raise typer.BadParameter(f"{value} is a directory; name a file to write")
+    if _names_a_directory(value):
+        raise typer.BadParameter(f"{value} names a directory; name a file to write")
+
+
+def _names_a_directory(name: str) -> bool:
+    """Whether a path ends in a directory's name, such as ``new/`` or ``new/.``."""
+    return os.path.basename(name) in ("", ".", "..")
+
+
+#: The most links the system follows to resolve one name.
+_MAX_LINK_HOPS = 40
+
+
 def _link_names_a_directory(link: Path) -> bool:
-    """Whether a chain of symlinks ends in a directory's name, such as
-    ``new/`` or ``new/.``, which ``os.path.realpath`` reduces to ``new``."""
-    for _ in range(40):
+    """Whether a chain of symlinks ends in a directory's name, which
+    ``os.path.realpath`` hides -- it reduces ``new/`` to ``new`` -- or is too
+    long for the system to follow."""
+    for _ in range(_MAX_LINK_HOPS):
         text = os.readlink(link)
-        if os.path.basename(text) in ("", ".", ".."):
+        if _names_a_directory(text):
             return True
         link = link.parent / text
         if not link.is_symlink():
             return False
-    return False
+    return True
 
 
 def _checked_plot_file(value: str | None) -> str | None:
-    """As :func:`_checked_output_file`, for the file matplotlib writes: a
-    name without a suffix gets ``.png``, as matplotlib would add it."""
-    if value and not Path(value).suffix:
-        value = f"{value}.png"
-    return _checked_output_file(value)
+    """As :func:`_checked_output_file`, for the file matplotlib writes.
+
+    Given a name without an extension, matplotlib strips its trailing dots
+    and adds ``.png``; the option names that file, so it is the one checked
+    and reported.
+    """
+    if not value:
+        return value
+    _refuse_a_directory(value)
+    name = os.fspath(Path(value))
+    if not os.path.splitext(name)[1][1:]:
+        name = name.rstrip(".") + ".png"
+    return _checked_output_file(name)
 
 
 def _checked_required_output_file(value: str) -> str:
