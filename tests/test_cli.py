@@ -2146,19 +2146,25 @@ def test_an_output_path_through_a_broken_link_is_refused_up_front(
     assert not (tmp_path / "missing").exists()
 
 
-@pytest.mark.parametrize("link", ["into-a-missing-directory", "loop"])
+@pytest.mark.parametrize(
+    "target", ["missing/x.qasm", "out.qasm", "new/", "new/.", "chain"]
+)
 def test_an_output_file_that_is_a_broken_link_is_refused_up_front(
-    tmp_path: Path, link: str
+    tmp_path: Path, target: str
 ) -> None:
-    """Writing follows the link, and the file it names cannot be made: the
-    command failed after all its work."""
+    """Writing follows the link, and the file it names cannot be made -- its
+    directory is missing, the link loops, or it names a directory, which
+    ``os.path.realpath`` hides -- so the command failed after all its work."""
     out = tmp_path / "out.qasm"
-    out.symlink_to(tmp_path / "missing" / "x.qasm" if link != "loop" else out)
+    if target == "chain":
+        (tmp_path / "hop").symlink_to("new/")
+        target = "hop"
+    out.symlink_to(target)
 
     result = CliRunner().invoke(app, ["map", "--n-logical", "2", "--out", str(out)])
 
     assert result.exit_code == 2, result.output
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["out.qasm"]
+    assert {path.name for path in tmp_path.iterdir()} <= {"out.qasm", "hop"}
 
 
 def test_an_output_file_that_is_a_link_to_a_new_file_is_written(
@@ -2189,6 +2195,42 @@ def test_an_empty_output_directory_is_refused(
 
     assert result.exit_code == 2, result.output
     assert sorted(path.name for path in tmp_path.iterdir()) == ["qpu_7.qasm"]
+
+
+def test_a_plot_name_without_a_suffix_is_checked_as_the_file_written(
+    tmp_path: Path,
+) -> None:
+    """matplotlib adds ``.png`` to such a name, so the up-front check looked
+    at one path, the plot went to another, and the message named the first."""
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("pandas")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    (tmp_path / "plot").symlink_to(tmp_path / "missing" / "x.png")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--depth",
+            "1",
+            "--trials",
+            "1",
+            "--strategies",
+            "baseline",
+            "--out",
+            str(tmp_path / "s.csv"),
+            "--plot",
+            str(tmp_path / "plot"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "plot.png").is_file()
+    assert "plot.png" in result.output.replace("\n", "")
 
 
 def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:

@@ -464,11 +464,37 @@ def _checked_output_file(value: str | None) -> str | None:
         )
     if path.is_symlink() and not path.exists():
         # Writing follows the link and creates the file it names, which needs
-        # a directory to go in, and a link that loops names no file at all.
+        # a directory to go in; a link that loops, or that names a directory,
+        # names no file at all.
         target = Path(os.path.realpath(path))
-        if target.is_symlink() or not target.parent.is_dir():
+        if (
+            target.is_symlink()
+            or not target.parent.is_dir()
+            or _link_names_a_directory(path)
+        ):
             raise typer.BadParameter(f"{value} is a broken link that cannot be written")
     return value
+
+
+def _link_names_a_directory(link: Path) -> bool:
+    """Whether a chain of symlinks ends in a directory's name, such as
+    ``new/`` or ``new/.``, which ``os.path.realpath`` reduces to ``new``."""
+    for _ in range(40):
+        text = os.readlink(link)
+        if os.path.basename(text) in ("", ".", ".."):
+            return True
+        link = link.parent / text
+        if not link.is_symlink():
+            return False
+    return False
+
+
+def _checked_plot_file(value: str | None) -> str | None:
+    """As :func:`_checked_output_file`, for the file matplotlib writes: a
+    name without a suffix gets ``.png``, as matplotlib would add it."""
+    if value and not Path(value).suffix:
+        value = f"{value}.png"
+    return _checked_output_file(value)
 
 
 def _checked_required_output_file(value: str) -> str:
@@ -756,8 +782,9 @@ def sweep(
     ),
     plot: str | None = typer.Option(
         None,
-        callback=_checked_output_file,
-        help="Optional PNG plot (requires quport\\[viz])",
+        callback=_checked_plot_file,
+        help="Optional PNG plot (requires quport\\[viz]); .png is added to a name "
+        "without a suffix",
     ),
 ) -> None:
     """Sweep multiple topologies and comm-port counts; save summary CSV."""

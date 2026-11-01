@@ -13,8 +13,11 @@ custom workflows, use the Python API documented in [API reference](api-reference
 - A bad option value is a usage error, exit code 2, naming the option. That
   includes an output path that is checked before any work and found unusable:
   an empty `--out-dir`, an empty `--out` on a command that always writes one,
-  a directory where a file is to be written, and a path at or under something
-  other than a directory, a broken link included. A config or circuit the
+  a directory where a file is to be written, a path under something other than
+  a directory (a broken link included), an `--out-dir` that is not a directory,
+  and an output file that is a broken link nothing can be written through --
+  one that loops, names a directory, or points into a missing one; a broken
+  link to a new file in an existing directory is written. A config or circuit the
   library refuses -- one global routing cannot connect, say -- and a write that
   fails anyway end the command with the message and exit code 1, rather than a
   Python traceback.
@@ -104,7 +107,8 @@ Important columns include:
 quport sweep --n-logical 8 --depth 20 --trials 5 --out sweep.csv --plot sweep.png
 ```
 
-Sweeps built-in topology and port settings. `--plot` requires `quport[viz]`. The
+Sweeps built-in topology and port settings. `--plot` requires `quport[viz]`, and
+a plot name without a suffix gets `.png`. The
 CSV contains one aggregate row per setting and strategy -- means, plus a median of
 the cost -- rather than one row per random circuit. Use `bench` when you need raw
 per-trial rows.
