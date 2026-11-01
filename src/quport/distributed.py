@@ -11,7 +11,7 @@ import json
 import math
 import os
 import re
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, replace
 from functools import cache
@@ -1134,8 +1134,9 @@ _EXTENDED_TYPES = (np.longdouble, np.clongdouble)
 def _param_matches(named: object, actual: object) -> bool:
     if isinstance(named, _UNSTABLE_TYPES) and isinstance(actual, _UNSTABLE_TYPES):
         return _same_unstable(named, actual)
-    if isinstance(named, _EXTENDED_TYPES) and isinstance(actual, _EXTENDED_TYPES):
-        return bool(named == actual) or bool(np.isnan(named) and np.isnan(actual))
+    for kind in _EXTENDED_TYPES:
+        if isinstance(named, kind) and isinstance(actual, kind):
+            return _same_extended(named, actual)
     if (
         isinstance(actual, Mapping)
         and isinstance(named, Mapping)
@@ -1149,6 +1150,18 @@ def _param_matches(named: object, actual: object) -> bool:
     return _matches_written(
         _json_safe_value(named, form=_COMPARED),
         _json_safe_value(actual, form=_COMPARED),
+    )
+
+
+def _same_extended(named: Any, actual: Any) -> bool:
+    """Two extended-precision numbers unrounded, part by part, NaN equal to NaN."""
+    parts = (
+        (np.real(named), np.real(actual)),
+        (np.imag(named), np.imag(actual)),
+    )
+    return all(
+        bool(left == right) or bool(np.isnan(left) and np.isnan(right))
+        for left, right in parts
     )
 
 
@@ -1237,27 +1250,78 @@ def _matches_written(named: Any, expected: Any) -> bool:
 
 
 def _same_items(named: list[Any], expected: list[Any]) -> bool:
-    """True when the items can be paired, each named one matching its own.
-
-    A read-back item can match several expected ones -- an array's text
-    matches any array -- so the pairing is a bipartite matching.
-    """
+    """True when the items can be paired, each named one matching its own."""
     if len(named) != len(expected):
         return False
-    fits = [[_matches_written(item, wanted) for item in named] for wanted in expected]
+    if not any(map(_holds_kept, named)) and not any(map(_holds_kept, expected)):
+        # Plain values match exactly when their keys are equal, so the items
+        # pair up when the two sides hold the same keys as often.
+        return Counter(map(_plain_key, named)) == Counter(map(_plain_key, expected))
+    return _perfect_matching(named, expected)
+
+
+def _holds_kept(form: Any) -> bool:
+    """Whether a compared form holds a kept circuit, array or set."""
+    if isinstance(form, _Unstable | _SetOf):
+        return True
+    if isinstance(form, dict):
+        return any(map(_holds_kept, form.values()))
+    if isinstance(form, list):
+        return any(map(_holds_kept, form))
+    return False
+
+
+def _plain_key(form: Any) -> Any:
+    """A hashable key equal for two plain forms exactly when
+    :func:`_matches_written` matches them: numbers compare by value, as
+    ``==`` does, so ``True``, ``1`` and ``1.0`` share one."""
+    if isinstance(form, dict):
+        return ("dict", tuple(sorted((key, _plain_key(v)) for key, v in form.items())))
+    if isinstance(form, list):
+        return ("list", tuple(map(_plain_key, form)))
+    if isinstance(form, bool | int):
+        return int(form)
+    if isinstance(form, float) and form.is_integer():
+        return int(form)
+    return form
+
+
+def _perfect_matching(named: list[Any], expected: list[Any]) -> bool:
+    """Whether a bipartite matching pairs every expected item with a named
+    one it matches. A read-back item can match several expected ones -- an
+    array's text matches any array -- so a first fit is not enough."""
+    fits = [
+        [index for index, item in enumerate(named) if _matches_written(item, wanted)]
+        for wanted in expected
+    ]
     holder: list[int | None] = [None] * len(named)
-
-    def place(wanted: int, tried: set[int]) -> bool:
-        for index, fit in enumerate(fits[wanted]):
-            if fit and index not in tried:
-                tried.add(index)
+    held: list[int | None] = [None] * len(expected)
+    for start in range(len(expected)):
+        # Breadth-first search for a path that frees a named item for start.
+        reached: dict[int, int] = {}
+        queue = deque([start])
+        free: int | None = None
+        while queue and free is None:
+            wanted = queue.popleft()
+            for index in fits[wanted]:
+                if index in reached:
+                    continue
+                reached[index] = wanted
                 current = holder[index]
-                if current is None or place(current, tried):
-                    holder[index] = wanted
-                    return True
-        return False
-
-    return all(place(wanted, set()) for wanted in range(len(expected)))
+                if current is None:
+                    free = index
+                    break
+                queue.append(current)
+        if free is None:
+            return False
+        index_or_none: int | None = free
+        while index_or_none is not None:
+            wanted = reached[index_or_none]
+            previous = held[wanted]
+            holder[index_or_none] = wanted
+            held[wanted] = index_or_none
+            index_or_none = previous
+    return True
 
 
 def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:

@@ -3492,6 +3492,34 @@ def test_a_live_extended_precision_parameter_is_compared_unrounded() -> None:
     assert _params_match([np.longdouble("nan")], [np.longdouble("nan")])
 
 
+def test_a_large_set_of_alike_items_is_matched() -> None:
+    """Every item of a set of NaNs matches every other, and pairing them up
+    recursed once per item, past Python's limit, from a thousand items on."""
+    import copy
+    import json
+
+    from quport.distributed import RemoteOp, _params_match
+
+    param = frozenset(float("nan") for _ in range(1500))
+    written = RemoteOp("g", 0, 3, 0, 1, (param,), (), 0).to_dict()["params"]
+
+    assert _params_match(json.loads(json.dumps(written)), [param])
+    assert _params_match([copy.deepcopy(param)], [param])
+
+
+def test_extended_precision_complex_numbers_compare_part_by_part() -> None:
+    """A NaN in either part made the whole numbers NaN, which were taken as
+    equal, so the other part went unchecked."""
+    import numpy as np
+
+    from quport.distributed import _params_match
+
+    assert not _params_match([np.clongdouble("nan+1j")], [np.clongdouble("nan+2j")])
+    assert not _params_match([np.clongdouble("1+nanj")], [np.clongdouble("5+nanj")])
+    assert not _params_match([np.longdouble("nan")], [np.clongdouble("3+nanj")])
+    assert _params_match([np.clongdouble("nan+2j")], [np.clongdouble("nan+2j")])
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 
