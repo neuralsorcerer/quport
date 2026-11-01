@@ -345,18 +345,78 @@ def test_interactions_inside_control_flow_count_on_the_qubits_they_touch() -> No
         qc.x(0)
         qc.barrier(0, 2)
 
+    # The blocks apply to qubits [0, 1, 2], [2, 3, 0], [1, 3] and [0, 2]; each
+    # links its first qubit to the others, then its gates count in turn.
+    assert [[qc.find_bit(q).index for q in inst.qubits] for inst in qc.data] == [
+        [0, 1, 2],
+        [2, 3, 0],
+        [1, 3],
+        [0, 2],
+    ]
     assert extract_twoq_weights(qc) == {
-        (0, 1): 1,
+        (0, 1): 2,
+        (0, 2): 3,
         (1, 2): 1,
-        (2, 3): 1,
+        (2, 3): 2,
         (0, 3): 1,
-        (1, 3): 1,
+        (1, 3): 2,
     }
     temporal = extract_temporal_twoq_weights(qc, decay=0.5)
+    # In program order: (0,1) (0,2) | (0,1) (1,2) | (2,3) (0,2) | (2,3) (0,3) |
+    # (1,3) | (1,3) | (0,2).
     assert temporal == pytest.approx(
-        {(0, 1): 1.0, (1, 2): 0.5, (2, 3): 0.25, (0, 3): 0.125, (1, 3): 0.0625}
+        {
+            (0, 1): 1.0 + 0.5**2,
+            (0, 2): 0.5 + 0.5**5 + 0.5**10,
+            (1, 2): 0.5**3,
+            (2, 3): 0.5**4 + 0.5**6,
+            (0, 3): 0.5**7,
+            (1, 3): 0.5**8 + 0.5**9,
+        }
     )
-    assert cut_weight(extract_twoq_weights(qc), [0, 1, 0, 1]) == 4.0
+    assert cut_weight(extract_twoq_weights(qc), [0, 1, 0, 1]) == 6.0
+
+
+def test_a_block_spanning_qpus_weighs_what_splitting_it_costs() -> None:
+    """A two-qubit condition holding only single-qubit gates weighed nothing,
+    yet splitting its qubits makes it a remote operation, so the partitioners
+    split it six times over to save one gate elsewhere."""
+    from quport.config import MultiQPUConfig
+    from quport.pipeline import map_and_transpile
+
+    qc = QuantumCircuit(4, 1)
+    qc.measure(0, 0)
+    for _ in range(6):
+        with qc.if_test((qc.clbits[0], 1)):
+            qc.x(0)
+            qc.x(1)
+    qc.cx(0, 2)
+    qc.cx(1, 3)
+
+    assert extract_twoq_weights(qc) == {(0, 1): 6, (0, 2): 1, (1, 3): 1}
+    cfg = MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    for strategy in ("balanced", "tpccap"):
+        part = map_and_transpile(qc, cfg, seed=0, strategy=strategy).partition
+        assert part[0] == part[1], strategy
+
+
+def test_a_loops_break_is_no_interaction() -> None:
+    """``break`` spans the loop's qubits but couples none, as compute_metrics
+    has it; only the loop itself links them."""
+    qc = QuantumCircuit(2, 1)
+    with qc.while_loop((qc.clbits[0], 1)):
+        qc.x(0)
+        qc.h(1)
+        qc.measure(0, 0)
+        with qc.if_test((qc.clbits[0], 0)):
+            qc.break_loop()
+
+    loop_qubits = [qc.find_bit(q).index for q in qc.data[0].qubits]
+    inner = qc.data[0].operation.blocks[0].data[-1]
+    assert len(loop_qubits) == 2 and len(inner.qubits) == 2
+    # The loop and the condition inside it each link the pair once; the break
+    # does not.
+    assert extract_twoq_weights(qc) == {(0, 1): 2}
 
 
 def test_a_box_of_gates_keeps_its_pairs_together_when_mapped() -> None:
@@ -374,5 +434,5 @@ def test_a_box_of_gates_keeps_its_pairs_together_when_mapped() -> None:
         result = map_and_transpile(qc, cfg, seed=0, strategy=strategy)
         part = result.partition
         assert part[0] == part[1] and part[2] == part[3], strategy
-        assert result.partition_cut == 0.0
+        # The box itself spans both QPUs whatever the split; no gate in it does.
         assert result.metrics.remote_2q == 0

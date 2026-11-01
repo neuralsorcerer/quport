@@ -13,7 +13,7 @@ from numbers import Integral
 from typing import SupportsFloat, SupportsIndex, TypeAlias, cast
 
 from qiskit import QuantumCircuit
-from qiskit.circuit import ControlFlowOp
+from qiskit.circuit import BreakLoopOp, ContinueLoopOp, ControlFlowOp
 
 from quport._validation import is_boolean, validate_nonnegative_integral
 
@@ -61,16 +61,24 @@ def _two_qubit_interactions(
     """Each two-qubit interaction, in program order, as a sorted index pair.
 
     ``outer[k]`` is the index, in the circuit being analysed, of ``circuit``'s
-    qubit ``k``. A control-flow operation is no interaction itself: the gates
-    in its bodies are, on the qubits the block applies them to -- once each,
-    in every branch -- as :func:`quport.metrics.compute_metrics` counts them,
-    so wrapping gates in a ``box`` or a condition does not hide them.
+    qubit ``k``. A control-flow operation on qubits that end up on different
+    QPUs is one remote operation, which gathers them on its first qubit's QPU,
+    whatever its bodies hold; so it contributes an interaction between its
+    first qubit and each other one. The gates in its bodies count too, on the
+    qubits the block applies them to -- once each, in every branch -- as
+    :func:`quport.metrics.compute_metrics` counts them, so wrapping gates in a
+    ``box`` or a condition does not hide them. A loop's ``break`` or
+    ``continue`` spans the loop's qubits but couples none.
     """
     position = {qubit: outer[index] for index, qubit in enumerate(circuit.qubits)}
     for inst in circuit.data:
         operation = inst.operation
         if isinstance(operation, ControlFlowOp):
             applied = [position[qubit] for qubit in inst.qubits]
+            for other in dict.fromkeys(applied[1:]):
+                if other != applied[0]:
+                    first = applied[0]
+                    yield (first, other) if first < other else (other, first)
             for block in operation.blocks:
                 yield from _two_qubit_interactions(block, applied)
             continue
@@ -78,6 +86,8 @@ def _two_qubit_interactions(
             continue
         # Compiler directives (e.g. a 2-qubit barrier) are not interactions.
         if getattr(operation, "_directive", False):
+            continue
+        if isinstance(operation, BreakLoopOp | ContinueLoopOp):
             continue
         i = position[inst.qubits[0]]
         j = position[inst.qubits[1]]
@@ -91,7 +101,9 @@ def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
 
     For each 2-qubit instruction acting on logical qubits (i, j), we increment
     weight[(min(i,j), max(i,j))]. Instructions inside control-flow bodies count
-    too, once each, in every branch, on the qubits the block applies them to.
+    too, once each, in every branch, on the qubits the block applies them to,
+    and a control-flow operation itself links its first qubit to each other
+    one, since splitting them makes it a remote operation.
 
     This works for random circuits and any circuits with 2Q ops (cx, cz, ecr, rxx, etc.).
     """
