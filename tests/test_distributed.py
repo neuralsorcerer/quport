@@ -3396,6 +3396,102 @@ def test_extended_precision_parameters_are_written_as_numbers() -> None:
     )
 
 
+@pytest.mark.parametrize("held", ["bare", "in-a-deque"])
+def test_a_manifest_naming_a_circuit_for_an_array_is_refused(held: str) -> None:
+    """A circuit against an array fell through to the written forms, which
+    compared the same pair again, until Python gave up."""
+    import collections
+    import dataclasses
+
+    import numpy as np
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    body = QuantumCircuit(2)
+    body.cx(0, 1)
+    actual: Any = np.array([1.0, 2.0])
+    named: Any = body
+    if held == "in-a-deque":
+        actual, named = collections.deque([actual]), collections.deque([named])
+    mapped = _mapped_with_tagged(arch, actual)
+    program = split_into_qpus(mapped, arch)
+    foreign = [dataclasses.replace(op, params=(named,)) for op in program.remote_ops]
+
+    with pytest.raises(ValueError, match="gives parameters"):
+        reassemble_distributed_program(mapped, program.local_circuits, foreign, arch)
+
+
+def test_an_array_holding_one_array_is_written_as_its_element() -> None:
+    """Its item() is an array, the same type as itself, so it was written as
+    its text and checked by its type alone, and a manifest naming another
+    value passed."""
+    import dataclasses
+    import json
+
+    import numpy as np
+
+    from quport.distributed import _json_safe_value, reassemble_distributed_program
+
+    param = np.empty(1, dtype=object)
+    param[0] = np.array([0.5])
+    assert _json_safe_value(param) == 0.5
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = _mapped_with_tagged(arch, param)
+    program = split_into_qpus(mapped, arch)
+    other = json.loads('{"type": "ndarray", "repr": "[array([0.7])]"}')
+    foreign = [dataclasses.replace(op, params=(other,)) for op in program.remote_ops]
+
+    with pytest.raises(ValueError, match="gives parameters"):
+        reassemble_distributed_program(mapped, program.local_circuits, foreign, arch)
+
+
+def test_set_items_match_in_any_order() -> None:
+    """Items were matched in the order each side sorted them, and the two
+    sides sorted a circuit differently, so a genuine set holding a hashable
+    circuit was refused, read back or copied; a manifest whose set an older
+    version wrote in another order was refused too."""
+    import copy
+    import json
+
+    from quport.distributed import RemoteOp, _params_match
+
+    class HashableCircuit(QuantumCircuit):
+        def __hash__(self) -> int:
+            return id(self)
+
+    first, second = HashableCircuit(1), HashableCircuit(1)
+    first.h(0)
+    second.x(0)
+    for param in (frozenset({first, "zzz"}), frozenset({first, second})):
+        written = RemoteOp("g", 0, 3, 0, 1, (param,), (), 0).to_dict()["params"]
+        assert _params_match(json.loads(json.dumps(written)), [param])
+        assert _params_match([copy.deepcopy(param)], [param])
+
+    param = {1, "a", None, (1, 2), 2.5}
+    (written,) = RemoteOp("g", 0, 3, 0, 1, (param,), (), 0).to_dict()["params"]
+    reordered = {"type": "set", "items": list(reversed(written["items"]))}
+    assert _params_match([reordered], [param])
+    assert not _params_match(
+        [{"type": "set", "items": [1, "a", None, [1, 2]]}], [param]
+    )
+
+
+def test_a_live_extended_precision_parameter_is_compared_unrounded() -> None:
+    import numpy as np
+
+    from quport.distributed import _params_match
+
+    tenth = np.longdouble(1) / np.longdouble(10)
+    assert _params_match([tenth.copy()], [tenth])
+    assert not _params_match([np.nextafter(tenth, np.longdouble(1))], [tenth])
+    assert _params_match([np.longdouble("nan")], [np.longdouble("nan")])
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 

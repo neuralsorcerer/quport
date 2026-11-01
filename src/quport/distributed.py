@@ -77,17 +77,26 @@ def _enter_container(value: object, seen: set[int]) -> int:
     return object_id
 
 
-def _typed_text(value: object) -> Any:
-    """The form of a value JSON cannot hold: its type and its text."""
-    return {"type": type(value).__name__, "repr": str(value)}
+class _JsonForm:
+    """How :func:`_json_safe_value` writes what JSON has no form for. This
+    one writes a manifest's text; another compares manifests."""
+
+    def opaque(self, value: object) -> Any:
+        """A value with no JSON form: its type and its text."""
+        return {"type": type(value).__name__, "repr": str(value)}
+
+    def set_items(self, value: Set[object], items: list[Any]) -> Any:
+        """A set, its items ordered by what they are written as: a value's
+        ``repr`` can follow NumPy's print options, or hold a memory address."""
+        items.sort(key=lambda item: json.dumps(item, sort_keys=True))
+        return {"type": type(value).__name__, "items": items}
 
 
-#: Writes a value :func:`_json_safe_value` has no other form for.
-_Opaque: TypeAlias = Callable[[object], Any]
+_WRITTEN = _JsonForm()
 
 
 def _json_safe_mapping(
-    value: Mapping[object, object], seen: set[int], opaque: _Opaque
+    value: Mapping[object, object], seen: set[int], form: _JsonForm
 ) -> Any:
     """Convert mappings while avoiding string-key collisions."""
     object_id = _enter_container(value, seen)
@@ -96,8 +105,8 @@ def _json_safe_mapping(
         entries: list[list[Any]] = []
         use_entries = False
         for key, item in value.items():
-            safe_key = _json_safe_value(key, seen, opaque)
-            safe_item = _json_safe_value(item, seen, opaque)
+            safe_key = _json_safe_value(key, seen, form)
+            safe_item = _json_safe_value(item, seen, form)
             entries.append([safe_key, safe_item])
 
             if isinstance(key, str) and key not in converted and not use_entries:
@@ -113,41 +122,37 @@ def _json_safe_mapping(
 
 
 def _json_safe_sequence(
-    value: Sequence[object], seen: set[int], opaque: _Opaque
+    value: Sequence[object], seen: set[int], form: _JsonForm
 ) -> list[Any]:
     """Convert ordered containers to JSON arrays with cycle detection."""
     object_id = _enter_container(value, seen)
     try:
-        return [_json_safe_value(item, seen, opaque) for item in value]
+        return [_json_safe_value(item, seen, form) for item in value]
     finally:
         seen.remove(object_id)
 
 
-def _json_safe_set(value: Set[object], seen: set[int], opaque: _Opaque) -> Any:
-    """Convert unordered containers deterministically without losing their type.
-
-    The items are ordered by what they are written as: a value's ``repr``
-    can follow NumPy's print options, or hold a memory address.
-    """
+def _json_safe_set(value: Set[object], seen: set[int], form: _JsonForm) -> Any:
+    """Convert unordered containers deterministically without losing their type."""
     object_id = _enter_container(value, seen)
     try:
-        items = [_json_safe_value(item, seen, opaque) for item in value]
-        items.sort(key=lambda item: json.dumps(item, sort_keys=True, default=repr))
-        return {"type": type(value).__name__, "items": items}
+        return form.set_items(
+            value, [_json_safe_value(item, seen, form) for item in value]
+        )
     finally:
         seen.remove(object_id)
 
 
 def _json_safe_value(
-    value: object, seen: set[int] | None = None, opaque: _Opaque = _typed_text
+    value: object, seen: set[int] | None = None, form: _JsonForm = _WRITTEN
 ) -> Any:
     """Convert instruction metadata to a deterministic JSON-compatible value.
 
     Qiskit gate parameters are usually numbers or symbolic parameters, but custom
     instructions may carry richer metadata. This helper preserves JSON-native
     values, explicitly encodes non-finite/complex/bytes/container edge cases, and
-    falls back to ``opaque``, a typed string representation by default, for
-    opaque objects.
+    leaves sets and opaque objects to ``form``, which writes a set's items in a
+    fixed order and an opaque object as its type and text.
     """
     active_seen = set() if seen is None else seen
 
@@ -169,17 +174,18 @@ def _json_safe_value(
             "data": base64.b64encode(raw).decode("ascii"),
         }
     if isinstance(value, Mapping):
-        return _json_safe_mapping(value, active_seen, opaque)
+        return _json_safe_mapping(value, active_seen, form)
     if isinstance(value, Set):
-        return _json_safe_set(value, active_seen, opaque)
+        return _json_safe_set(value, active_seen, form)
     if isinstance(value, Sequence) and not isinstance(value, str):
-        return _json_safe_sequence(value, active_seen, opaque)
+        return _json_safe_sequence(value, active_seen, form)
 
-    # NumPy's extended precision has no Python type: its item() is itself.
+    # NumPy's extended precision has no Python type, so its item() gives it
+    # back; JSON holds it as the double it rounds to.
     if isinstance(value, np.longdouble):
         return _json_safe_float(float(value))
     if isinstance(value, np.clongdouble):
-        return _json_safe_value(complex(value), active_seen, opaque)
+        return _json_safe_value(complex(value), active_seen, form)
     item = getattr(value, "item", None)
     if callable(item):
         try:
@@ -187,10 +193,18 @@ def _json_safe_value(
         except (TypeError, ValueError, OverflowError):
             pass
         else:
-            if type(plain) is not type(value):
-                return _json_safe_value(plain, active_seen, opaque)
+            # An array's one element can be an array, held one level down;
+            # anything else whose item() is of its own kind has no plainer form.
+            if plain is not value and (
+                isinstance(value, np.ndarray) or type(plain) is not type(value)
+            ):
+                object_id = _enter_container(value, active_seen)
+                try:
+                    return _json_safe_value(plain, active_seen, form)
+                finally:
+                    active_seen.remove(object_id)
 
-    return opaque(value)
+    return form.opaque(value)
 
 
 @dataclass(frozen=True)
@@ -244,7 +258,7 @@ class RemoteOp:
         params = _json_safe_sequence(
             _validate_manifest_sequence(self.params, label="remote operation params"),
             set(),
-            _typed_text,
+            _WRITTEN,
         )
         clbits = [
             _validate_manifest_int(clbit, label="remote operation clbit index")
@@ -1098,23 +1112,30 @@ def _check_manifest_describes(
 def _params_match(named: Sequence[object], actual: Sequence[object]) -> bool:
     """True when a manifest's parameters are the instruction's.
 
-    Parameters are compared by value. Two kinds have no JSON form, and are
-    written as their type and their text: a control-flow body, drawn at the
-    terminal's width, and an array, printed at NumPy's precision. That text
-    is not stable, so where the manifest was read back from JSON, such a
-    value -- at any depth -- is checked by its type alone; a live one is
-    compared by value. An array of one element is written as that number.
+    A live manifest is compared by value. One read back from JSON is compared
+    with what the instruction's parameters are written as, a set's items in
+    any order, except for two kinds whose text is not stable -- a control-flow
+    body, drawn at the terminal's width, and an array, printed at NumPy's
+    precision -- which are checked by their type alone, at any depth. An
+    array of one element is written as that element, and an extended-precision
+    number as the double it rounds to.
     """
     if len(named) != len(actual):
         return False
     return all(_param_matches(left, right) for left, right in zip(named, actual))
 
 
+#: Parameters written as text that depends on the process.
+_UNSTABLE_TYPES = (QuantumCircuit, np.ndarray)
+#: NumPy's extended precision, written as the double it rounds to.
+_EXTENDED_TYPES = (np.longdouble, np.clongdouble)
+
+
 def _param_matches(named: object, actual: object) -> bool:
-    if isinstance(actual, np.ndarray) and isinstance(named, np.ndarray):
-        return named.shape == actual.shape and _arrays_equal(named, actual)
-    if isinstance(actual, QuantumCircuit) and isinstance(named, QuantumCircuit):
-        return bool(named == actual)
+    if isinstance(named, _UNSTABLE_TYPES) and isinstance(actual, _UNSTABLE_TYPES):
+        return _same_unstable(named, actual)
+    if isinstance(named, _EXTENDED_TYPES) and isinstance(actual, _EXTENDED_TYPES):
+        return bool(named == actual) or bool(np.isnan(named) and np.isnan(actual))
     if (
         isinstance(actual, Mapping)
         and isinstance(named, Mapping)
@@ -1123,45 +1144,83 @@ def _param_matches(named: object, actual: object) -> bool:
         return all(_param_matches(named[key], actual[key]) for key in actual)
     if isinstance(actual, list | tuple) and isinstance(named, list | tuple):
         return _params_match(named, actual)
-    # Read back from JSON, or held in another form: compare what each is
-    # written as, walked as the writer walks it, keeping the values whose text
-    # is unstable.
+    # Read back from JSON, or held in another form: compare the forms the two
+    # are written in, keeping what has no stable text.
     return _matches_written(
-        _json_safe_value(named, opaque=_kept_unstable),
-        _json_safe_value(actual, opaque=_kept_unstable),
+        _json_safe_value(named, form=_COMPARED),
+        _json_safe_value(actual, form=_COMPARED),
     )
+
+
+def _same_unstable(
+    named: QuantumCircuit | np.ndarray, actual: QuantumCircuit | np.ndarray
+) -> bool:
+    """Two circuits, or two arrays, by value; a circuit is never an array."""
+    if isinstance(named, np.ndarray) and isinstance(actual, np.ndarray):
+        return named.shape == actual.shape and _arrays_equal(named, actual)
+    if isinstance(named, QuantumCircuit) and isinstance(actual, QuantumCircuit):
+        return bool(named == actual)
+    return False
 
 
 @dataclass(frozen=True, eq=False)
 class _Unstable:
-    """A value written as text that depends on the process: a circuit is
-    drawn at the terminal's width, an array printed at NumPy's precision."""
+    """A circuit or an array, whose written text is not stable."""
 
     value: QuantumCircuit | np.ndarray
 
 
-def _kept_unstable(value: object) -> Any:
-    """As :func:`_typed_text`, except that a circuit or an array is kept."""
-    if isinstance(value, QuantumCircuit | np.ndarray):
-        return _Unstable(value)
-    return _typed_text(value)
+@dataclass(frozen=True, eq=False)
+class _SetOf:
+    """A set's items, in no particular order."""
+
+    name: str
+    items: list[Any]
+
+
+class _ComparedForm(_JsonForm):
+    """The form manifests are compared in: it keeps a circuit or an array,
+    and leaves a set's items unordered."""
+
+    def opaque(self, value: object) -> Any:
+        if isinstance(value, _UNSTABLE_TYPES):
+            return _Unstable(value)
+        return super().opaque(value)
+
+    def set_items(self, value: Set[object], items: list[Any]) -> Any:
+        return _SetOf(type(value).__name__, items)
+
+
+_COMPARED = _ComparedForm()
 
 
 def _matches_written(named: Any, expected: Any) -> bool:
-    """True when the written form ``named`` is ``expected``.
+    """True when the form ``named`` is ``expected``, both in the compared form.
 
     Where ``expected`` holds a circuit or an array, a live one in ``named`` is
-    compared by value; one read back from JSON, by its type alone, since its
-    text is not stable.
+    compared by value, and one read back from JSON by its type alone. Where it
+    holds a set, the items may come in any order.
     """
     if isinstance(expected, _Unstable):
         if isinstance(named, _Unstable):
-            return _param_matches(named.value, expected.value)
+            return _same_unstable(named.value, expected.value)
         return (
             isinstance(named, dict)
             and set(named) == {"type", "repr"}
             and named["type"] == type(expected.value).__name__
         )
+    if isinstance(expected, _SetOf):
+        if isinstance(named, _SetOf):
+            name, items = named.name, named.items
+        elif (
+            isinstance(named, dict)
+            and set(named) == {"type", "items"}
+            and isinstance(named["items"], list)
+        ):
+            name, items = named["type"], named["items"]
+        else:
+            return False
+        return name == expected.name and _same_items(items, expected.items)
     if isinstance(expected, dict):
         return (
             isinstance(named, dict)
@@ -1175,6 +1234,30 @@ def _matches_written(named: Any, expected: Any) -> bool:
             and all(map(_matches_written, named, expected))
         )
     return bool(named == expected)
+
+
+def _same_items(named: list[Any], expected: list[Any]) -> bool:
+    """True when the items can be paired, each named one matching its own.
+
+    A read-back item can match several expected ones -- an array's text
+    matches any array -- so the pairing is a bipartite matching.
+    """
+    if len(named) != len(expected):
+        return False
+    fits = [[_matches_written(item, wanted) for item in named] for wanted in expected]
+    holder: list[int | None] = [None] * len(named)
+
+    def place(wanted: int, tried: set[int]) -> bool:
+        for index, fit in enumerate(fits[wanted]):
+            if fit and index not in tried:
+                tried.add(index)
+                current = holder[index]
+                if current is None or place(current, tried):
+                    holder[index] = wanted
+                    return True
+        return False
+
+    return all(place(wanted, set()) for wanted in range(len(expected)))
 
 
 def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
