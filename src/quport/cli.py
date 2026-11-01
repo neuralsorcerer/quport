@@ -30,7 +30,11 @@ from quport.config import (
     load_config,
     optional_module_available,
 )
-from quport.distributed import _remove_stale_programs, write_remote_ops_json
+from quport.distributed import (
+    _remove_stale_programs,
+    qasm3_text,
+    write_remote_ops_json,
+)
 from quport.entanglement import is_standard_gate
 from quport.exact import DEFAULT_MAX_NODES, Objective, partition_gap
 from quport.interaction import extract_twoq_weights
@@ -547,7 +551,7 @@ def map(
     )
 
     if out:
-        _output_path(out).write_text(qasm3.dumps(res.mapped_circuit), encoding="utf-8")
+        _output_path(out).write_text(qasm3_text(res.mapped_circuit), encoding="utf-8")
         _print_path(f"Wrote mapped circuit to {out}")
 
 
@@ -715,7 +719,7 @@ def split(
     # write per-QPU QASM3
     programs = [outp / f"qpu_{qpu}.qasm" for qpu in prog.local_circuits]
     for path, c in zip(programs, prog.local_circuits.values()):
-        path.write_text(qasm3.dumps(c), encoding="utf-8")
+        path.write_text(qasm3_text(c), encoding="utf-8")
 
     # write remote ops
     write_remote_ops_json(prog.remote_ops, outp / "remote_ops.json")
@@ -846,7 +850,7 @@ def ebits(
             res.physical_circuit, arch, plan, coherent=False
         )
         _output_path(emit_qasm).write_text(
-            qasm3.dumps(program.circuit), encoding="utf-8"
+            qasm3_text(program.circuit), encoding="utf-8"
         )
         _print_path(
             f"Wrote telegate circuit ({program.n_ancillas} protocol ancillas) "
@@ -1146,7 +1150,7 @@ def compile_dist(
 
     programs = [outp / f"qpu_{qpu}_routed.qasm" for qpu in res.local_routed]
     for path, c in zip(programs, res.local_routed.values()):
-        path.write_text(qasm3.dumps(c), encoding="utf-8")
+        path.write_text(qasm3_text(c), encoding="utf-8")
     _remove_stale_programs(outp, programs, keep=[input_qasm] if input_qasm else [])
 
     # The bundle ships routed programs, so it ships the manifest that matches

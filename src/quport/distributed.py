@@ -344,6 +344,19 @@ def _encodable(text: str, *, label: str) -> str:
     return text
 
 
+def qasm3_text(circuit: QuantumCircuit) -> str:
+    """Return ``circuit`` as OpenQASM 3, the way every QuPort writer emits it.
+
+    Classical registers that share bits -- a ``let`` alias in an OpenQASM 3
+    input, or a register built over another's bits -- can only be written as
+    aliases, which Qiskit's exporter refuses unless asked; a circuit without
+    any is written exactly as before.
+    """
+    from qiskit import qasm3
+
+    return str(qasm3.dumps(circuit, allow_aliasing=True))
+
+
 def _render_remote_ops_json(remote_ops: Iterable[RemoteOp]) -> str:
     """Validate remote operations and return their manifest's text."""
     payload: list[dict[str, Any]] = []
@@ -378,8 +391,6 @@ def write_distributed_program(
     if not isinstance(include_empty_circuits, bool):
         raise ValueError("include_empty_circuits must be a boolean")
 
-    from qiskit import qasm3
-
     out_dir = _coerce_output_path(path, label="path")
     if out_dir.exists() and not out_dir.is_dir():
         raise ValueError("path must be a directory or a path that does not exist")
@@ -398,7 +409,7 @@ def write_distributed_program(
     rendered: list[tuple[int, str]] = [
         (
             qpu_id,
-            _encodable(qasm3.dumps(circuit), label=f"the program for QPU {qpu_id}"),
+            _encodable(qasm3_text(circuit), label=f"the program for QPU {qpu_id}"),
         )
         for qpu_id, circuit in sorted(entries, key=lambda item: item[0])
         if include_empty_circuits or len(circuit.data) > 0
