@@ -1926,3 +1926,28 @@ def test_what_the_library_refuses_ends_with_a_message_not_a_traceback(
     assert result.exit_code == 1, result.output
     assert isinstance(result.exception, SystemExit)
     assert "Error:" in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["gen-config", "--out"],
+        ["bench", "--n-logical", "2", "--trials", "1", "--out"],
+        ["sweep", "--n-logical", "2", "--trials", "1", "--out"],
+        ["map", "--n-logical", "2", "--out"],
+        ["optimal", "--n-logical", "3", "--out"],
+        ["migrate", "--n-logical", "3", "--out"],
+        ["ebits", "--n-logical", "3", "--out"],
+        ["ebits", "--n-logical", "3", "--emit-qasm"],
+    ],
+    ids=lambda args: "-".join(args[:1] + args[-1:]),
+)
+def test_a_file_option_naming_a_directory_is_refused_up_front(
+    tmp_path: Path, args: list[str]
+) -> None:
+    """Some commands refused it as a usage error only after all their work,
+    and others failed writing, with exit code 1."""
+    result = CliRunner().invoke(app, [*args, str(tmp_path)])
+
+    assert result.exit_code == 2, result.output
+    assert list(tmp_path.iterdir()) == []

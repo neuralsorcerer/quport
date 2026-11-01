@@ -419,6 +419,13 @@ def _reports_errors(command: _Command) -> _Command:
     return cast(_Command, reported)
 
 
+def _checked_output_file(value: str | None) -> str | None:
+    """Refuse a file option naming a directory before any work is done."""
+    if value is not None and Path(value).is_dir():
+        raise typer.BadParameter(f"{value} is a directory; name a file to write")
+    return value
+
+
 #: Partition strategies the mapping and compiling commands take.
 _STRATEGIES = ("balanced", "cluster", "ebit", "tpccap", "tpccap_sa")
 
@@ -538,6 +545,7 @@ def _pretty_config(cfg: MultiQPUConfig) -> None:
 def gen_config(
     out: str = typer.Option(
         "quport_config.json",
+        callback=_checked_output_file,
         help="Output path. Use a .yaml/.yml suffix for YAML (needs quport\\[yaml]).",
     ),
 ) -> None:
@@ -587,7 +595,9 @@ def map(
         "--input-qasm",
         help="Load an OpenQASM 2/3 circuit instead of generating one",
     ),
-    out: str | None = typer.Option(None, help="Write mapped circuit as OpenQASM 3.0"),
+    out: str | None = typer.Option(
+        None, callback=_checked_output_file, help="Write mapped circuit as OpenQASM 3.0"
+    ),
 ) -> None:
     """Map+transpile a single random circuit and print key metrics."""
     cfg = _load_config_or_default(config)
@@ -632,7 +642,9 @@ def bench(
         help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
-    out: str = typer.Option("results.csv", help="Output CSV path"),
+    out: str = typer.Option(
+        "results.csv", callback=_checked_output_file, help="Output CSV path"
+    ),
 ) -> None:
     """Benchmark baseline vs QuPort on multiple random circuits."""
     cfg = _load_config_or_default(config)
@@ -661,14 +673,18 @@ def sweep(
     depth: int = typer.Option(20, min=0, help="Random circuit depth"),
     trials: int = typer.Option(5, min=0, help="Trials per setting"),
     seed: int = typer.Option(0, min=0, help="Base seed"),
-    out: str = typer.Option("sweep.csv", help="Output CSV summary"),
+    out: str = typer.Option(
+        "sweep.csv", callback=_checked_output_file, help="Output CSV summary"
+    ),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
         callback=_checked_strategies,
         help="Comma-separated strategies: baseline,balanced,cluster,ebit,tpccap,tpccap_sa",
     ),
     plot: str | None = typer.Option(
-        None, help="Optional PNG plot (requires quport\\[viz])"
+        None,
+        callback=_checked_output_file,
+        help="Optional PNG plot (requires quport\\[viz])",
     ),
 ) -> None:
     """Sweep multiple topologies and comm-port counts; save summary CSV."""
@@ -829,11 +845,14 @@ def ebits(
         help="Load an OpenQASM 2/3 circuit instead of generating one",
     ),
     out: str | None = typer.Option(
-        None, help="Optional JSON path for the full entanglement plan"
+        None,
+        callback=_checked_output_file,
+        help="Optional JSON path for the full entanglement plan",
     ),
     emit_qasm: str | None = typer.Option(
         None,
         "--emit-qasm",
+        callback=_checked_output_file,
         help=(
             "Optional OpenQASM 3 path for the executable telegate circuit "
             "(explicit EPR pairs, mid-circuit measurement, and feedforward)"
@@ -965,7 +984,11 @@ def optimal(
         min=1,
         help="Branch-and-bound node budget; exhausting it reports a bound, not a proof",
     ),
-    out: str | None = typer.Option(None, help="Optional JSON path for the gap report"),
+    out: str | None = typer.Option(
+        None,
+        callback=_checked_output_file,
+        help="Optional JSON path for the gap report",
+    ),
 ) -> None:
     """Score a strategy's partition against the exact optimum.
 
@@ -1083,7 +1106,9 @@ def migrate(
         help="Load an OpenQASM 2/3 circuit instead of generating one",
     ),
     out: str | None = typer.Option(
-        None, help="Optional JSON path for the placement plan"
+        None,
+        callback=_checked_output_file,
+        help="Optional JSON path for the placement plan",
     ),
 ) -> None:
     """Report what letting qubits move between QPUs mid-circuit would save.
