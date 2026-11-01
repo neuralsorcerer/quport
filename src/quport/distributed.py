@@ -19,6 +19,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, TypeAlias
 
+import numpy as np
 from qiskit import QuantumCircuit, QuantumRegister, transpile
 from qiskit.circuit import Barrier, ControlFlowOp, Measure, Store
 
@@ -1020,7 +1021,7 @@ def _check_manifest_describes(
             f"is {source.operation.name!r}"
         )
     params = getattr(source.operation, "params", [])
-    if _comparable_params(op.params) != _comparable_params(params):
+    if not _params_match(op.params, params):
         raise ValueError(
             f"remote_ops[{entry}] gives parameters {list(op.params)}, but "
             f"instruction {index} takes {list(params)}"
@@ -1033,26 +1034,36 @@ def _check_manifest_describes(
         )
 
 
-def _comparable_params(params: Sequence[object]) -> Any:
-    """Parameters as a manifest can state them, for comparing two of them.
+def _params_match(named: Sequence[object], actual: Sequence[object]) -> bool:
+    """True when a manifest's parameters are the instruction's.
 
-    A value with no JSON form -- a control-flow body, a unitary's matrix -- is
-    written as its type and its text, and that text is not stable: a circuit
-    is drawn at the terminal's width, an array at NumPy's print precision. So
-    such a value is compared by its type alone; every other value exactly, as
-    it is written.
+    Parameters are compared by value. Two kinds have no JSON form, and are
+    written as their type and their text: a control-flow body, drawn at the
+    terminal's width, and an array, printed at NumPy's precision. That text
+    is not stable, so where the manifest was read back from JSON, such a
+    value is checked by its type alone; a live manifest is compared by value.
     """
+    if len(named) != len(actual):
+        return False
+    return all(_param_matches(left, right) for left, right in zip(named, actual))
 
-    def described(value: Any) -> Any:
-        if isinstance(value, dict):
-            if set(value) == {"type", "repr"}:
-                return {"type": value["type"]}
-            return {key: described(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [described(item) for item in value]
-        return value
 
-    return described(_json_safe_sequence(list(params), set()))
+def _param_matches(named: object, actual: object) -> bool:
+    if isinstance(actual, QuantumCircuit | np.ndarray):
+        if isinstance(named, Mapping):
+            return named.get("type") == type(actual).__name__
+        if isinstance(actual, np.ndarray):
+            return isinstance(named, np.ndarray) and bool(
+                named.shape == actual.shape and np.array_equal(named, actual)
+            )
+        return isinstance(named, QuantumCircuit) and named == actual
+    if (
+        isinstance(actual, list | tuple)
+        and isinstance(named, list | tuple)
+        and not isinstance(named, str)
+    ):
+        return _params_match(named, actual)
+    return bool(_json_safe_value(named) == _json_safe_value(actual))
 
 
 def _check_manifest_markers(

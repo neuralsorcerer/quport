@@ -617,7 +617,9 @@ compares the result against the mapped circuit on a pseudo-random product input.
 Merging runs each remote operation as the mapped circuit has it, so the manifest
 is checked against it too: an entry naming another gate, other parameters, other
 classical bits, or a barrier other than its own marker is refused, since those are
-what a consumer of the emitted files acts on.
+what a consumer of the emitted files acts on. A branch body or a matrix has no JSON
+form and is written as text that depends on the terminal and NumPy's print
+settings, so in a manifest read back from JSON it is checked by its type alone.
 The suite runs this across every intra-QPU topology and optimization level, so it
 covers the routing permutation and the manifest remapping as well as the split.
 

@@ -592,7 +592,8 @@ and registers are carried across, so measurements and conditioned operations
 survive the round trip. Each remote operation runs as the mapped circuit has it,
 and a manifest entry naming another gate, other parameters, other classical bits,
 or a marker position other than where its marker sits is refused with
-`ValueError`. `verify_distributed_program` does that comparison by state-vector
+`ValueError` (a branch body or a matrix in a manifest read back from JSON, written
+as unstable text, is checked by its type). `verify_distributed_program` does that comparison by state-vector
 simulation. Terminating measurements are compared by outcome, per classical bit:
 each is swapped into an ancilla for its bit, and the ancillas are dephased, so
 the measurement-aware optimizations of `optimization_level` 2 and 3 (dropping a

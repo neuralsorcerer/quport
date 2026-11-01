@@ -3030,3 +3030,43 @@ def test_a_circuit_with_overlapping_classical_registers_is_written(
     plain.h(0)
     plain.measure([0, 1], [0, 1])
     assert qasm3_text(plain) == qasm3.dumps(plain)
+
+
+@pytest.mark.parametrize("kind", ["parameter", "unitary", "if_body"])
+def test_a_manifest_naming_other_live_parameters_is_refused(kind: str) -> None:
+    """Comparing every value without a JSON form by its type alone let a manifest
+    for another angle, another matrix or another branch body pass, even when it
+    was never written to a file."""
+    from qiskit.circuit import Parameter
+    from qiskit.circuit.library import UnitaryGate
+    from qiskit.quantum_info import random_unitary
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+
+    def circuit(variant: int) -> QuantumCircuit:
+        qc = QuantumCircuit(arch.n_phys, 1)
+        if kind == "parameter":
+            qc.rzz(Parameter("theta" if variant else "phi"), 0, 3)
+        elif kind == "unitary":
+            qc.append(UnitaryGate(random_unitary(4, seed=variant)), [0, 3])
+        else:
+            qc.measure(0, 0)
+            with qc.if_test((qc.clbits[0], 1)):
+                qc.cx(1, 4)
+                if variant:
+                    qc.h(1)
+        return qc
+
+    honest, other = circuit(1), circuit(0)
+    program = split_into_qpus(honest, arch)
+    reassemble_distributed_program(
+        honest, program.local_circuits, program.remote_ops, arch
+    )
+    foreign = split_into_qpus(other, arch).remote_ops
+
+    with pytest.raises(ValueError, match="gives parameters"):
+        reassemble_distributed_program(honest, program.local_circuits, foreign, arch)
