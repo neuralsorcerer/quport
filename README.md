@@ -169,6 +169,14 @@ $$
 w_{ij}\leftarrow w_{ij}+1,\qquad i<j.
 $$
 
+Two-qubit gates inside control-flow bodies count too, once each and in every
+branch, on the qubits the block applies them to; the block itself is not an
+interaction. That is what global routing pays for. Distributed compilation instead
+gathers a whole control-flow operation on one QPU, so `compile_distributed` also
+links each operand of a top-level block that none of its gates touches to the block
+(`block_operands=True`): splitting even an idle operand off makes the block a remote
+operation.
+
 The weighted logical interaction graph is:
 
 $$

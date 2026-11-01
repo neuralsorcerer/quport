@@ -220,13 +220,17 @@ def compile_distributed(
     # 1) Extract interaction graph
     t0 = time.perf_counter()
 
+    # The whole of a control-flow operation runs on one QPU here, so an idle
+    # operand of one is weighed with it too.
     partition_weights: Mapping[tuple[int, int], float]
     if is_tpccap and temporal_decay_value < 1.0:
         partition_weights = extract_temporal_twoq_weights(
-            qc_basis, decay=temporal_decay_value
+            qc_basis, decay=temporal_decay_value, block_operands=True
         )  # float weights
     else:
-        partition_weights = extract_twoq_weights(qc_basis)  # int weights
+        partition_weights = extract_twoq_weights(
+            qc_basis, block_operands=True
+        )  # int weights
 
     # Packets are partition independent, so they are built once and reused by
     # the e-bit objective, the diagnostics, and the aggregation cross-check.

@@ -68,9 +68,12 @@ partition quality and makespan estimates.
 
 QuPort scans two-qubit circuit instructions and builds an undirected weighted
 logical interaction graph. An edge `(i, j)` means logical qubits `i` and `j`
-interact. The weight is normally the count of two-qubit interactions. Some
-partitioners can use temporal decay so earlier two-qubit gates receive higher
-weight.
+interact. The weight is normally the count of two-qubit interactions, those inside
+control-flow bodies included, once each and in every branch. Some partitioners can
+use temporal decay so earlier two-qubit gates receive higher weight.
+`compile_distributed`, which runs a control-flow operation whole on one QPU, also
+links each operand of a top-level block that none of its gates touches to that
+block.
 
 This interaction graph is a heuristic summary. It does not encode the full circuit
 DAG, gate commutation, or all timing dependencies. It is used to choose partitions

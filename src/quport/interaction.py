@@ -56,31 +56,46 @@ def _iter_validated_weights(
 
 
 def _two_qubit_interactions(
-    circuit: QuantumCircuit, outer: Sequence[int]
+    circuit: QuantumCircuit,
+    outer: Sequence[int],
+    *,
+    block_operands: bool = False,
+    top: bool = True,
 ) -> Iterator[tuple[int, int]]:
     """Each two-qubit interaction, in program order, as a sorted index pair.
 
     ``outer[k]`` is the index, in the circuit being analysed, of ``circuit``'s
-    qubit ``k``. A control-flow operation on qubits that end up on different
-    QPUs is one remote operation, which gathers them on its first qubit's QPU,
-    whatever its bodies hold; so it contributes an interaction between its
-    first qubit and each other one. The gates in its bodies count too, on the
+    qubit ``k``. The gates in a control-flow operation's bodies count on the
     qubits the block applies them to -- once each, in every branch -- as
     :func:`quport.metrics.compute_metrics` counts them, so wrapping gates in a
-    ``box`` or a condition does not hide them. A loop's ``break`` or
-    ``continue`` spans the loop's qubits but couples none.
+    ``box`` or a condition does not hide them; the operation itself is no
+    interaction. A loop's ``break`` or ``continue`` spans the loop's qubits but
+    couples none.
+
+    With ``block_operands``, each operand of a top-level control-flow
+    operation that no gate in it touches is also linked to the operation, to
+    an operand a gate does touch where there is one: distributed compilation
+    gathers the whole operation on one QPU, so splitting even an idle operand
+    off makes it a remote operation.
     """
     position = {qubit: outer[index] for index, qubit in enumerate(circuit.qubits)}
     for inst in circuit.data:
         operation = inst.operation
         if isinstance(operation, ControlFlowOp):
             applied = [position[qubit] for qubit in inst.qubits]
-            for other in dict.fromkeys(applied[1:]):
-                if other != applied[0]:
-                    first = applied[0]
-                    yield (first, other) if first < other else (other, first)
-            for block in operation.blocks:
-                yield from _two_qubit_interactions(block, applied)
+            inner = [
+                edge
+                for block in operation.blocks
+                for edge in _two_qubit_interactions(block, applied, top=False)
+            ]
+            yield from inner
+            if block_operands and top:
+                touched = {qubit for edge in inner for qubit in edge}
+                operands = list(dict.fromkeys(applied))
+                anchor = next((q for q in operands if q in touched), operands[0])
+                for other in operands:
+                    if other != anchor and other not in touched:
+                        yield (anchor, other) if anchor < other else (other, anchor)
             continue
         if len(inst.qubits) != 2:
             continue
@@ -96,19 +111,26 @@ def _two_qubit_interactions(
         yield (i, j) if i < j else (j, i)
 
 
-def extract_twoq_weights(qc: QuantumCircuit) -> dict[tuple[int, int], int]:
+def extract_twoq_weights(
+    qc: QuantumCircuit, *, block_operands: bool = False
+) -> dict[tuple[int, int], int]:
     """Extract a weighted *undirected* interaction graph from a circuit.
 
     For each 2-qubit instruction acting on logical qubits (i, j), we increment
     weight[(min(i,j), max(i,j))]. Instructions inside control-flow bodies count
-    too, once each, in every branch, on the qubits the block applies them to,
-    and a control-flow operation itself links its first qubit to each other
-    one, since splitting them makes it a remote operation.
+    too, once each, in every branch, on the qubits the block applies them to.
+    That is what global routing pays for. With ``block_operands``, an operand
+    of a top-level control-flow operation that none of its gates touches is
+    linked to the operation as well, since distributed compilation gathers
+    the whole operation on one QPU; ``compile_distributed`` partitions on that.
 
     This works for random circuits and any circuits with 2Q ops (cx, cz, ecr, rxx, etc.).
     """
     weights: dict[tuple[int, int], int] = defaultdict(int)
-    for edge in _two_qubit_interactions(qc, range(len(qc.qubits))):
+    interactions = _two_qubit_interactions(
+        qc, range(len(qc.qubits)), block_operands=block_operands
+    )
+    for edge in interactions:
         weights[edge] += 1
     return dict(weights)
 
@@ -165,6 +187,8 @@ def validate_temporal_decay(decay: object, *, label: str = "decay") -> float:
 def extract_temporal_twoq_weights(
     qc: QuantumCircuit,
     decay: object = 0.98,
+    *,
+    block_operands: bool = False,
 ) -> dict[tuple[int, int], float]:
     """Extract a *time-aware* 2Q interaction graph.
 
@@ -187,6 +211,8 @@ def extract_temporal_twoq_weights(
     decay:
         Exponential decay factor in (0,1]. Values closer to 1 approach the
         uniform weighting of :func:`extract_twoq_weights`.
+    block_operands:
+        As for :func:`extract_twoq_weights`.
 
     Returns
     -------
@@ -196,7 +222,9 @@ def extract_temporal_twoq_weights(
     decay_value = validate_temporal_decay(decay)
 
     weights: dict[tuple[int, int], float] = defaultdict(float)
-    interactions = _two_qubit_interactions(qc, range(len(qc.qubits)))
+    interactions = _two_qubit_interactions(
+        qc, range(len(qc.qubits)), block_operands=block_operands
+    )
     for t, edge in enumerate(interactions):
         weights[edge] += float(decay_value**t)
     # Once decay**t underflows, an edge first seen after that point adds only

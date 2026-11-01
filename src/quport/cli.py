@@ -1014,7 +1014,9 @@ def optimal(
     )
 
     res = compile_distributed(qc, cfg, seed=seed, strategy=strategy)
-    weights = extract_twoq_weights(res.basis_circuit)
+    # The weights compile_distributed partitioned on, so the gap is measured
+    # against the objective the strategy optimised.
+    weights = extract_twoq_weights(res.basis_circuit, block_operands=True)
     capacity = cfg.capacity_per_qpu()
 
     table = Table(title=f"Optimality gap ({strategy}, {res.basis_circuit.num_qubits}q)")
