@@ -12,6 +12,7 @@ import pytest
 pytest.importorskip("qiskit")
 
 from qiskit import ClassicalRegister, QuantumCircuit, QuantumRegister
+from qiskit.circuit import Instruction
 
 from quport.architecture import MultiQPUArchitecture
 from quport.config import MultiQPUConfig
@@ -3147,6 +3148,99 @@ def test_genuine_array_parameters_survive_the_manifest_check() -> None:
                     for op in ops
                 ]
         reassemble_distributed_program(mapped, program.local_circuits, ops, arch)
+
+
+class _Tagged(Instruction):
+    """An instruction that takes any parameter as it is given."""
+
+    def validate_parameter(self, parameter: Any) -> Any:
+        return parameter
+
+
+def _mapped_with_tagged(arch: MultiQPUArchitecture, param: Any) -> QuantumCircuit:
+    definition = QuantumCircuit(2)
+    definition.cx(0, 1)
+    tagged = _Tagged("tagged", 2, 0, [param])
+    tagged.definition = definition
+    mapped = QuantumCircuit(arch.n_phys)
+    mapped.append(tagged, [0, 3])
+    return mapped
+
+
+@pytest.mark.parametrize("kind", ["values", "shape", "body"])
+def test_a_live_manifest_naming_other_nested_values_is_refused(kind: str) -> None:
+    """An array or a circuit inside a dict parameter was compared by its type
+    alone even in a live manifest, so one naming other values passed."""
+    import dataclasses
+
+    import numpy as np
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    first, second = QuantumCircuit(2), QuantumCircuit(2)
+    first.cx(0, 1)
+    second.cz(0, 1)
+    named, actual = {
+        "values": ({"m": np.array([1.0, 2.0])}, {"m": np.array([3.0, 4.0])}),
+        "shape": ({"m": np.zeros(2)}, {"m": np.zeros((3, 3))}),
+        "body": ({"b": first}, {"b": second}),
+    }[kind]
+    mapped = _mapped_with_tagged(arch, actual)
+    program = split_into_qpus(mapped, arch)
+    reassemble_distributed_program(
+        mapped, program.local_circuits, program.remote_ops, arch
+    )
+    foreign = [dataclasses.replace(op, params=(named,)) for op in program.remote_ops]
+
+    with pytest.raises(ValueError, match="gives parameters"):
+        reassemble_distributed_program(mapped, program.local_circuits, foreign, arch)
+
+
+@pytest.mark.filterwarnings("ignore::PendingDeprecationWarning")
+def test_subclassed_and_object_array_parameters_survive_the_manifest_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an exact ``ndarray`` or ``QuantumCircuit`` read back from JSON was
+    compared by its type, so a matrix or a circuit subclass written at another
+    print precision or terminal width was refused; and an object array with a
+    NaN never matched its own copy."""
+    import copy
+    import dataclasses
+    import json
+
+    import numpy as np
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+
+    class Body(QuantumCircuit):
+        pass
+
+    wide = Body(2)
+    for _ in range(40):
+        wide.h(0)
+    wide.cx(0, 1)
+    for param in (np.matrix([[0.123456789, 2.0]]), wide):
+        mapped = _mapped_with_tagged(arch, param)
+        program = split_into_qpus(mapped, arch)
+        monkeypatch.setenv("COLUMNS", "40")
+        with np.printoptions(precision=2):
+            text = json.dumps(program.remote_ops[0].to_dict()["params"])
+        monkeypatch.setenv("COLUMNS", "200")
+        ops = [dataclasses.replace(program.remote_ops[0], params=json.loads(text))]
+        reassemble_distributed_program(mapped, program.local_circuits, ops, arch)
+
+    mapped = _mapped_with_tagged(arch, np.array([np.nan, "a"], dtype=object))
+    program = split_into_qpus(mapped, arch)
+    reassemble_distributed_program(
+        mapped, program.local_circuits, copy.deepcopy(program.remote_ops), arch
+    )
 
 
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:

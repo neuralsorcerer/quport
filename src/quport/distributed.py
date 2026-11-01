@@ -1080,47 +1080,41 @@ def _params_match(named: Sequence[object], actual: Sequence[object]) -> bool:
     return all(_param_matches(left, right) for left, right in zip(named, actual))
 
 
-#: Parameter types written as text that depends on the process: a circuit is
-#: drawn at the terminal's width, an array printed at NumPy's precision.
-_UNSTABLE_TEXT_TYPES = frozenset({"QuantumCircuit", "ndarray"})
-
-
 def _param_matches(named: object, actual: object) -> bool:
-    if isinstance(actual, QuantumCircuit) and isinstance(named, QuantumCircuit):
-        return bool(named == actual)
     if isinstance(actual, np.ndarray) and isinstance(named, np.ndarray):
         return named.shape == actual.shape and _arrays_equal(named, actual)
+    if isinstance(actual, QuantumCircuit) and isinstance(named, QuantumCircuit):
+        return bool(named == actual)
+    if (
+        isinstance(actual, Mapping)
+        and isinstance(named, Mapping)
+        and set(named) == set(actual)
+    ):
+        return all(_param_matches(named[key], actual[key]) for key in actual)
     if (
         isinstance(actual, list | tuple)
         and isinstance(named, list | tuple)
         and not isinstance(named, str)
     ):
         return _params_match(named, actual)
-    return bool(_stable_form(named) == _stable_form(actual))
+    written = _json_safe_value(actual)
+    if (
+        isinstance(actual, QuantumCircuit | np.ndarray)
+        and isinstance(written, dict)
+        and set(written) == {"type", "repr"}
+    ):
+        # Read back from JSON, where only the type of such a value is stable.
+        return isinstance(named, Mapping) and named.get("type") == written["type"]
+    return bool(_json_safe_value(named) == written)
 
 
 def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
-    """Element-wise equality, with NaN equal to NaN where the dtype has one."""
+    """Element-wise equality, NaN equal to NaN; arrays of the same shape."""
     try:
         return bool(np.array_equal(left, right, equal_nan=True))
     except TypeError:
-        return bool(np.array_equal(left, right))
-
-
-def _stable_form(value: object) -> Any:
-    """A value's JSON form, with any text that depends on the process reduced
-    to the type it describes."""
-
-    def reduce(item: Any) -> Any:
-        if isinstance(item, dict):
-            if set(item) == {"type", "repr"} and item["type"] in _UNSTABLE_TEXT_TYPES:
-                return {"type": item["type"]}
-            return {key: reduce(inner) for key, inner in item.items()}
-        if isinstance(item, list):
-            return [reduce(inner) for inner in item]
-        return item
-
-    return reduce(_json_safe_value(value))
+        # An object array: its elements are parameters in their own right.
+        return all(_param_matches(a, b) for a, b in zip(left.ravel(), right.ravel()))
 
 
 def _check_manifest_markers(
