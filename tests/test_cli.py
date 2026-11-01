@@ -1892,12 +1892,12 @@ def test_a_circuit_the_cli_cannot_write_exits_with_a_message() -> None:
     assert raised.value.exit_code == 1
 
 
-@pytest.mark.parametrize("case", ["no-ports", "creg-q", "out-dir-is-a-file"])
+@pytest.mark.parametrize("case", ["no-ports", "creg-q"])
 def test_what_the_library_refuses_ends_with_a_message_not_a_traceback(
     tmp_path: Path, case: str
 ) -> None:
-    """A config that cannot route the circuit, an input Qiskit's layout cannot
-    hold, and an output directory that is a file all surfaced as tracebacks."""
+    """A config that cannot route the circuit and an input Qiskit's layout
+    cannot hold surfaced as tracebacks."""
     config = tmp_path / "cfg.json"
     ports = 0 if case == "no-ports" else 1
     config.write_text(
@@ -1918,8 +1918,6 @@ def test_what_the_library_refuses_ends_with_a_message_not_a_traceback(
         args += ["--input-qasm", str(source)]
     else:
         args += ["--n-logical", "4", "--depth", "4"]
-    if case == "out-dir-is-a-file":
-        out_dir.write_text("", encoding="utf-8")
 
     result = CliRunner().invoke(app, args)
 
@@ -1996,15 +1994,143 @@ def test_a_symlinked_input_named_like_a_bundle_file_is_refused(
     assert real.read_text(encoding="utf-8") == qasm2.dumps(circuit)
 
 
-def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:
-    """The message went through rich markup: a path with [old] in it lost
-    those characters, and one with [/b] in it crashed the error handler."""
-    blocker = tmp_path / "runs[old]"
-    blocker.write_text("", encoding="utf-8")
+@pytest.mark.parametrize("link", ["symlink", "hard-link"])
+def test_a_bundle_file_linked_to_the_input_is_refused(
+    tmp_path: Path, link: str
+) -> None:
+    """Only the input's own name and resolved path were checked, so a bundle
+    file already in the output directory that links to the input passed, and
+    writing the bundle wrote over the input through it."""
+    circuit = QuantumCircuit(2, 2)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    circuit.measure([0, 1], [0, 1])
+    out_dir = tmp_path / "out"
+    data = tmp_path / "data"
+    out_dir.mkdir()
+    data.mkdir()
+    source = data / "c.qasm"
+    source.write_text(qasm2.dumps(circuit), encoding="utf-8")
+    entry = out_dir / "qpu_0.qasm"
+    if link == "symlink":
+        entry.symlink_to(source)
+    else:
+        entry.hardlink_to(source)
 
     result = CliRunner().invoke(
         app,
-        ["split", "--n-logical", "2", "--depth", "2", "--out-dir", str(blocker / "x")],
+        [
+            "split",
+            "--input-qasm",
+            str(source),
+            "--config",
+            str(_small_config(tmp_path)),
+            "--out-dir",
+            str(out_dir),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert source.read_text(encoding="utf-8") == qasm2.dumps(circuit)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["map", "--n-logical", "2", "--out"],
+        ["optimal", "--n-logical", "3", "--out"],
+        ["migrate", "--n-logical", "3", "--out"],
+        ["ebits", "--n-logical", "3", "--out"],
+        ["ebits", "--n-logical", "3", "--emit-qasm"],
+        ["sweep", "--n-logical", "2", "--trials", "1", "--out", "s.csv", "--plot"],
+    ],
+    ids=lambda args: "-".join(args[:1] + args[-1:]),
+)
+def test_an_empty_optional_file_option_is_not_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    """An empty value is how the commands read "not given", and the up-front
+    check refused it as naming a directory, since ``Path("")`` is ``.``."""
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(app, [*args, ""])
+
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["gen-config", "--out"],
+        ["bench", "--n-logical", "2", "--trials", "1", "--out"],
+        ["sweep", "--n-logical", "2", "--trials", "1", "--out"],
+    ],
+    ids=lambda args: args[0],
+)
+def test_an_empty_required_file_option_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(app, [*args, ""])
+
+    assert result.exit_code == 2, result.output
+    assert "is a directory" not in result.output
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["gen-config", "--out"],
+        ["map", "--n-logical", "2", "--out"],
+        ["optimal", "--n-logical", "3", "--out"],
+        ["ebits", "--n-logical", "3", "--emit-qasm"],
+        ["split", "--n-logical", "2", "--depth", "2", "--out-dir"],
+        ["compile-dist", "--n-logical", "2", "--depth", "2", "--out-dir"],
+    ],
+    ids=lambda args: "-".join(args[:1] + args[-1:]),
+)
+def test_an_output_path_under_a_file_is_refused_up_front(
+    tmp_path: Path, args: list[str]
+) -> None:
+    """A path whose parent is a file cannot be written, and the commands found
+    out only after all their work, failing with exit code 1."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("mine", encoding="utf-8")
+
+    result = CliRunner().invoke(app, [*args, str(blocker / "x")])
+
+    assert result.exit_code == 2, result.output
+    assert blocker.read_text(encoding="utf-8") == "mine"
+
+
+@pytest.mark.parametrize("command", ["split", "compile-dist"])
+def test_an_output_directory_that_is_a_file_is_refused_up_front(
+    tmp_path: Path, command: str
+) -> None:
+    """The commands compiled the whole circuit before failing to create it."""
+    out_dir = tmp_path / "bundle"
+    out_dir.write_text("mine", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app, [command, "--n-logical", "2", "--depth", "2", "--out-dir", str(out_dir)]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert out_dir.read_text(encoding="utf-8") == "mine"
+
+
+def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:
+    """The message went through rich markup: a path with [old] in it lost
+    those characters, and one with [/b] in it crashed the error handler."""
+    out_dir = tmp_path / "runs[old]"
+    # A directory where the bundle writes a file: the write itself fails.
+    (out_dir / "qpu_0.qasm").mkdir(parents=True)
+
+    result = CliRunner().invoke(
+        app,
+        ["split", "--n-logical", "2", "--depth", "2", "--out-dir", str(out_dir)],
     )
 
     assert result.exit_code == 1, result.output

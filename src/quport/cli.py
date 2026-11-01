@@ -393,12 +393,21 @@ def _refuse_input_in_bundle(input_qasm: str | None, out_dir: str) -> None:
     source = Path(input_qasm)
     target = Path(out_dir).resolve()
     # Both the name it was given and, through a symlink, the file it is.
-    for candidate in (source.parent.resolve() / source.name, source.resolve()):
-        if candidate.parent != target or not is_bundle_file(candidate.name):
-            continue
+    named_like = any(
+        candidate.parent == target and is_bundle_file(candidate.name)
+        for candidate in (source.parent.resolve() / source.name, source.resolve())
+    )
+    # A bundle file already there that is the input, through a symlink or a
+    # hard link, would be written over it.
+    linked = target.is_dir() and any(
+        entry.exists() and source.exists() and entry.samefile(source)
+        for entry in target.iterdir()
+        if is_bundle_file(entry.name)
+    )
+    if named_like or linked:
         raise typer.BadParameter(
-            f"--input-qasm {input_qasm} is named like a file of the bundle written "
-            f"to {out_dir}; move it or choose another --out-dir"
+            f"--input-qasm {input_qasm} is, or is named like, a file of the bundle "
+            f"written to {out_dir}; move it or choose another --out-dir"
         )
 
 
@@ -426,10 +435,47 @@ def _reports_errors(command: _Command) -> _Command:
     return cast(_Command, reported)
 
 
+def _blocking_ancestor(path: Path) -> Path | None:
+    """The nearest existing ancestor of ``path`` if it is not a directory."""
+    for ancestor in path.parents:
+        if ancestor.exists():
+            return None if ancestor.is_dir() else ancestor
+    return None
+
+
 def _checked_output_file(value: str | None) -> str | None:
-    """Refuse a file option naming a directory before any work is done."""
-    if value is not None and Path(value).is_dir():
+    """Refuse a file option that cannot be written, before any work is done.
+
+    An empty value means the option was not given, as the commands read it.
+    """
+    if not value:
+        return value
+    path = Path(value)
+    if path.is_dir():
         raise typer.BadParameter(f"{value} is a directory; name a file to write")
+    blocker = _blocking_ancestor(path)
+    if blocker is not None:
+        raise typer.BadParameter(f"{blocker} is a file, so {value} cannot be written")
+    return value
+
+
+def _checked_required_output_file(value: str) -> str:
+    """As :func:`_checked_output_file`, for an option that always writes."""
+    if not value:
+        raise typer.BadParameter("name a file to write")
+    checked = _checked_output_file(value)
+    assert checked is not None
+    return checked
+
+
+def _checked_output_dir(value: str) -> str:
+    """Refuse an ``--out-dir`` that is, or lies under, a file."""
+    path = Path(value)
+    if path.exists() and not path.is_dir():
+        raise typer.BadParameter(f"{value} is a file, not a directory")
+    blocker = _blocking_ancestor(path)
+    if blocker is not None:
+        raise typer.BadParameter(f"{blocker} is a file, so {value} cannot be created")
     return value
 
 
@@ -552,7 +598,7 @@ def _pretty_config(cfg: MultiQPUConfig) -> None:
 def gen_config(
     out: str = typer.Option(
         "quport_config.json",
-        callback=_checked_output_file,
+        callback=_checked_required_output_file,
         help="Output path. Use a .yaml/.yml suffix for YAML (needs quport\\[yaml]).",
     ),
 ) -> None:
@@ -650,7 +696,7 @@ def bench(
     ),
     config: str | None = typer.Option(None, help="Path to config JSON/YAML"),
     out: str = typer.Option(
-        "results.csv", callback=_checked_output_file, help="Output CSV path"
+        "results.csv", callback=_checked_required_output_file, help="Output CSV path"
     ),
 ) -> None:
     """Benchmark baseline vs QuPort on multiple random circuits."""
@@ -681,7 +727,9 @@ def sweep(
     trials: int = typer.Option(5, min=0, help="Trials per setting"),
     seed: int = typer.Option(0, min=0, help="Base seed"),
     out: str = typer.Option(
-        "sweep.csv", callback=_checked_output_file, help="Output CSV summary"
+        "sweep.csv",
+        callback=_checked_required_output_file,
+        help="Output CSV summary",
     ),
     strategies: str = typer.Option(
         "baseline,balanced,tpccap",
@@ -785,7 +833,9 @@ def split(
         help="Load an OpenQASM 2/3 circuit instead of generating one",
     ),
     out_dir: str = typer.Option(
-        "distributed_out", help="Output directory for per-QPU QASM files"
+        "distributed_out",
+        callback=_checked_output_dir,
+        help="Output directory for per-QPU QASM files",
     ),
 ) -> None:
     """Split a mapped circuit into per-QPU local circuits + remote-op list (JSON).
@@ -1224,7 +1274,9 @@ def compile_dist(
         help="Load an OpenQASM 2/3 circuit instead of generating one",
     ),
     out_dir: str = typer.Option(
-        "compile_out", help="Output directory (per-QPU QASM3 + remote/schedule JSON)"
+        "compile_out",
+        callback=_checked_output_dir,
+        help="Output directory (per-QPU QASM3 + remote/schedule JSON)",
     ),
 ) -> None:
     """Distributed compile (no cross-QPU SWAPs).
