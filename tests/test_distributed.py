@@ -3311,6 +3311,91 @@ def test_a_text_or_object_matrix_parameter_matches_its_copy(dtype: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "kind", ["deque-arrays", "deque-circuits", "subarray-field", "nan-keyed"]
+)
+def test_a_live_manifest_naming_other_values_in_any_container_is_refused(
+    kind: str,
+) -> None:
+    """A circuit or an array the check reached only through the written form
+    -- in a deque, a structured array's field, or a dict whose NaN key is
+    another object -- was compared by its type alone, as if read back from
+    JSON, so a live manifest naming other values passed."""
+    import collections
+    import dataclasses
+
+    import numpy as np
+
+    from quport.distributed import reassemble_distributed_program
+
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    first, second = np.array([1.0, 2.0]), np.array([3.0, 4.0])
+    cx, cz = QuantumCircuit(2), QuantumCircuit(2)
+    cx.cx(0, 1)
+    cz.cz(0, 1)
+    field = [("a", "f8", (2,))]
+    actual, named = {
+        "deque-arrays": (collections.deque([first]), collections.deque([second])),
+        "deque-circuits": (collections.deque([cx]), collections.deque([cz])),
+        "subarray-field": (
+            np.array([([1.0, 2.0],), ([5.0, 6.0],)], dtype=field),
+            np.array([([3.0, 4.0],), ([5.0, 6.0],)], dtype=field),
+        ),
+        "nan-keyed": ({float("nan"): first}, {float("nan"): second}),
+    }[kind]
+    mapped = _mapped_with_tagged(arch, actual)
+    program = split_into_qpus(mapped, arch)
+    foreign = [dataclasses.replace(op, params=(named,)) for op in program.remote_ops]
+
+    with pytest.raises(ValueError, match="gives parameters"):
+        reassemble_distributed_program(mapped, program.local_circuits, foreign, arch)
+
+
+def test_a_set_is_written_in_one_order_whatever_the_print_options() -> None:
+    """Items were sorted by their repr, which for a NumPy scalar follows the
+    print options, so a genuine manifest written under legacy printing listed
+    them in another order and was refused."""
+    import json
+
+    import numpy as np
+
+    from quport.distributed import _json_safe_value, _params_match
+
+    param = frozenset({np.float64(0.25), 1.0, "x"})
+    with np.printoptions(legacy="1.25"):
+        legacy = json.loads(json.dumps(_json_safe_value(param)))
+
+    assert legacy == _json_safe_value(param)
+    assert _params_match([legacy], [param])
+
+
+def test_extended_precision_parameters_are_written_as_numbers() -> None:
+    """Their item() gives back the same type, so writing one recursed until
+    Python gave up, and so did checking a manifest naming one."""
+    import copy
+
+    import numpy as np
+
+    from quport.distributed import _json_safe_value, reassemble_distributed_program
+
+    assert _json_safe_value(np.longdouble(0.5)) == 0.5
+    assert _json_safe_value(np.clongdouble(1 + 2j)) == {
+        "type": "complex",
+        "real": 1.0,
+        "imag": 2.0,
+    }
+    arch = MultiQPUArchitecture(
+        MultiQPUConfig(n_qpus=2, compute_qubits_per_qpu=2, comm_qubits_per_qpu=1)
+    )
+    mapped = _mapped_with_tagged(arch, np.longdouble(0.5))
+    program = split_into_qpus(mapped, arch)
+    reassemble_distributed_program(
+        mapped, program.local_circuits, copy.deepcopy(program.remote_ops), arch
+    )
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 

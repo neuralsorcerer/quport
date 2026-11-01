@@ -124,12 +124,15 @@ def _json_safe_sequence(
 
 
 def _json_safe_set(value: Set[object], seen: set[int], opaque: _Opaque) -> Any:
-    """Convert unordered containers deterministically without losing their type."""
+    """Convert unordered containers deterministically without losing their type.
+
+    The items are ordered by what they are written as: a value's ``repr``
+    can follow NumPy's print options, or hold a memory address.
+    """
     object_id = _enter_container(value, seen)
     try:
-        items = [
-            _json_safe_value(item, seen, opaque) for item in sorted(value, key=repr)
-        ]
+        items = [_json_safe_value(item, seen, opaque) for item in value]
+        items.sort(key=lambda item: json.dumps(item, sort_keys=True, default=repr))
         return {"type": type(value).__name__, "items": items}
     finally:
         seen.remove(object_id)
@@ -172,12 +175,20 @@ def _json_safe_value(
     if isinstance(value, Sequence) and not isinstance(value, str):
         return _json_safe_sequence(value, active_seen, opaque)
 
+    # NumPy's extended precision has no Python type: its item() is itself.
+    if isinstance(value, np.longdouble):
+        return _json_safe_float(float(value))
+    if isinstance(value, np.clongdouble):
+        return _json_safe_value(complex(value), active_seen, opaque)
     item = getattr(value, "item", None)
     if callable(item):
         try:
-            return _json_safe_value(item(), active_seen, opaque)
+            plain = item()
         except (TypeError, ValueError, OverflowError):
             pass
+        else:
+            if type(plain) is not type(value):
+                return _json_safe_value(plain, active_seen, opaque)
 
     return opaque(value)
 
@@ -1113,36 +1124,43 @@ def _param_matches(named: object, actual: object) -> bool:
     if isinstance(actual, list | tuple) and isinstance(named, list | tuple):
         return _params_match(named, actual)
     # Read back from JSON, or held in another form: compare what each is
-    # written as, walked as the writer walks it, with the unstable text in it
-    # reduced to the type it describes.
+    # written as, walked as the writer walks it, keeping the values whose text
+    # is unstable.
     return _matches_written(
-        _json_safe_value(named), _json_safe_value(actual, opaque=_stable_text)
+        _json_safe_value(named, opaque=_kept_unstable),
+        _json_safe_value(actual, opaque=_kept_unstable),
     )
 
 
-@dataclass(frozen=True)
-class _TextOfType:
-    """Where a value is written as text that depends on the process."""
+@dataclass(frozen=True, eq=False)
+class _Unstable:
+    """A value written as text that depends on the process: a circuit is
+    drawn at the terminal's width, an array printed at NumPy's precision."""
 
-    name: str
+    value: QuantumCircuit | np.ndarray
 
 
-def _stable_text(value: object) -> Any:
-    """As :func:`_typed_text`, except that a circuit, drawn at the terminal's
-    width, and an array, printed at NumPy's precision, keep only their type."""
+def _kept_unstable(value: object) -> Any:
+    """As :func:`_typed_text`, except that a circuit or an array is kept."""
     if isinstance(value, QuantumCircuit | np.ndarray):
-        return _TextOfType(type(value).__name__)
+        return _Unstable(value)
     return _typed_text(value)
 
 
 def _matches_written(named: Any, expected: Any) -> bool:
-    """True when the JSON form ``named`` is ``expected``, a written form whose
-    unstable text stands as :class:`_TextOfType`."""
-    if isinstance(expected, _TextOfType):
+    """True when the written form ``named`` is ``expected``.
+
+    Where ``expected`` holds a circuit or an array, a live one in ``named`` is
+    compared by value; one read back from JSON, by its type alone, since its
+    text is not stable.
+    """
+    if isinstance(expected, _Unstable):
+        if isinstance(named, _Unstable):
+            return _param_matches(named.value, expected.value)
         return (
             isinstance(named, dict)
             and set(named) == {"type", "repr"}
-            and named["type"] == expected.name
+            and named["type"] == type(expected.value).__name__
         )
     if isinstance(expected, dict):
         return (
