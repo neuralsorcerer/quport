@@ -3535,6 +3535,34 @@ def test_a_set_item_without_a_hash_is_still_compared() -> None:
     assert not _params_match(named, [frozenset({2.5, 2})])
 
 
+def test_a_set_item_keys_as_the_base_value_it_is_written_as() -> None:
+    """Counting keyed an item by its own hash, so a ``str`` subclass hashed
+    apart from its value refused its genuine manifest, read back or copied."""
+    import copy
+    import json
+
+    from quport.distributed import RemoteOp, _params_match
+
+    class Tag(str):
+        def __hash__(self) -> int:
+            return hash(("tag", str.__str__(self)))
+
+        def __eq__(self, other: object) -> bool:
+            return str.__eq__(self, other)
+
+    class IdStr(str):
+        def __hash__(self) -> int:
+            return id(self)
+
+        def __eq__(self, other: object) -> bool:
+            return str.__eq__(self, other)
+
+    for param in (frozenset({Tag("x"), "y"}), frozenset({IdStr("x"), 2})):
+        written = RemoteOp("g", 0, 3, 0, 1, (param,), (), 0).to_dict()["params"]
+        assert _params_match(json.loads(json.dumps(written)), [param])
+        assert _params_match([copy.deepcopy(param)], [param])
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 

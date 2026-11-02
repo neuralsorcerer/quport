@@ -1278,15 +1278,23 @@ def _holds_kept(form: Any) -> bool:
 def _plain_key(form: Any) -> Any:
     """A hashable key equal for two plain forms exactly when
     :func:`_matches_written` matches them: numbers compare by value, as
-    ``==`` does, so ``True``, ``1`` and ``1.0`` share one."""
+    ``==`` does, so ``True``, ``1`` and ``1.0`` share one.
+
+    A subclass of ``str``, ``int`` or ``float`` keys as the base value it is
+    written as, whatever hash or conversions it defines, so a genuine
+    manifest read back from JSON finds it.
+    """
     if isinstance(form, dict):
         return ("dict", tuple(sorted((key, _plain_key(v)) for key, v in form.items())))
     if isinstance(form, list):
         return ("list", tuple(map(_plain_key, form)))
-    if isinstance(form, bool | int):
-        return int(form)
-    if isinstance(form, float) and form.is_integer():
-        return int(form)
+    if isinstance(form, str):
+        return str.__str__(form)
+    if isinstance(form, int):
+        return int.__int__(form)
+    if isinstance(form, float):
+        value = float.__float__(form)
+        return int(value) if value.is_integer() else value
     return form
 
 
