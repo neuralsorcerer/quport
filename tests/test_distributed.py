@@ -3520,6 +3520,21 @@ def test_extended_precision_complex_numbers_compare_part_by_part() -> None:
     assert _params_match([np.clongdouble("nan+2j")], [np.clongdouble("nan+2j")])
 
 
+def test_a_set_item_without_a_hash_is_still_compared() -> None:
+    """Counting items by key raised TypeError for a value whose type defines
+    equality and so has no hash; such items are paired one by one."""
+    from quport.distributed import _params_match
+
+    class Loose(float):
+        def __eq__(self, other: object) -> bool:
+            return float(self) == other
+
+    named = [{"type": "frozenset", "items": [Loose(1.5), 2]}]
+
+    assert _params_match(named, [frozenset({1.5, 2})])
+    assert not _params_match(named, [frozenset({2.5, 2})])
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 

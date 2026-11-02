@@ -1255,8 +1255,12 @@ def _same_items(named: list[Any], expected: list[Any]) -> bool:
         return False
     if not any(map(_holds_kept, named)) and not any(map(_holds_kept, expected)):
         # Plain values match exactly when their keys are equal, so the items
-        # pair up when the two sides hold the same keys as often.
-        return Counter(map(_plain_key, named)) == Counter(map(_plain_key, expected))
+        # pair up when the two sides hold the same keys as often -- unless a
+        # value of a type that defines equality alone has no key.
+        try:
+            return Counter(map(_plain_key, named)) == Counter(map(_plain_key, expected))
+        except TypeError:
+            pass
     return _perfect_matching(named, expected)
 
 
