@@ -2368,14 +2368,18 @@ def test_two_outputs_may_share_a_device(tmp_path: Path) -> None:
             "r/p.png",
         ],
         ["ebits", "--n-logical", "3", "--out", "d/plan.json", "--emit-qasm", "d"],
+        ["ebits", "--n-logical", "3", "--out", "x", "--emit-qasm", "x/../y.qasm"],
+        ["sweep", "--n-logical", "2", "--out", "/dev/null", "--plot", "p"],
     ],
-    ids=["sweep", "ebits"],
+    ids=["sweep", "ebits", "through-the-first", "plot-from-a-device"],
 )
 def test_two_outputs_one_under_the_other_are_refused_up_front(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
 ) -> None:
-    """The first output made the second unwritable, which the command found
-    only after all its work."""
+    """The first output made the second unwritable -- reached through it as
+    a directory, even by ``x/..``, which ``os.path.realpath`` drops while
+    ``x`` does not exist -- or, for a plot, unreadable, and the command found
+    out only after all its work."""
     monkeypatch.chdir(tmp_path)
 
     result = CliRunner().invoke(app, args)

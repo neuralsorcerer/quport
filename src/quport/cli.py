@@ -537,7 +537,8 @@ def _refuse_one_file_for_two(
 ) -> None:
     """Refuse two outputs of one command naming the same file, where the
     second write would replace the first and the command report both, or
-    one under the other, which cannot both be written."""
+    one reached through the other as a directory, which cannot both be
+    written."""
     if not first or not second:
         return
     if _one_file(first, second):
@@ -545,16 +546,27 @@ def _refuse_one_file_for_two(
             f"{second} is the {first_option} file; name another",
             param_hint=second_option,
         )
-    real_first = Path(os.path.realpath(first))
-    real_second = Path(os.path.realpath(second))
-    if real_first != real_second and (
-        real_first.is_relative_to(real_second) or real_second.is_relative_to(real_first)
-    ):
+    if _passes_through(second, first) or _passes_through(first, second):
         raise typer.BadParameter(
-            f"{second} and the {first_option} file {first} lie one under the "
-            "other; name another",
+            f"{second} and the {first_option} file {first} cannot both be "
+            "written: one is reached through the other; name another",
             param_hint=second_option,
         )
+
+
+def _passes_through(path: str, other: str) -> bool:
+    """Whether reaching ``path`` goes through ``other`` as a directory.
+
+    Each leading part of ``path`` is resolved on its own, so ``x/../y`` goes
+    through ``x``, which :func:`os.path.realpath` drops while ``x`` does not
+    exist yet.
+    """
+    target = os.path.realpath(other)
+    parts = Path(path).parts
+    return any(
+        os.path.realpath(os.path.join(*parts[:depth])) == target
+        for depth in range(1, len(parts))
+    )
 
 
 def _one_file(first: str, second: str) -> bool:
@@ -876,6 +888,12 @@ def sweep(
 ) -> None:
     """Sweep multiple topologies and comm-port counts; save summary CSV."""
     _refuse_one_file_for_two("--out", out, "--plot", plot)
+    if plot and os.path.exists(out) and not os.path.isfile(out):
+        raise typer.BadParameter(
+            f"the plot is drawn from the --out CSV read back, and {out} is not a "
+            "file to read it from",
+            param_hint="--plot",
+        )
     sweep_topologies(
         n_logical=n_logical,
         depth=depth,
