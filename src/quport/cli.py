@@ -508,19 +508,28 @@ def _link_names_a_directory(link: Path) -> bool:
 
 
 def _checked_plot_file(value: str | None) -> str | None:
-    """As :func:`_checked_output_file`, for the file matplotlib writes.
+    """As :func:`_checked_output_file`, for the file the plot is written to.
 
     Given a name without an extension, matplotlib strips its trailing dots
-    and adds ``.png``; the option names that file, so it is the one checked
-    and reported.
+    and adds ``.png``; the option names that file, so it is the one checked,
+    written -- in :func:`_plot_format`, so matplotlib renames nothing -- and
+    reported. A directory's name, say ``results``, gets ``results.png``.
     """
     if not value:
         return value
-    _refuse_a_directory(value)
+    if _names_a_directory(value):
+        raise typer.BadParameter(f"{value} names a directory; name a file to write")
     name = os.fspath(Path(value))
     if not os.path.splitext(name)[1][1:]:
         name = name.rstrip(".") + ".png"
     return _checked_output_file(name)
+
+
+def _plot_format(name: str) -> str:
+    """The format of a plot written to ``name``, as checked by
+    :func:`_checked_plot_file`: its extension, or PNG where that added one
+    ``os.path.splitext`` does not see, as in ``.png`` from ``...``."""
+    return os.path.splitext(name)[1][1:].lower() or "png"
 
 
 def _checked_required_output_file(value: str) -> str:
@@ -809,8 +818,8 @@ def sweep(
     plot: str | None = typer.Option(
         None,
         callback=_checked_plot_file,
-        help="Optional PNG plot (requires quport\\[viz]); .png is added to a name "
-        "without a suffix",
+        help="Optional PNG plot (requires quport\\[viz]); a name without an "
+        "extension gets .png in place of any trailing dots",
     ),
 ) -> None:
     """Sweep multiple topologies and comm-port counts; save summary CSV."""
@@ -840,7 +849,12 @@ def sweep(
         plt.xlabel("comm ports per QPU")
         plt.ylabel("mean estimated cost")
         plt.legend()
-        fig.savefig(_output_path(plot), dpi=180, bbox_inches="tight")
+        fig.savefig(
+            _output_path(plot),
+            format=_plot_format(plot),
+            dpi=180,
+            bbox_inches="tight",
+        )
         _print_path(f"Wrote plot to {plot}")
 
 

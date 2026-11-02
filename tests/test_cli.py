@@ -2240,13 +2240,21 @@ def test_a_plot_name_without_a_suffix_is_checked_as_the_file_written(
 
 @pytest.mark.parametrize(
     ("given", "written"),
-    [("plot.", "plot.png"), ("..png", "..png.png"), ("sub/.v", "sub/.v.png")],
+    [
+        ("plot.", "plot.png"),
+        ("..png", "..png.png"),
+        ("sub/.v", "sub/.v.png"),
+        ("...", ".png"),
+        ("results", "results.png"),
+    ],
 )
 def test_a_plot_name_is_the_file_matplotlib_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: str, written: str
 ) -> None:
     """``Path.suffix`` and matplotlib disagree on dotted names, so the check
-    and the report named one file and matplotlib wrote another."""
+    and the report named one file and matplotlib wrote another; ``...`` gave
+    ``.png``, which matplotlib renamed again; and the name of an existing
+    directory was refused, though the plot goes beside it."""
     pytest.importorskip("matplotlib")
     pytest.importorskip("pandas")
     import matplotlib
@@ -2254,6 +2262,7 @@ def test_a_plot_name_is_the_file_matplotlib_writes(
     matplotlib.use("Agg")
     monkeypatch.chdir(tmp_path)
     (tmp_path / "sub").mkdir()
+    (tmp_path / "results").mkdir()
 
     result = CliRunner().invoke(
         app,
@@ -2276,6 +2285,7 @@ def test_a_plot_name_is_the_file_matplotlib_writes(
 
     assert result.exit_code == 0, result.output
     assert (tmp_path / written).is_file()
+    assert not list(tmp_path.rglob("*.png.png")) or written.endswith(".png.png")
     assert f"Wrote plot to {written}" in result.output.replace("\n", "")
 
 

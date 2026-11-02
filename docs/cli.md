@@ -17,8 +17,8 @@ custom workflows, use the Python API documented in [API reference](api-reference
   be written; an `--out-dir` that is not a directory; a path under something
   other than a directory, a broken link included; and an output file that is a
   broken link nothing can be written through -- one that loops, names a
-  directory, or points into a missing one. A broken link to a new file in an
-  existing directory is written. A config or circuit the library refuses --
+  directory, points into a missing one, or chains more links than the system
+  follows. A broken link to a new file in an existing directory is written. A config or circuit the library refuses --
   one global routing cannot connect, say -- and a write that fails anyway end
   the command with the message and exit code 1, rather than a Python
   traceback.
