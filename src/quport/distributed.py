@@ -1237,17 +1237,16 @@ def _matches_written(named: Any, expected: Any) -> bool:
     if isinstance(expected, dict):
         if not isinstance(named, dict):
             return False
-        # Keys, like values, compare as the base strings they are written as.
+        # Keys, like values, compare as the base strings they are written as,
+        # unless two of one mapping's are one string, kept apart only by a
+        # subclass's own hash: then as they are given.
         named_by_key = {_plain_key(key): item for key, item in named.items()}
         expected_by_key = {_plain_key(key): item for key, item in expected.items()}
-        return (
-            len(named_by_key) == len(named)
-            and len(expected_by_key) == len(expected)
-            and named_by_key.keys() == expected_by_key.keys()
-            and all(
-                _matches_written(named_by_key[key], item)
-                for key, item in expected_by_key.items()
-            )
+        if len(named_by_key) < len(named) or len(expected_by_key) < len(expected):
+            named_by_key, expected_by_key = named, expected
+        return named_by_key.keys() == expected_by_key.keys() and all(
+            _matches_written(named_by_key[key], item)
+            for key, item in expected_by_key.items()
         )
     if isinstance(expected, list):
         return (
@@ -1256,6 +1255,8 @@ def _matches_written(named: Any, expected: Any) -> bool:
             and all(map(_matches_written, named, expected))
         )
     # A string or a number compares as the base value it is written as.
+    if isinstance(named, dict | list | _Unstable | _SetOf):
+        return False
     return bool(_plain_key(named) == _plain_key(expected))
 
 
@@ -1295,9 +1296,14 @@ def _plain_key(form: Any) -> Any:
     genuine manifest read back from JSON finds it.
     """
     if isinstance(form, dict):
+        keys = {_plain_key(key): key for key in form}
+        if len(keys) < len(form):
+            # Two keys one string: :func:`_matches_written` compares such a
+            # mapping by its keys as given, which no key can stand for.
+            raise TypeError("mapping keys collide as written")
         return (
             "dict",
-            tuple(sorted((_plain_key(key), _plain_key(v)) for key, v in form.items())),
+            tuple((key, _plain_key(form[keys[key]])) for key in sorted(keys)),
         )
     if isinstance(form, list):
         return ("list", tuple(map(_plain_key, form)))

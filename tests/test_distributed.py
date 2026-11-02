@@ -3619,6 +3619,50 @@ def test_a_string_compares_as_its_written_value_by_every_route() -> None:
         assert _params_match(read_back(param), [param])
 
 
+def test_a_mapping_whose_keys_collide_as_written_still_matches() -> None:
+    """Two keys one string as written -- kept apart by a subclass's own hash
+    -- made the counting key sort their values, which raised TypeError, and
+    made the pairwise route refuse what the counting route accepted."""
+    import copy
+    from collections.abc import Iterator, Mapping
+
+    from quport.distributed import _params_match
+
+    class Tag(str):
+        def __hash__(self) -> int:
+            return hash(("tag", str.__str__(self)))
+
+        def __eq__(self, other: object) -> bool:
+            return type(other) is type(self) and str.__eq__(self, other)
+
+    class FrozenMap(Mapping[Any, Any]):
+        def __init__(self, items: dict[Any, Any]) -> None:
+            self._items = items
+
+        def __getitem__(self, key: Any) -> Any:
+            return self._items[key]
+
+        def __iter__(self) -> Iterator[Any]:
+            return iter(self._items)
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+        def __hash__(self) -> int:
+            return 0
+
+    mapping = FrozenMap({"a": 1, Tag("a"): "x"})
+    for param in (
+        mapping,
+        (mapping, 7),
+        frozenset({mapping, 7}),
+        frozenset({mapping, frozenset({1})}),
+    ):
+        assert _params_match([copy.deepcopy(param)], [param])
+    for other in (0.5, "a", frozenset({7})):
+        assert not _params_match([mapping], [other])
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 
