@@ -532,6 +532,26 @@ def _plot_format(name: str) -> str:
     return os.path.splitext(name)[1][1:].lower() or "png"
 
 
+def _refuse_one_file_for_two(
+    first_option: str, first: str | None, second_option: str, second: str | None
+) -> None:
+    """Refuse two outputs of one command naming the same file: the second
+    write would replace the first, and the command report both."""
+    if not first or not second:
+        return
+    same = os.path.realpath(first) == os.path.realpath(second)
+    if not same:
+        try:
+            same = os.path.samefile(first, second)
+        except OSError:
+            same = False
+    if same:
+        raise typer.BadParameter(
+            f"{second} is the {first_option} file; name another",
+            param_hint=second_option,
+        )
+
+
 def _checked_required_output_file(value: str) -> str:
     """As :func:`_checked_output_file`, for an option that always writes."""
     if not value:
@@ -818,11 +838,12 @@ def sweep(
     plot: str | None = typer.Option(
         None,
         callback=_checked_plot_file,
-        help="Optional PNG plot (requires quport\\[viz]); a name without an "
-        "extension gets .png in place of any trailing dots",
+        help="Optional plot (requires quport\\[viz]), in the format its extension "
+        "names; a name without one gets .png in place of any trailing dots",
     ),
 ) -> None:
     """Sweep multiple topologies and comm-port counts; save summary CSV."""
+    _refuse_one_file_for_two("--out", out, "--plot", plot)
     sweep_topologies(
         n_logical=n_logical,
         depth=depth,
@@ -1015,6 +1036,7 @@ def ebits(
     the aggregated plan, then schedules that plan against the configured
     comm-port and link budgets.
     """
+    _refuse_one_file_for_two("--out", out, "--emit-qasm", emit_qasm)
     cfg = _load_config_or_default(config)
     latency = LatencyModel()
     qc = _load_or_random_circuit(

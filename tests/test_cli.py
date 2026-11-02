@@ -2321,6 +2321,27 @@ def test_a_file_name_ending_in_a_directory_is_refused(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["sweep", "--n-logical", "2", "--trials", "1", "--out", "p.png", "--plot", "p"],
+        ["ebits", "--n-logical", "3", "--out", "same", "--emit-qasm", "./same"],
+    ],
+    ids=["sweep", "ebits"],
+)
+def test_two_outputs_naming_one_file_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    """The second write replaced the first -- the plot the CSV, the circuit
+    the plan -- and the command reported writing both."""
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 2, result.output
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:
     """The message went through rich markup: a path with [old] in it lost
     those characters, and one with [/b] in it crashed the error handler."""

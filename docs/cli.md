@@ -15,13 +15,14 @@ custom workflows, use the Python API documented in [API reference](api-reference
   an empty `--out-dir`, or an empty `--out` on a command that always writes
   one; a directory, or a name ending in one such as `out/`, where a file is to
   be written; an `--out-dir` that is not a directory; a path under something
-  other than a directory, a broken link included; and an output file that is a
+  other than a directory, a broken link included; an output file that is a
   broken link nothing can be written through -- one that loops, names a
   directory, points into a missing one, or chains more links than the system
-  follows. A broken link to a new file in an existing directory is written. A config or circuit the library refuses --
-  one global routing cannot connect, say -- and a write that fails anyway end
-  the command with the message and exit code 1, rather than a Python
-  traceback.
+  follows; and two outputs of one command naming the same file. A broken link
+  to a new file in an existing directory is written. A config or circuit the
+  library refuses -- one global routing cannot connect, say -- and a write that
+  fails anyway end the command with the message and exit code 1, rather than a
+  Python traceback.
 - Commands that operate on one circuit (`map`, `schedule`, `split`, `ebits`,
   `optimal`, `migrate`, and `compile-dist`) can either generate a random
   benchmark with `--n-logical` or
@@ -108,12 +109,12 @@ Important columns include:
 quport sweep --n-logical 8 --depth 20 --trials 5 --out sweep.csv --plot sweep.png
 ```
 
-Sweeps built-in topology and port settings. `--plot` requires `quport[viz]`, and
-a plot name without an extension gets `.png` in place of any trailing dots, as
-matplotlib adds it; the command reports the file it wrote. The
-CSV contains one aggregate row per setting and strategy -- means, plus a median of
-the cost -- rather than one row per random circuit. Use `bench` when you need raw
-per-trial rows.
+Sweeps built-in topology and port settings. `--plot` requires `quport[viz]`. The
+plot's extension picks its format, and a name without one gets `.png` in place of
+any trailing dots, as matplotlib adds it; the command reports the file it wrote.
+The CSV contains one aggregate row per setting and strategy -- means, plus a
+median of the cost -- rather than one row per random circuit. Use `bench` when
+you need raw per-trial rows.
 
 ## `quport schedule`
 
