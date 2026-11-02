@@ -2342,6 +2342,63 @@ def test_two_outputs_naming_one_file_are_refused(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_two_outputs_may_share_a_device(tmp_path: Path) -> None:
+    """Neither write replaces the other on /dev/null, which runs the plan's
+    audit and keeps nothing; the check refused it as one file."""
+    result = CliRunner().invoke(
+        app,
+        ["ebits", "--n-logical", "3", "--out", "/dev/null", "--emit-qasm", "/dev/null"],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "sweep",
+            "--n-logical",
+            "2",
+            "--trials",
+            "1",
+            "--out",
+            "r",
+            "--plot",
+            "r/p.png",
+        ],
+        ["ebits", "--n-logical", "3", "--out", "d/plan.json", "--emit-qasm", "d"],
+    ],
+    ids=["sweep", "ebits"],
+)
+def test_two_outputs_one_under_the_other_are_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    """The first output made the second unwritable, which the command found
+    only after all its work."""
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(app, args)
+
+    assert result.exit_code == 2, result.output
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_second_output_found_to_be_the_first_is_not_written(tmp_path: Path) -> None:
+    """Some names for one file -- another case of it, a bind mount -- show
+    as the same only once the first output exists."""
+    from quport.cli import _refuse_replacing
+
+    first = tmp_path / "plan.json"
+    first.write_text("plan", encoding="utf-8")
+    alias = tmp_path / "alias.json"
+    alias.hardlink_to(first)
+
+    with pytest.raises(ValueError, match="just written"):
+        _refuse_replacing("--out", str(first), str(alias))
+    _refuse_replacing("--out", str(first), str(tmp_path / "other.json"))
+
+
 def test_an_error_mentioning_brackets_is_printed_verbatim(tmp_path: Path) -> None:
     """The message went through rich markup: a path with [old] in it lost
     those characters, and one with [/b] in it crashed the error handler."""

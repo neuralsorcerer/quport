@@ -535,20 +535,52 @@ def _plot_format(name: str) -> str:
 def _refuse_one_file_for_two(
     first_option: str, first: str | None, second_option: str, second: str | None
 ) -> None:
-    """Refuse two outputs of one command naming the same file: the second
-    write would replace the first, and the command report both."""
+    """Refuse two outputs of one command naming the same file, where the
+    second write would replace the first and the command report both, or
+    one under the other, which cannot both be written."""
     if not first or not second:
         return
+    if _one_file(first, second):
+        raise typer.BadParameter(
+            f"{second} is the {first_option} file; name another",
+            param_hint=second_option,
+        )
+    real_first = Path(os.path.realpath(first))
+    real_second = Path(os.path.realpath(second))
+    if real_first != real_second and (
+        real_first.is_relative_to(real_second) or real_second.is_relative_to(real_first)
+    ):
+        raise typer.BadParameter(
+            f"{second} and the {first_option} file {first} lie one under the "
+            "other; name another",
+            param_hint=second_option,
+        )
+
+
+def _one_file(first: str, second: str) -> bool:
+    """Whether two output names reach one regular file, now or once written.
+
+    A device or a pipe, such as ``/dev/null``, takes both writes without
+    one replacing the other.
+    """
     same = os.path.realpath(first) == os.path.realpath(second)
     if not same:
         try:
             same = os.path.samefile(first, second)
         except OSError:
             same = False
-    if same:
-        raise typer.BadParameter(
-            f"{second} is the {first_option} file; name another",
-            param_hint=second_option,
+    # By the name itself: the system follows /dev/stdout to its pipe, which
+    # os.path.realpath cannot name.
+    return same and (not os.path.exists(first) or os.path.isfile(first))
+
+
+def _refuse_replacing(first_option: str, first: str | None, second: str) -> None:
+    """Refuse, just before writing ``second``, to replace the file ``first``
+    has just been written to, under a name only that file's existence
+    reveals as the same, such as another case of it, or a bind mount."""
+    if first and _one_file(first, second):
+        raise ValueError(
+            f"{second} is the {first_option} file just written; not replacing it"
         )
 
 
@@ -855,6 +887,7 @@ def sweep(
     _print_path(f"Wrote sweep summary to {out}")
 
     if plot:
+        _refuse_replacing("--out", out, plot)
         plt, pd = _load_plot_modules()
 
         df = pd.read_csv(out)
@@ -1105,6 +1138,7 @@ def ebits(
             res.physical_circuit, arch, plan, coherent=False
         )
         text = _qasm3_or_exit(program.circuit)
+        _refuse_replacing("--out", out, emit_qasm)
         _output_path(emit_qasm).write_text(text, encoding="utf-8")
         _print_path(
             f"Wrote telegate circuit ({program.n_ancillas} protocol ancillas) "

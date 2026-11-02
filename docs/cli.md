@@ -18,11 +18,13 @@ custom workflows, use the Python API documented in [API reference](api-reference
   other than a directory, a broken link included; an output file that is a
   broken link nothing can be written through -- one that loops, names a
   directory, points into a missing one, or chains more links than the system
-  follows; and two outputs of one command naming the same file. A broken link
-  to a new file in an existing directory is written. A config or circuit the
-  library refuses -- one global routing cannot connect, say -- and a write that
-  fails anyway end the command with the message and exit code 1, rather than a
-  Python traceback.
+  follows; and two outputs of one command naming the same regular file, or one
+  under the other. A broken link to a new file in an existing directory is
+  written, and two outputs may share a device such as `/dev/null`. A config or
+  circuit the library refuses -- one global routing cannot connect, say -- and
+  a write that fails anyway end the command with the message and exit code 1,
+  rather than a Python traceback; so does a second output that turns out, once
+  the first exists, to be the same file, which is left as written.
 - Commands that operate on one circuit (`map`, `schedule`, `split`, `ebits`,
   `optimal`, `migrate`, and `compile-dist`) can either generate a random
   benchmark with `--n-logical` or
