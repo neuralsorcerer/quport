@@ -3563,6 +3563,62 @@ def test_a_set_item_keys_as_the_base_value_it_is_written_as() -> None:
         assert _params_match([copy.deepcopy(param)], [param])
 
 
+def test_a_string_compares_as_its_written_value_by_every_route() -> None:
+    """A str subclass with its own equality was compared by it in a tuple,
+    or in a set holding a nested set, but by its written value in a plain
+    set; and a str-subclass key hashed apart from its value refused its own
+    mapping, read back from JSON."""
+    import json
+    from collections.abc import Iterator, Mapping
+
+    from quport.distributed import RemoteOp, _params_match
+
+    class Caseless(str):
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, str) and self.lower() == other.lower()
+
+        def __hash__(self) -> int:
+            return hash(self.lower())
+
+    class Tag(str):
+        def __hash__(self) -> int:
+            return hash(("tag", str.__str__(self)))
+
+        def __eq__(self, other: object) -> bool:
+            return str.__eq__(self, other)
+
+    class FrozenMap(Mapping[Any, Any]):
+        def __init__(self, items: dict[Any, Any]) -> None:
+            self._items = items
+
+        def __getitem__(self, key: Any) -> Any:
+            return self._items[key]
+
+        def __iter__(self) -> Iterator[Any]:
+            return iter(self._items)
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+        def __hash__(self) -> int:
+            return 0
+
+    def read_back(param: Any) -> Any:
+        written = RemoteOp("g", 0, 3, 0, 1, (param,), (), 0).to_dict()["params"]
+        return json.loads(json.dumps(written))
+
+    for param in (
+        (Caseless("x"), "y"),
+        frozenset({Caseless("x"), "y"}),
+        frozenset({Caseless("x"), frozenset({1})}),
+    ):
+        foreign = json.loads(json.dumps(read_back(param)).replace('"x"', '"X"'))
+        assert _params_match(read_back(param), [param])
+        assert not _params_match(foreign, [param])
+    for param in (FrozenMap({Tag("a"): 1}), frozenset({FrozenMap({Tag("a"): 1})})):
+        assert _params_match(read_back(param), [param])
+
+
 def test_a_refused_write_creates_no_directory(tmp_path: Path) -> None:
     from qiskit.circuit import Clbit
 

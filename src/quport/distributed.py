@@ -1235,10 +1235,19 @@ def _matches_written(named: Any, expected: Any) -> bool:
             return False
         return name == expected.name and _same_items(items, expected.items)
     if isinstance(expected, dict):
+        if not isinstance(named, dict):
+            return False
+        # Keys, like values, compare as the base strings they are written as.
+        named_by_key = {_plain_key(key): item for key, item in named.items()}
+        expected_by_key = {_plain_key(key): item for key, item in expected.items()}
         return (
-            isinstance(named, dict)
-            and set(named) == set(expected)
-            and all(_matches_written(named[key], expected[key]) for key in expected)
+            len(named_by_key) == len(named)
+            and len(expected_by_key) == len(expected)
+            and named_by_key.keys() == expected_by_key.keys()
+            and all(
+                _matches_written(named_by_key[key], item)
+                for key, item in expected_by_key.items()
+            )
         )
     if isinstance(expected, list):
         return (
@@ -1246,7 +1255,8 @@ def _matches_written(named: Any, expected: Any) -> bool:
             and len(named) == len(expected)
             and all(map(_matches_written, named, expected))
         )
-    return bool(named == expected)
+    # A string or a number compares as the base value it is written as.
+    return bool(_plain_key(named) == _plain_key(expected))
 
 
 def _same_items(named: list[Any], expected: list[Any]) -> bool:
@@ -1281,11 +1291,14 @@ def _plain_key(form: Any) -> Any:
     ``==`` does, so ``True``, ``1`` and ``1.0`` share one.
 
     A subclass of ``str``, ``int`` or ``float`` keys as the base value it is
-    written as, whatever hash or conversions it defines, so a genuine
-    manifest read back from JSON finds it.
+    written as, whatever hash, equality or conversions it defines, so a
+    genuine manifest read back from JSON finds it.
     """
     if isinstance(form, dict):
-        return ("dict", tuple(sorted((key, _plain_key(v)) for key, v in form.items())))
+        return (
+            "dict",
+            tuple(sorted((_plain_key(key), _plain_key(v)) for key, v in form.items())),
+        )
     if isinstance(form, list):
         return ("list", tuple(map(_plain_key, form)))
     if isinstance(form, str):
